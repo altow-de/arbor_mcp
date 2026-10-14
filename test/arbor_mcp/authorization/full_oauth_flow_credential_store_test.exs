@@ -99,6 +99,22 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlowCredentialStoreTest do
     assert Agent.get(server.counter, & &1.registrations) == 0
   end
 
+  test "sends a pathless PRM resource identifier unchanged on the token request" do
+    {:ok, store_agent} =
+      Agent.start_link(fn -> %{index: %{}, registrations: %{}, tokens: %{}} end)
+
+    server = oauth_server("pathless-resource-client", nil, prm_resource: :pathless_origin)
+
+    assert {:ok, %{access_token: "token-for-pathless-resource-client"}} =
+             server
+             |> flow_config({StoreAdapter, store_agent})
+             |> FullOAuthFlow.execute()
+
+    assert [params] = Agent.get(server.counter, & &1.token_requests)
+    assert params["resource"] == server.resource_origin
+    refute String.ends_with?(params["resource"], "/")
+  end
+
   test "treats malformed optional PRM fields as absent" do
     {:ok, store_agent} =
       Agent.start_link(fn -> %{index: %{}, registrations: %{}, tokens: %{}} end)
@@ -276,14 +292,18 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlowCredentialStoreTest do
     metadata_issuer = metadata_issuer || issuer
 
     {:ok, counter} =
-      Agent.start_link(fn -> %{registrations: 0, registration_requests: [], tokens: 0} end)
+      Agent.start_link(fn ->
+        %{registrations: 0, registration_requests: [], tokens: 0, token_requests: []}
+      end)
+
+    prm_resource = prm_resource_field(opts[:prm_resource], resource_origin)
 
     metadata_client = fn uri, _address, _opts ->
       body =
         case {uri.host, uri.path} do
           {^resource_host, "/prm"} ->
             %{"authorization_servers" => [issuer]}
-            |> maybe_put("resource", opts[:prm_resource])
+            |> maybe_put("resource", prm_resource)
             |> maybe_put("scopes_supported", opts[:prm_scopes])
 
           {^issuer_host, "/.well-known/openid-configuration"} ->
@@ -328,7 +348,14 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlowCredentialStoreTest do
     end)
 
     Bypass.stub(bypass, "POST", "/token", fn conn ->
-      Agent.update(counter, &Map.update!(&1, :tokens, fn count -> count + 1 end))
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      params = URI.decode_query(body)
+
+      Agent.update(counter, fn state ->
+        state
+        |> Map.update!(:tokens, fn count -> count + 1 end)
+        |> Map.update!(:token_requests, &[params | &1])
+      end)
 
       case opts[:token_error] do
         nil ->
@@ -381,4 +408,7 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlowCredentialStoreTest do
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp prm_resource_field(:pathless_origin, resource_origin), do: resource_origin
+  defp prm_resource_field(other, _resource_origin), do: other
 end
