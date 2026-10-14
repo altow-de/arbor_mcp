@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bump `decimal` to 3.1.2, which fixes `EEF-CVE-2026-97853` (unbounded
+  allocation in `Decimal.round/3` via `places`). The requirement is now
+  `~> 3.1 and >= 3.1.2` so consumers cannot resolve 3.1.1. 3.1.2 requires
+  Elixir `~> 1.12` and remains compatible with the OTP 27.0 / Elixir 1.17.3
+  CI matrix entry.
+- Acknowledge `EEF-CVE-2026-105659` (Bandit HTTP/2 blocked-send deadline
+  reset) while Bandit has no patched Hex release. Latest Hex is still
+  1.12.5; the upstream fix is `mtrudel/bandit@d88b219` on main. Owned
+  Bandit startup stays ABI-pinned to 1.12.5. Remove the `mix hex.audit`
+  exception when a patched Hex version ships.
+
 ### Fixed
 
 - Send the OAuth `resource` parameter exactly as published in protected
