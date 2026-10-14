@@ -100,16 +100,7 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlow do
            :ok <- validate_prm_resource(prm, config),
            {:ok, as_metadata} <- discover_as_metadata(prm, config),
            {:ok, client_info} <- ensure_client_registered(as_metadata, config) do
-        # Merge PRM scopes_supported into config for scope negotiation
-        config =
-          case prm[:scopes_supported] do
-            scopes when is_list(scopes) and scopes != [] ->
-              Map.put_new(config, :prm_scopes, scopes)
-
-            _ ->
-              config
-          end
-
+        config = apply_discovered_prm(config, prm)
         run_and_persist_token(as_metadata, client_info, config)
       else
         {:error, _reason} = error -> error
@@ -386,6 +377,36 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlow do
 
       _invalid ->
         {:error, :invalid_prm_metadata}
+    end
+  end
+
+  # RFC 8707 / MCP: authorization and token requests must send the resource
+  # identifier exactly as published in protected resource metadata. Do not
+  # re-serialize the MCP endpoint URL; a URI parser that appends "/" to a
+  # pathless identifier is the usual source of a mismatch.
+  defp apply_discovered_prm(config, prm) do
+    config
+    |> apply_prm_scopes(prm)
+    |> apply_prm_resource(prm)
+  end
+
+  defp apply_prm_scopes(config, prm) do
+    case prm[:scopes_supported] do
+      scopes when is_list(scopes) and scopes != [] ->
+        Map.put_new(config, :prm_scopes, scopes)
+
+      _ ->
+        config
+    end
+  end
+
+  defp apply_prm_resource(config, prm) do
+    case prm[:resource] do
+      resource when is_binary(resource) and resource != "" ->
+        Map.put(config, :resource, resource)
+
+      _ ->
+        config
     end
   end
 

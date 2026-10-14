@@ -413,6 +413,24 @@ defmodule Arbor.MCP.Compliance.OAuth21ComplianceTest do
       assert query["resource"] == @resource1
     end
 
+    test "preserves a pathless resource identifier without adding a trailing slash" do
+      pathless = "https://api.example.com"
+
+      config = %{
+        client_id: "test-client",
+        redirect_uri: "https://client.app/callback",
+        authorization_endpoint: @auth_endpoint,
+        scopes: ["read"],
+        resource: pathless
+      }
+
+      {:ok, auth_url, _state} = Authorization.start_authorization_flow(config)
+      query = URI.decode_query(URI.parse(auth_url).query)
+
+      assert query["resource"] == pathless
+      refute String.ends_with?(query["resource"], "/")
+    end
+
     test "includes multiple resource parameters in authorization URL" do
       config = %{
         client_id: "test-client",
