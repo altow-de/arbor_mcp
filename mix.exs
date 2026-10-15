@@ -46,12 +46,21 @@ defmodule Arbor.MCP.MixProject do
       # call cow_cookie:cookie/1; and the Arbor.MCP/Plug/Cowboy server stack does
       # not call cow_link:link/1. Those assumptions are locked by
       # dependency_advisory_mitigation_test.exs. Core consumers omit Cowboy and
-      # Cowlib; standalone hosts explicitly select Cowboy or Bandit. Keep the
-      # exceptions exact so `mix hex.audit` still fails on every new advisory.
+      # Cowlib; standalone hosts explicitly select Cowboy or Bandit.
+      #
+      # Bandit advisory state as of 2026-10-14. EEF-CVE-2026-105659 (HTTP/2
+      # blocked-send deadline reset on WINDOW_UPDATE) affects Bandit >= 1.4.0
+      # through the latest Hex release, 1.12.5 (2026-08-20). The upstream fix
+      # is on bandit main (mtrudel/bandit@d88b219, 2026-10-12) but has no Hex
+      # release. Owned Bandit startup is ABI-pinned to 1.12.5, so an unpublished
+      # git dep would break that contract. Remove this exception when a patched
+      # Hex version ships. Keep the exceptions exact so `mix hex.audit` still
+      # fails on every new advisory.
       hex: [
         ignore_advisories: [
           "EEF-CVE-2026-43966",
-          "EEF-CVE-2026-43969"
+          "EEF-CVE-2026-43969",
+          "EEF-CVE-2026-105659"
         ]
       ],
       aliases: aliases()
@@ -127,6 +136,12 @@ defmodule Arbor.MCP.MixProject do
       external_dep(:fuse, "~> 2.4", optional: true),
       # MCP protocol support
       external_dep(:ex_json_schema, "~> 0.10"),
+      # Security floor: 3.1.2 fixes EEF-CVE-2026-97853 (unbounded allocation
+      # in Decimal.round/3 via places). Not used directly; declared so
+      # consumers cannot resolve 3.1.1 through ex_json_schema's `~> 3.0`.
+      # 3.1.2 requires Elixir ~> 1.12 and remains compatible with the OTP
+      # 27.0 / Elixir 1.17.3 CI matrix entry.
+      external_dep(:decimal, "~> 3.1 and >= 3.1.2"),
       external_dep(:jsv, "~> 0.25.0"),
       external_dep(:html_entities, "~> 0.5", only: [:dev, :test]),
       external_dep(:propcheck, "~> 1.4", only: :test),
