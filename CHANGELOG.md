@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0-rc.3] — 2026-10-17
+
 ### Changed
 
 - Bump `decimal` to 3.1.2, which fixes `EEF-CVE-2026-97853` (unbounded
@@ -19,14 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transformation for `compress_chunked` and lock HPAX 1.1.0. Remove the
   temporary `EEF-CVE-2026-105659` audit exception; the separate Cowlib
   exceptions remain. Host-owned listeners keep compatible dependency ranges.
+- Refresh published-RC installation guidance and consolidate current documentation.
 
 ### Fixed
 
 - Send the OAuth `resource` parameter exactly as published in protected
   resource metadata, including pathless identifiers that must not gain a
   trailing slash from URL normalization.
-
-- Refresh published-RC installation guidance and consolidate current documentation.
 
 
 ## [2.0.0-rc.2] — 2026-10-08

@@ -1,7 +1,7 @@
 # Public API entrypoints
 
 Use role-specific modules for new code. Full signatures and types are in
-[ArborMCP HexDocs](https://hexdocs.pm/arbor_mcp/2.0.0-rc.2/).
+[ArborMCP HexDocs](https://hexdocs.pm/arbor_mcp/2.0.0-rc.3/).
 The [migration guide](guides/MIGRATING_V1_TO_V2.md) explains removed APIs,
 configuration changes and the different return shapes of retained root wrappers.
 

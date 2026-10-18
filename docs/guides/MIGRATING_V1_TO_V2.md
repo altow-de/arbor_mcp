@@ -22,7 +22,7 @@ process death alone does not certify physical IO cleanup.
 
 ExMCP 1.x splits into **ArborMCP** for MCP and **ArborACP** for ACP, with
 independently installable ArborRPC and optional ArborACP adapter packages.
-This guide covers the published ArborMCP `2.0.0-rc.2` and ArborACP, ArborRPC
+This guide covers the published ArborMCP `2.0.0-rc.3` and ArborACP, ArborRPC
 and adapter `1.0.0-rc.1` combination. Library versions are independent; ACP
 protocol versions are a separate upstream concern.
 
@@ -37,7 +37,7 @@ Library names in prose use ArborMCP, ArborACP and ArborRPC. Code uses the dotted
 namespaces above; dependency and application configuration uses the lowercase
 package names.
 
-**RC status:** ArborMCP `2.0.0-rc.2` and the other three `1.0.0-rc.1`
+**RC status:** ArborMCP `2.0.0-rc.3` and the other three `1.0.0-rc.1`
 packages are published and verified through ordinary Hex installation. The
 original four `2.0.0-rc.1` versions are retired, with archives and tags preserved.
 Continuous 48-hour qualification remains incomplete: the latest harness attempt
@@ -104,7 +104,7 @@ pin so downstream test results are reproducible:
 ```elixir
 defp deps do
   [
-    {:arbor_mcp, "== 2.0.0-rc.2"}
+    {:arbor_mcp, "== 2.0.0-rc.3"}
   ]
 end
 ```
@@ -113,7 +113,7 @@ Choose additional packages by ownership:
 
 | What your application uses | Direct dependency |
 | --- | --- |
-| MCP clients, handlers, tools, resources or prompts | `{:arbor_mcp, "== 2.0.0-rc.2"}` |
+| MCP clients, handlers, tools, resources or prompts | `{:arbor_mcp, "== 2.0.0-rc.3"}` |
 | Native ACP agents/controllers or the generic adapter contract | `{:arbor_acp, "== 1.0.0-rc.1"}` |
 | Built-in Claude, Codex, Pi or ZCode adapters | `{:arbor_acp_adapters, "== 1.0.0-rc.1"}` |
 | Shared JSON-RPC/framing/subprocess APIs called directly | `{:arbor_rpc, "== 1.0.0-rc.1"}` |
@@ -122,7 +122,7 @@ MCP and ACP each bring in `arbor_rpc`; neither brings in the other protocol.
 The adapter bundle brings in ACP and RPC. Native ACP users do not need the
 bundle, and vendor CLI executables remain separate prerequisites. Add a direct
 RPC dependency only when your code uses its API. A compatible prerelease range
-is `~> 2.0.0-rc.2` for MCP or `~> 1.0.0-rc.1` for the new packages;
+is `~> 2.0.0-rc.3` for MCP or `~> 1.0.0-rc.1` for the new packages;
 an ordinary stable-only constraint does not select these RCs.
 
 For a normal Hex consumer, unset development overrides such as
@@ -192,7 +192,7 @@ For an agent that speaks ACP natively, replace the old MCP-owned ACP facade:
 Arbor.ACP.Client.disconnect(client)
 ```
 
-ArborMCP version `2.0.0-rc.2` and the MCP wire revision are separate identifiers.
+ArborMCP version `2.0.0-rc.3` and the MCP wire revision are separate identifiers.
 The latest stable wire revision in this source is `2026-07-28`.
 `:prefer_modern` permits evidence-based legacy fallback; `:modern_only` and
 `:legacy_only` select an era explicitly. Retained legacy Roots, Sampling and
