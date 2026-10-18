@@ -1,6 +1,6 @@
 # Releasing the Arbor packages
 
-The published RC train is ArborMCP `2.0.0-rc.3` and ArborRPC, ArborACP and
+The published RC train is ArborMCP `2.0.0-rc.4` and ArborRPC, ArborACP and
 Adapters `1.0.0-rc.1`. The original four `2.0.0-rc.1` candidates are retired;
 their tags and archives remain available. ExMCP `1.6.0` is independently
 maintained. Stable promotion follows the gates below.
@@ -9,7 +9,7 @@ maintained. Stable promotion follows the gates below.
 
 | Package | Published candidate | First stable | Dependencies |
 | --- | --- | --- | --- |
-| ArborMCP | `2.0.0-rc.3` | `2.0.0` | RPC `~> 1.0.0-rc.1` |
+| ArborMCP | `2.0.0-rc.4` | `2.0.0` | RPC `~> 1.0.0-rc.1` |
 | ArborRPC | `1.0.0-rc.1` | `1.0.0` | None of the other Arbor packages |
 | ArborACP | `1.0.0-rc.1` | `1.0.0` | RPC `~> 1.0.0-rc.1` |
 | ArborACP adapters | `1.0.0-rc.1` | `1.0.0` | ACP and RPC `~> 1.0.0-rc.1` |
@@ -36,7 +36,7 @@ python3 scripts/prepare_release.py \
   --mcp-source /path/to/arbor_mcp \
   --acp-source /path/to/arbor_acp \
   --rpc-source /path/to/arbor_rpc \
-  --mcp-version 2.0.0-rc.3 \
+  --mcp-version 2.0.0-rc.4 \
   --rpc-version 1.0.0-rc.1 \
   --acp-version 1.0.0-rc.1 \
   --adapters-version 1.0.0-rc.1 \
@@ -89,7 +89,7 @@ Run the four-package consumer against one archive per package:
 
 ```sh
 python3 scripts/check_archive_consumer.py /path/to/four-archives \
-  --expected-package-version arbor_mcp=2.0.0-rc.3 \
+  --expected-package-version arbor_mcp=2.0.0-rc.4 \
   --expected-package-version arbor_rpc=1.0.0-rc.1 \
   --expected-package-version arbor_acp=1.0.0-rc.1 \
   --expected-package-version arbor_acp_adapters=1.0.0-rc.1 --report /path/to/qualification.json
@@ -114,7 +114,7 @@ MCP and RPC commits. To associate those two archives with their exact sources:
 python3 scripts/check_archive_source_selection.py \
   --archives /path/to/mcp-and-rpc-archives \
   --mcp-source /path/to/arbor_mcp --rpc-source /path/to/arbor_rpc \
-  --version 2.0.0-rc.3 --rpc-version 1.0.0-rc.1 --output /path/to/source-selection.json
+  --version 2.0.0-rc.4 --rpc-version 1.0.0-rc.1 --output /path/to/source-selection.json
 ```
 
 RC publication enables downstream migration testing before stable qualification

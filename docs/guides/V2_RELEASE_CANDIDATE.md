@@ -6,7 +6,7 @@ tags remain available:
 
 | Package | Replacement candidate | First stable target |
 | --- | --- | --- |
-| ArborMCP (`arbor_mcp`) | `2.0.0-rc.3` | `2.0.0` |
+| ArborMCP (`arbor_mcp`) | `2.0.0-rc.4` | `2.0.0` |
 | ArborRPC (`arbor_rpc`) | `1.0.0-rc.1` | `1.0.0` |
 | ArborACP (`arbor_acp`) | `1.0.0-rc.1` | `1.0.0` |
 | ArborACP adapters (`arbor_acp_adapters`) | `1.0.0-rc.1` | `1.0.0` |
@@ -24,7 +24,7 @@ needed for protocol output encoding and is independent of the Elixir version.
 For an MCP application, replace `ex_mcp` with:
 
 ```elixir
-{:arbor_mcp, "== 2.0.0-rc.3"}
+{:arbor_mcp, "== 2.0.0-rc.4"}
 ```
 
 ACP applications use `{:arbor_acp, "== 1.0.0-rc.1"}`. Add
@@ -77,6 +77,13 @@ now qualify exact Bandit `1.13.1` and Thousand Island `1.6.0`, so hosts that
 pinned `1.12.5`/`1.5.0` for an owned listener must update both pins. OAuth
 requests send the `resource` parameter exactly as protected resource metadata
 publishes it. The public API is unchanged from `2.0.0-rc.2`.
+
+ArborMCP `2.0.0-rc.4` replaces `2.0.0-rc.3` with a security fix for
+handler-process request cancellation (GHSA-22m7-hr37-pxg3).
+`Arbor.MCP.MessageProcessor` now limits `notifications/cancelled` to requests
+from the same HTTP session or authenticated principal, and bounds the table
+it keeps. Runtime-mounted servers were not affected. The public API is
+unchanged.
 Earlier credential-free CLI lifecycle checks do not qualify live model turns.
 No completed continuous 48-hour final-candidate soak is claimed.
 
