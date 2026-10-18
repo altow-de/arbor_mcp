@@ -24,8 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancellation for an unknown ID adds nothing, and the table is swept and
   capped. Runtime-mounted servers already scoped their cancellations and
   were not affected; applications that call `MessageProcessor` directly
-  were. **Behavior change:** an anonymous sessionless request can no longer
-  be cancelled from a different HTTP request.
+  were.
+
+  **Behavior change:** for direct `MessageProcessor` use without
+  authentication, a `notifications/cancelled` sent in a separate modern
+  (2026-07-28) HTTP POST no longer cancels a request. That revision cancels
+  an HTTP request by closing its response stream, and Runtime-mounted
+  servers already ignored such cross-POST notifications.
 
 ## [2.0.0-rc.3] — 2026-10-18
 
