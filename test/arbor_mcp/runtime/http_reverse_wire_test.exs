@@ -254,6 +254,41 @@ defmodule Arbor.MCP.Server.Runtime.HTTPReverseWireTest do
     assert Runtime.stats!(runtime).response_bytes == 0
   end
 
+  test "socket closure remains observable when another listener reuses its port" do
+    address = {127, 0, 0, 1}
+    options = [:binary, active: false, ip: address, reuseaddr: true]
+    {:ok, original} = :gen_tcp.listen(0, options)
+    {:ok, {^address, port}} = :inet.sockname(original)
+    monitor = :erlang.monitor(:port, original)
+    assert :ok = :gen_tcp.close(original)
+
+    {:ok, replacement} = :gen_tcp.listen(port, options)
+    on_exit(fn -> :gen_tcp.close(replacement) end)
+    {:ok, probe} = :gen_tcp.connect(address, port, [:binary, active: false], 1_000)
+    on_exit(fn -> :gen_tcp.close(probe) end)
+    {:ok, accepted} = :gen_tcp.accept(replacement, 1_000)
+    on_exit(fn -> :gen_tcp.close(accepted) end)
+
+    # A successful probe reaches the replacement, not the retired socket.
+    assert :ok = :gen_tcp.send(accepted, "replacement listener")
+
+    assert {:ok, "replacement listener"} =
+             :gen_tcp.recv(probe, byte_size("replacement listener"), 1_000)
+
+    assert_socket_closed(original, monitor)
+    assert Port.info(replacement) != nil
+  end
+
+  test "a still-live listening socket cannot pass the closure assertion" do
+    {:ok, socket} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
+    on_exit(fn -> :gen_tcp.close(socket) end)
+    monitor = :erlang.monitor(:port, socket)
+
+    assert_raise ExUnit.AssertionError, fn -> assert_socket_closed(socket, monitor, 0) end
+    assert :ok = :gen_tcp.close(socket)
+    assert_socket_closed(socket, monitor)
+  end
+
   defp host do
     root =
       start_supervised!(
@@ -273,18 +308,14 @@ defmodule Arbor.MCP.Server.Runtime.HTTPReverseWireTest do
     ref = make_ref()
     {:ok, listener} = Plug.Cowboy.http(Router, [], port: 0, ip: {127, 0, 0, 1}, ref: ref)
     {{127, 0, 0, 1}, port} = :ranch.get_addr(ref)
+    socket = listening_socket(listener, port)
 
     on_exit(fn ->
       monitor = Process.monitor(listener)
+      socket_monitor = :erlang.monitor(:port, socket)
       assert :ok = :ranch.stop_listener(ref)
       assert_receive {:DOWN, ^monitor, :process, ^listener, _reason}, 1_000
-
-      assert {:error, reason} =
-               :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false], 1_000)
-
-      # Linux can reset an in-flight loopback handshake after listener DOWN.
-      # Both failures prove this probe obtained no live connection.
-      assert reason in [:econnrefused, :econnreset]
+      assert_socket_closed(socket, socket_monitor)
 
       root_monitor = Process.monitor(root)
       if Process.alive?(root), do: assert(Runtime.stop(root) == :ok)
@@ -292,6 +323,27 @@ defmodule Arbor.MCP.Server.Runtime.HTTPReverseWireTest do
     end)
 
     {runtime, port}
+  end
+
+  defp listening_socket(listener, port) do
+    {:ranch_acceptors_sup, acceptors, :supervisor, _modules} =
+      List.keyfind(Supervisor.which_children(listener), :ranch_acceptors_sup, 0)
+
+    {:links, links} = Process.info(acceptors, :links)
+
+    [socket] =
+      Enum.filter(links, fn link ->
+        is_port(link) and :inet.sockname(link) == {:ok, {{127, 0, 0, 1}, port}}
+      end)
+
+    socket
+  end
+
+  defp assert_socket_closed(socket, monitor, timeout \\ 1_000) do
+    # Observe the exact resource: a new connection to its old numeric port can
+    # reach a replacement listener or even self-connect on Linux.
+    assert_receive {:DOWN, ^monitor, :port, ^socket, _reason}, timeout
+    assert Port.info(socket) == nil
   end
 
   defp reverse_event(socket, method) do
