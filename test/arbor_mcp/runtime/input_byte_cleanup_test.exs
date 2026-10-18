@@ -102,12 +102,21 @@ defmodule Arbor.MCP.Server.Runtime.InputByteCleanupTest do
 
   test "deferred trim can settle without releasing an accepted reservation" do
     {runtime, route} = runtime()
+    # Production requests trim only after Admission records acceptance. An ETS
+    # candidate alone is earlier than that: a queued reaper can trim it before
+    # its confirmation call runs, correctly returning :admission_lost.
+    assert {:ok, _route, held} = reserve(runtime)
+    assert %{reserved: 1, confirmed: 1} = Runtime.stats!(runtime)
     pause(route.admission)
-    {producer, candidate} = candidate(runtime)
     table = Ref.table(runtime)
-    assert {:pending, :trim} = ByteBudget.confirm(table, candidate.token, deadline: past())
+
+    # Exercise a reaper already ahead of the cleanup wake, independent of the
+    # periodic timer or scheduler speed. Acceptance is acknowledged above.
+    send(route.admission, :reap_unconfirmed)
+    assert {:pending, :trim} = ByteBudget.confirm(table, held.token, deadline: past())
+    assert [{held.token, self(), :trim}] == ByteBudget.pending(table)
+    assert ByteBudget.used(table).data == held.bytes
     :sys.resume(route.admission)
-    assert_receive {:candidate_returned, ^producer, {:ok, _route, held}}, 1_000
     wait_for(fn -> ByteBudget.pending(table) == [] end)
     assert ByteBudget.candidate(table, held.token) == nil
     assert %{reserved: 1, confirmed: 1, pending_byte_cleanup: 0} = Runtime.stats!(runtime)

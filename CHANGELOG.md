@@ -14,11 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~> 3.1 and >= 3.1.2` so consumers cannot resolve 3.1.1. 3.1.2 requires
   Elixir `~> 1.12` and remains compatible with the OTP 27.0 / Elixir 1.17.3
   CI matrix entry.
-- Acknowledge `EEF-CVE-2026-105659` (Bandit HTTP/2 blocked-send deadline
-  reset) while Bandit has no patched Hex release. Latest Hex is still
-  1.12.5; the upstream fix is `mtrudel/bandit@d88b219` on main. Owned
-  Bandit startup stays ABI-pinned to 1.12.5. Remove the `mix hex.audit`
-  exception when a patched Hex version ships.
+- Raise the Bandit security floor to 1.13.1 and qualify owned listeners with
+  exact Bandit 1.13.1 / Thousand Island 1.6.0. Update the HTTP option
+  transformation for `compress_chunked` and lock HPAX 1.1.0. Remove the
+  temporary `EEF-CVE-2026-105659` audit exception; the separate Cowlib
+  exceptions remain. Host-owned listeners keep compatible dependency ranges.
 
 ### Fixed
 

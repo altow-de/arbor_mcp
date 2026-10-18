@@ -95,6 +95,8 @@ defmodule ListenerArchiveConsumer do
       for app <- [:bandit, :thousand_island, :websock], do: absent(app)
     else
       true = Code.ensure_loaded?(Bandit)
+      "1.13.1" = to_string(Application.spec(:bandit, :vsn))
+      "1.6.0" = to_string(Application.spec(:thousand_island, :vsn))
       for app <- [:plug_cowboy, :cowboy, :cowlib, :ranch], do: absent(app)
     end
   end

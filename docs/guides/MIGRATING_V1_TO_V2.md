@@ -348,8 +348,8 @@ dependencies `{:plug_cowboy, "~> 2.7"}` and `{:ranch, "== 1.8.1"}`, then use:
 ```
 
 Cowboy and Bandit are optional host dependencies; MCP clients, stdio and BEAM
-use need neither. Owned Bandit currently requires exact Bandit `1.12.5` and
-Thousand Island `1.5.0`. Follow the [HTTP listener guide](../HTTP_LISTENERS.md)
+use need neither. Owned Bandit currently requires exact Bandit `1.13.1` and
+Thousand Island `1.6.0`. Follow the [HTTP listener guide](../HTTP_LISTENERS.md)
 for constraints and owned/borrowed shutdown rules rather than broadening the
 backend versions during migration.
 

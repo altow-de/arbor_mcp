@@ -30,10 +30,22 @@ defmodule Arbor.MCP.Security.DependencyAdvisoryMitigationTest do
     assert Version.compare(locked_version, "3.1.2") in [:eq, :gt]
   end
 
-  test "Bandit stays on 1.12.5 while EEF-CVE-2026-105659 has no Hex patch" do
-    locked_version = Lock.read()[:bandit] |> elem(2)
-    assert locked_version == "1.12.5"
-    assert "EEF-CVE-2026-105659" in Project.config()[:hex][:ignore_advisories]
+  test "Bandit requirement and lock include the October security and Phoenix fixes" do
+    requirement = Project.config()[:deps] |> List.keyfind(:bandit, 0) |> elem(1)
+    assert Version.match?("1.13.1", requirement)
+    refute Version.match?("1.13.0", requirement)
+    refute Version.match?("1.12.5", requirement)
+
+    lock = Lock.read()
+    assert elem(lock[:bandit], 2) == "1.13.1"
+    assert elem(lock[:thousand_island], 2) == "1.6.0"
+    assert Version.compare(elem(lock[:hpax], 2), "1.1.0") in [:eq, :gt]
+
+    # Only the independently justified Cowlib exceptions remain.
+    assert Project.config()[:hex][:ignore_advisories] == [
+             "EEF-CVE-2026-43966",
+             "EEF-CVE-2026-43969"
+           ]
   end
 
   test "Plug rejects response-header bytes covered by EEF-CVE-2026-43966" do

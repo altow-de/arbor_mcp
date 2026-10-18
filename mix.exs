@@ -47,20 +47,11 @@ defmodule Arbor.MCP.MixProject do
       # not call cow_link:link/1. Those assumptions are locked by
       # dependency_advisory_mitigation_test.exs. Core consumers omit Cowboy and
       # Cowlib; standalone hosts explicitly select Cowboy or Bandit.
-      #
-      # Bandit advisory state as of 2026-10-14. EEF-CVE-2026-105659 (HTTP/2
-      # blocked-send deadline reset on WINDOW_UPDATE) affects Bandit >= 1.4.0
-      # through the latest Hex release, 1.12.5 (2026-08-20). The upstream fix
-      # is on bandit main (mtrudel/bandit@d88b219, 2026-10-12) but has no Hex
-      # release. Owned Bandit startup is ABI-pinned to 1.12.5, so an unpublished
-      # git dep would break that contract. Remove this exception when a patched
-      # Hex version ships. Keep the exceptions exact so `mix hex.audit` still
-      # fails on every new advisory.
+      # Keep exceptions exact so `mix hex.audit` fails on every new advisory.
       hex: [
         ignore_advisories: [
           "EEF-CVE-2026-43966",
-          "EEF-CVE-2026-43969",
-          "EEF-CVE-2026-105659"
+          "EEF-CVE-2026-43969"
         ]
       ],
       aliases: aliases()
@@ -122,9 +113,10 @@ defmodule Arbor.MCP.MixProject do
       external_dep(:plug_cowboy, "~> 2.7", optional: true),
       # Host-managed listeners may resolve compatible backend releases. Owned
       # startup separately checks its qualified Bandit/Thousand Island ABI.
-      # Keep Bandit 1.12.5's HTTP/2 validation/flow-control security floor.
-      external_dep(:bandit, "~> 1.12 and >= 1.12.5", optional: true),
-      external_dep(:thousand_island, "~> 1.0", optional: true),
+      # 1.13.1 includes the HTTP/1 authority and HTTP/2 blocked-send fixes
+      # from 1.13.0 plus its Phoenix error-response regression fix.
+      external_dep(:bandit, "~> 1.13 and >= 1.13.1", optional: true),
+      external_dep(:thousand_island, "~> 1.6", optional: true),
       # Not used directly; declared so consumers resolve a cowlib that fixes
       # EEF-CVE-2026-43971 (Link header directive smuggling in cow_link),
       # which plug_cowboy's own requirements still allow.
