@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Security (GHSA-22m7-hr37-pxg3):** `Arbor.MCP.MessageProcessor` recorded
+  `notifications/cancelled` in a VM-global table keyed only by request ID.
+  - A client could make `Context.cancelled?/0` return true for another
+    session's in-flight request that had the same ID.
+  - Cancellations for request IDs that never ran stayed in the table, so any
+    client could grow it without bound.
+
+  Now a cancellation only applies to an in-flight request from the same HTTP
+  session, or, for a sessionless request, the same authenticated principal,
+  tenant and endpoint. Rows belong to the request being dispatched, a
+  cancellation for an unknown ID adds nothing, and the table is swept and
+  capped. Runtime-mounted servers already scoped their cancellations and
+  were not affected; applications that call `MessageProcessor` directly
+  were. **Behavior change:** an anonymous sessionless request can no longer
+  be cancelled from a different HTTP request.
+
 ## [2.0.0-rc.3] — 2026-10-18
 
 ### Changed

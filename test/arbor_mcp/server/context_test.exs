@@ -10,13 +10,23 @@ defmodule Arbor.MCP.Server.ContextTest do
     :ok
   end
 
-  defp context(request_id) do
+  defp context(request_id, scope) do
     %RequestContext{
       method: "tools/call",
       request_id: request_id,
       request?: true,
-      era: :legacy
+      era: :legacy,
+      cancellation_scope: scope
     }
+  end
+
+  defp scope(name), do: {:session, __MODULE__, "#{name}-#{System.unique_integer([:positive])}"}
+
+  # Runs `fun` inside a tracked request, as MessageProcessor dispatches one.
+  defp in_request(request_id, scope, fun) do
+    Cancellation.track(scope, request_id, fn ->
+      Context.with_context(context(request_id, scope), fun)
+    end)
   end
 
   describe "cancelled?/0" do
@@ -25,42 +35,55 @@ defmodule Arbor.MCP.Server.ContextTest do
     end
 
     test "is false when the current request has not been cancelled" do
-      request_id = "ctx-not-cancelled-#{System.unique_integer([:positive])}"
-
-      Context.with_context(context(request_id), fn ->
+      in_request("ctx-not-cancelled", scope("a"), fn ->
         refute Context.cancelled?()
       end)
     end
 
-    test "is true after a cancel is recorded for the current request id" do
-      request_id = "ctx-cancelled-#{System.unique_integer([:positive])}"
+    test "is true after a cancel is recorded for the current request in its scope" do
+      scope = scope("a")
 
-      Context.with_context(context(request_id), fn ->
+      in_request("ctx-cancelled", scope, fn ->
         refute Context.cancelled?()
-        :ok = Cancellation.mark_cancelled(request_id)
+        :ok = Cancellation.cancel(scope, "ctx-cancelled")
         assert Context.cancelled?()
       end)
     end
 
     test "is false for a different request id than the one that was cancelled" do
-      current_id = "ctx-current-#{System.unique_integer([:positive])}"
-      other_id = "ctx-other-#{System.unique_integer([:positive])}"
+      scope = scope("a")
 
-      Context.with_context(context(current_id), fn ->
-        :ok = Cancellation.mark_cancelled(other_id)
+      in_request("ctx-current", scope, fn ->
+        :ok = Cancellation.cancel(scope, "ctx-other")
         refute Context.cancelled?()
       end)
     end
 
+    test "is false when another scope cancels the same request id" do
+      in_request(7, scope("a"), fn ->
+        :ok = Cancellation.cancel(scope("b"), 7)
+        refute Context.cancelled?()
+      end)
+    end
+
+    test "is false without a cancellation scope" do
+      Cancellation.track(nil, "anonymous", fn ->
+        Context.with_context(context("anonymous", nil), fn ->
+          :ok = Cancellation.cancel(nil, "anonymous")
+          refute Context.cancelled?()
+        end)
+      end)
+    end
+
     test "becomes true when another process records the cancel" do
-      request_id = "ctx-oob-#{System.unique_integer([:positive])}"
+      scope = scope("oob")
       parent = self()
 
-      Context.with_context(context(request_id), fn ->
+      in_request("ctx-oob", scope, fn ->
         refute Context.cancelled?()
 
         spawn(fn ->
-          :ok = Cancellation.mark_cancelled(request_id)
+          :ok = Cancellation.cancel(scope, "ctx-oob")
           send(parent, :marked)
         end)
 
@@ -73,7 +96,7 @@ defmodule Arbor.MCP.Server.ContextTest do
   test "scope is absent outside runtime work, including legacy request context" do
     assert Context.scope() == nil
 
-    Context.with_context(context("legacy"), fn ->
+    Context.with_context(context("legacy", nil), fn ->
       assert Context.scope() == nil
     end)
   end
