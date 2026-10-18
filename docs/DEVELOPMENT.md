@@ -149,6 +149,8 @@ ArborMCP uses a comprehensive set of code quality tools to ensure maintainable, 
 - **Pre-commit**: Checks formatting, compilation, Credo, Dialyzer and staged skip tags
 - **Pre-push**: No tasks are currently configured; run relevant tests before pushing
 - **Setup**: `mix git_hooks.install`; the development config also enables auto-install
+- **Worktrees**: hooks run in the checkout being committed, including linked
+  `git worktree` checkouts, so fetch and compile dependencies there first
 - **Source of truth**: `config/config.exs`
 
 ## Testing Strategy

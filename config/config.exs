@@ -240,6 +240,11 @@ if Mix.env() == :dev do
   config :git_hooks,
     auto_install: true,
     verbose: true,
+    # An empty path keeps the installed hook from `cd`-ing into the checkout
+    # that last installed it, so checks run where git starts hooks: the root
+    # of the worktree being committed. It also avoids git_hooks' search for a
+    # `.git` directory, which is a file in linked worktrees.
+    project_path: "",
     hooks: [
       pre_commit: [
         tasks: [
