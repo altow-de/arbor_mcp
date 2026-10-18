@@ -20,12 +20,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# HTTP option transformation adapted from Bandit 1.12.5, lib/bandit.ex.
+# HTTP option transformation adapted from Bandit 1.13.1, lib/bandit.ex.
 # TLS remains host-managed; the owned constructor fixes scheme: :http.
 defmodule Arbor.MCP.Server.HTTP.Bandit.Options do
   @moduledoc false
   @top_level_keys ~w(plug scheme port ip keyfile certfile otp_app cipher_suite display_plug startup_log thousand_island_options http_options http_1_options http_2_options websocket_options)a
-  @http_keys ~w(compress response_encodings deflate_options zstd_options log_exceptions_with_status_codes log_protocol_errors log_client_closures)a
+  @http_keys ~w(compress response_encodings compress_chunked deflate_options zstd_options log_exceptions_with_status_codes log_protocol_errors log_client_closures)a
   @http_1_keys ~w(enabled max_request_line_length max_header_length max_header_count max_requests clear_process_dict gc_every_n_keepalive_requests log_unknown_messages)a
   @http_2_keys ~w(enabled max_header_block_size max_requests max_reset_stream_rate sendfile_chunk_size default_local_settings)a
   @websocket_keys ~w(enabled max_frame_size max_fragmented_message_size validate_text_frames compress deflate_options max_inflate_ratio primitive_ops_module log_protocol_errors)a

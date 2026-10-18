@@ -1,0 +1,258 @@
+defmodule Arbor.MCP.Server.HTTPBanditCompatibilityTest do
+  use ExUnit.Case, async: false
+
+  alias Arbor.MCP.Server.HTTP.Bandit.Owned
+  alias Arbor.MCP.Server.{Runtime, Transport}
+
+  defmodule Handler do
+    use Arbor.MCP.Server.Handler
+  end
+
+  defmodule Echo do
+    @behaviour WebSock
+    def init(observer) do
+      send(observer, {:websocket_connection, self()})
+      {:ok, observer}
+    end
+
+    def handle_in({data, opcode: opcode}, state), do: {:push, {opcode, data}, state}
+    def handle_info(_message, state), do: {:ok, state}
+  end
+
+  defmodule HostPlug do
+    def init(options), do: options
+
+    def call(%{request_path: "/ws"} = conn, options),
+      do: Plug.Conn.upgrade_adapter(conn, :websocket, {Echo, options[:observer], []})
+
+    def call(%{request_path: "/health"} = conn, _options),
+      do: Plug.Conn.send_resp(conn, 200, "host alive")
+
+    def call(conn, options), do: Arbor.MCP.HttpPlug.call(conn, options[:mcp])
+  end
+
+  test "owned qualification rejects other versions before handler effects in an isolated VM" do
+    assert Owned.compatible?()
+
+    # Application metadata belongs to the VM. Exercise rejection without
+    # replacing modules or changing the running test suite's application state.
+    script = """
+    defmodule UnreachableHandler do
+      use Arbor.MCP.Server.Handler
+      def init(_), do: raise("unsupported constructor initialized its handler")
+    end
+
+    originals = for app <- [:bandit, :thousand_island], into: %{} do
+      :ok = Application.load(app)
+      {:ok, properties} = :application.get_all_key(app)
+      {app, properties}
+    end
+
+    for {bandit, island} <- [
+          {"1.12.5", "1.5.0"}, {"1.13.0", "1.6.0"},
+          {"1.13.2", "1.6.0"}, {"1.13.1", "1.5.0"}, {"1.13.1", "1.6.1"}
+        ] do
+      for {app, version} <- [bandit: bandit, thousand_island: island] do
+        :ok = Application.unload(app)
+        :ok = :application.load({:application, app,
+          Keyword.put(originals[app], :vsn, String.to_charlist(version))})
+      end
+
+      false = Arbor.MCP.Server.HTTP.Bandit.Owned.compatible?()
+      {:error, :unsupported_owned_bandit_constructor} =
+        Arbor.MCP.Server.Runtime.start_link(handler: UnreachableHandler,
+          transport: :http, http: [adapter: :bandit, port: 0])
+      {:ok, _} = Arbor.MCP.Server.HTTP.Config.new([adapter: :bandit, port: 0], :borrowed)
+    end
+    IO.puts("unqualified pairs rejected; borrowed configuration accepted")
+    """
+
+    paths = Enum.flat_map(:code.get_path(), &["-pa", List.to_string(&1)])
+    {output, status} = System.cmd("elixir", paths ++ ["-e", script], stderr_to_stdout: true)
+    assert status == 0, output
+    assert output =~ "unqualified pairs rejected; borrowed configuration accepted"
+  end
+
+  for ownership <- [:owned, :host], protocol <- [:http1, :http2] do
+    @tag :physical_http
+    test "#{ownership} Bandit serves MCP over #{protocol} and respects listener ownership" do
+      {root, listener, port} = start_listener(unquote(ownership))
+      conn = connect(port, unquote(protocol))
+
+      body =
+        Jason.encode!(%{
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: %{
+            protocolVersion: "2025-11-25",
+            capabilities: %{},
+            clientInfo: %{name: "bandit-compatibility", version: "1"}
+          }
+        })
+
+      headers = [
+        {"content-type", "application/json"},
+        {"accept", "application/json"},
+        {"mcp-protocol-version", "2025-11-25"}
+      ]
+
+      {:ok, conn, ref} = Mint.HTTP.request(conn, "POST", "/mcp", headers, body)
+      {conn, events} = response(conn, ref)
+      assert {:status, ref, 200} in events
+      result = events |> response_body(ref) |> Jason.decode!()
+      assert result["id"] == 1
+      assert result["result"]["protocolVersion"] == "2025-11-25"
+
+      monitor = Process.monitor(listener)
+      assert :ok = Runtime.stop(root)
+
+      if unquote(ownership) == :host do
+        assert Process.alive?(listener)
+        {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", "/health", [], nil)
+        {conn, events} = response(conn, ref)
+        assert response_body(events, ref) == "host alive"
+        Mint.HTTP.close(conn)
+        assert :ok = Supervisor.stop(listener)
+      else
+        Mint.HTTP.close(conn)
+      end
+
+      assert_receive {:DOWN, ^monitor, :process, ^listener, _}, 1_000
+      assert_port_closed(port)
+    end
+  end
+
+  @tag :physical_http
+  test "host Bandit upgrades WebSockets, echoes data and ping, and closes active connections" do
+    {root, listener, port} = start_listener(:host)
+    {conn, ref, websocket} = websocket(port)
+    assert_receive {:websocket_connection, connection}, 1_000
+
+    {conn, websocket} = send_frame(conn, ref, websocket, {:text, "bandit 1.13.1"})
+    {conn, websocket, frames} = frames(conn, ref, websocket)
+    assert {:text, "bandit 1.13.1"} in frames
+    {conn, websocket} = send_frame(conn, ref, websocket, {:binary, <<0, 1, 255>>})
+    {conn, websocket, frames} = frames(conn, ref, websocket)
+    assert {:binary, <<0, 1, 255>>} in frames
+
+    assert :ok = Runtime.stop(root)
+    assert Process.alive?(connection)
+    {conn, websocket} = send_frame(conn, ref, websocket, {:ping, "still hosted"})
+    {conn, websocket, frames} = frames(conn, ref, websocket)
+    assert {:pong, "still hosted"} in frames
+
+    {conn, websocket} = send_frame(conn, ref, websocket, {:close, 1_000, "done"})
+    {conn, _websocket, frames} = frames(conn, ref, websocket)
+    assert Enum.any?(frames, &match?({:close, 1_000, _}, &1))
+    Mint.HTTP.close(conn)
+
+    # Keep another WebSocket live across host shutdown.
+    {conn, _ref, _websocket} = websocket(port)
+    assert_receive {:websocket_connection, connection}, 1_000
+    monitor = Process.monitor(connection)
+    assert :ok = Supervisor.stop(listener)
+    assert_receive {:DOWN, ^monitor, :process, ^connection, _}, 1_000
+    Mint.HTTP.close(conn)
+    assert_port_closed(port)
+  end
+
+  @tag :physical_http
+  test "the owned MCP Plug does not expose a WebSocket endpoint" do
+    {_root, _listener, port} = start_listener(:owned)
+    {:ok, conn, ref} = Mint.WebSocket.upgrade(:ws, connect(port, :http1), "/mcp", [])
+    {conn, events} = response(conn, ref)
+    assert {:status, ref, 400} in events
+    assert response_body(events, ref) =~ "Session ID required"
+    refute {:status, ref, 101} in events
+    Mint.HTTP.close(conn)
+  end
+
+  defp start_listener(ownership) do
+    options = [
+      startup_log: false,
+      thousand_island_options: [num_acceptors: 1, shutdown_timeout: 100]
+    ]
+
+    {:ok, root} =
+      Runtime.start_link(
+        handler: Handler,
+        transport: if(ownership == :owned, do: :http, else: :mounted_http),
+        http: [adapter: :bandit, port: 0, host: {127, 0, 0, 1}, listener_options: options]
+      )
+
+    on_exit(fn -> Runtime.stop(root) end)
+
+    listener =
+      if ownership == :owned do
+        {:ok, %{adapter: :bandit, listener: listener}} = Transport.http_listener(root)
+        listener
+      else
+        mcp = Arbor.MCP.HttpPlug.init(runtime: root, path: "/mcp")
+
+        {:ok, listener} =
+          Bandit.start_link(
+            [plug: {HostPlug, [mcp: mcp, observer: self()]}, port: 0, ip: {127, 0, 0, 1}] ++
+              options
+          )
+
+        on_exit(fn -> if Process.alive?(listener), do: Supervisor.stop(listener) end)
+        listener
+      end
+
+    {:ok, {{127, 0, 0, 1}, port}} = ThousandIsland.listener_info(listener)
+    {root, listener, port}
+  end
+
+  defp connect(port, protocol) do
+    {:ok, conn} =
+      Mint.HTTP.connect(:http, "127.0.0.1", port, protocols: [protocol], mode: :passive)
+
+    assert Mint.HTTP.protocol(conn) == protocol
+    conn
+  end
+
+  defp response(conn, ref, accumulated \\ []) do
+    {:ok, conn, events} = Mint.HTTP.recv(conn, 0, 2_000)
+    accumulated = accumulated ++ events
+
+    if {:done, ref} in accumulated,
+      do: {conn, accumulated},
+      else: response(conn, ref, accumulated)
+  end
+
+  defp response_body(events, ref),
+    do: for({:data, ^ref, data} <- events, into: "", do: data)
+
+  defp websocket(port) do
+    {:ok, conn, ref} = Mint.WebSocket.upgrade(:ws, connect(port, :http1), "/ws", [])
+    {conn, events} = response(conn, ref)
+    assert {:status, ref, 101} in events
+
+    headers =
+      Enum.flat_map(events, fn
+        {:headers, ^ref, headers} -> headers
+        _ -> []
+      end)
+
+    {:ok, conn, websocket} = Mint.WebSocket.new(conn, ref, 101, headers, mode: :passive)
+    {conn, ref, websocket}
+  end
+
+  defp send_frame(conn, ref, websocket, frame) do
+    {:ok, websocket, data} = Mint.WebSocket.encode(websocket, frame)
+    {:ok, conn} = Mint.WebSocket.stream_request_body(conn, ref, data)
+    {conn, websocket}
+  end
+
+  defp frames(conn, ref, websocket) do
+    {:ok, conn, events} = Mint.WebSocket.recv(conn, 0, 2_000)
+    {:ok, websocket, frames} = Mint.WebSocket.decode(websocket, response_body(events, ref))
+    if frames == [], do: frames(conn, ref, websocket), else: {conn, websocket, frames}
+  end
+
+  defp assert_port_closed(port) do
+    assert {:error, :econnrefused} =
+             :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false], 500)
+  end
+end

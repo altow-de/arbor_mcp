@@ -488,7 +488,7 @@ defmodule Arbor.MCP.Server.HTTPRuntimeStartupTest do
     variants = [
       [],
       [
-        http_options: [compress: false, log_protocol_errors: false],
+        http_options: [compress: false, compress_chunked: true, log_protocol_errors: false],
         http_1_options: [enabled: true, max_header_count: 20, clear_process_dict: false],
         http_2_options: [enabled: false, max_requests: 25],
         websocket_options: [enabled: false, max_frame_size: 2_048]
@@ -499,6 +499,7 @@ defmodule Arbor.MCP.Server.HTTPRuntimeStartupTest do
           num_acceptors: 1,
           num_connections: 5,
           read_timeout: 2_000,
+          handshake_timeout: 1_000,
           shutdown_timeout: 500,
           transport_options: [ip: {127, 0, 0, 1}, nodelay: true]
         ]
