@@ -109,7 +109,7 @@ jobs:
     - name: Install archives and probe a compiler-free release
       run: python3 scripts/check_archive_consumer.py archive-consumer-input
     - name: Preserve qualified source archives
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
       with:
         name: four-package-source-archives-${{ matrix.toolchain.elixir }}
         path: archive-consumer-input/*.tar
