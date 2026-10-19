@@ -1,6 +1,6 @@
 # ArborMCP Quick Start Guide
 
-This guide shows a minimal MCP server and client in the `2.0.0-rc.3` checkout.
+This guide shows a minimal MCP server and client in the `2.0.0-rc.4` checkout.
 The RC is published; see the [RC notes](../guides/V2_RELEASE_CANDIDATE.md)
 for qualification and known limits, and the
 [v1-to-v2 guide](../guides/MIGRATING_V1_TO_V2.md) when upgrading ExMCP.
@@ -10,7 +10,7 @@ for qualification and known limits, and the
 Use Elixir 1.17 or newer with OTP 27 or newer. Add the published package:
 
 ```elixir
-{:arbor_mcp, "== 2.0.0-rc.3"}
+{:arbor_mcp, "== 2.0.0-rc.4"}
 ```
 
 Run `mix deps.get`. Source installation on macOS/Darwin and Linux requires a C17

@@ -186,13 +186,22 @@ defmodule Arbor.MCP.MessageProcessor do
            RequestContext.validate_protocol_mode(request_context, Map.get(opts, :protocol_mode)),
          :ok <- RequestContext.validate_method(request_context),
          {:ok, request_context} <- MRTR.prepare_context(request_context, params, mrtr_opts) do
-      request_context =
-        %{request_context | notification_target: Map.get(opts, :request_notification_target)}
+      scope = cancellation_scope(conn, opts)
 
-      conn
-      |> assign(:request_context, request_context)
-      |> assign(:mrtr_opts, mrtr_opts)
-      |> process_validated_request(opts)
+      request_context = %{
+        request_context
+        | notification_target: Map.get(opts, :request_notification_target),
+          cancellation_scope: scope
+      }
+
+      conn =
+        conn
+        |> assign(:request_context, request_context)
+        |> assign(:mrtr_opts, mrtr_opts)
+
+      Cancellation.track(scope, cancellable_id(request_context), fn ->
+        process_validated_request(conn, opts)
+      end)
     else
       {:error, %Error.ProtocolError{} = error} ->
         conn
@@ -361,6 +370,33 @@ defmodule Arbor.MCP.MessageProcessor do
   end
 
   defp runtime_scope(conn), do: {:message_processor, conn.session_id || self()}
+
+  # A cancellation must come from whoever sent the request: the same HTTP
+  # session, or for a sessionless request the same authenticated principal,
+  # tenant and endpoint. The handler keeps two mounts with equal session ids or
+  # principals apart. Anonymous sessionless requests cannot be correlated with
+  # a cancellation that arrives in another HTTP request, so they get no scope.
+  defp cancellation_scope(%Conn{session_id: session_id}, opts)
+       when is_binary(session_id) and session_id != "",
+       do: {:session, cancellation_owner(opts), session_id}
+
+  defp cancellation_scope(%Conn{} = conn, opts) do
+    case Map.get(opts, :principal_id) do
+      principal when is_binary(principal) and principal != "" ->
+        endpoint = Map.get(opts, :endpoint) || transport_endpoint(conn)
+
+        {:principal, cancellation_owner(opts), endpoint, principal, Map.get(opts, :tenant_id)}
+
+      _anonymous ->
+        nil
+    end
+  end
+
+  defp cancellation_owner(opts), do: Map.get(opts, :server) || Map.get(opts, :handler)
+
+  # `initialize` must not be cancelled (MCP cancellation rules).
+  defp cancellable_id(%RequestContext{method: "initialize"}), do: nil
+  defp cancellable_id(%RequestContext{request_id: request_id}), do: request_id
 
   # Process request using a temporary per-request handler GenServer.
   #
@@ -662,7 +698,7 @@ defmodule Arbor.MCP.MessageProcessor do
   defp process_validated_notification(%Conn{} = conn, opts) do
     # Record cancel before invoking the handler so a request running on
     # another process can observe Context.cancelled?/0 immediately.
-    Cancellation.mark_from_message(conn.request)
+    Cancellation.cancel_from_message(cancellation_scope(conn, opts), conn.request)
 
     # Notifications don't generate responses, just process them
     handler = Map.get(opts, :handler)

@@ -36,6 +36,7 @@ defmodule Arbor.MCP.Server.RequestContext do
     :endpoint,
     :notification_target,
     :application_context,
+    :cancellation_scope,
     meta: %{},
     trace_context: %{}
   ]
@@ -61,6 +62,7 @@ defmodule Arbor.MCP.Server.RequestContext do
           endpoint: String.t() | nil,
           notification_target: term(),
           application_context: term(),
+          cancellation_scope: term(),
           meta: map(),
           trace_context: map()
         }

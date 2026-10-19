@@ -2,7 +2,7 @@
 
 ArborMCP provides Elixir clients and servers for the [Model Context Protocol](https://modelcontextprotocol.io/), with stdio, Streamable HTTP and BEAM-local transports. Its Hex package is `arbor_mcp`; its Elixir module namespace is `Arbor.MCP.*`.
 
-**Version 2 release candidate.** ArborMCP `2.0.0-rc.3` is published on Hex
+**Version 2 release candidate.** ArborMCP `2.0.0-rc.4` is published on Hex
 for downstream integration testing, with ArborRPC on its independent 1.x line.
 Stable `arbor_mcp` 2.0 has not been released. The runtime/scheduler redesign and
 accepted API cleanup are implemented; the [roadmap](docs/ROADMAP.md) and
@@ -20,7 +20,7 @@ For reproducible downstream RC testing:
 
 ```elixir
 defp deps do
-  [{:arbor_mcp, "== 2.0.0-rc.3"}]
+  [{:arbor_mcp, "== 2.0.0-rc.4"}]
 end
 ```
 
@@ -108,7 +108,7 @@ HTTP applications mount `Arbor.MCP.HttpPlug` with an explicit Runtime inside an 
 Published 1.x API documentation is available at [hexdocs.pm/ex_mcp](https://hexdocs.pm/ex_mcp). It describes the previous package and namespace. The v2 migration guide is available in this checkout and is included in the package and ExDoc documentation.
 
 For v2 API documentation from the checkout, run `mix docs --warnings-as-errors`
-after fetching development dependencies. The original RC API docs are at [hexdocs.pm/arbor_mcp/2.0.0-rc.1](https://hexdocs.pm/arbor_mcp/2.0.0-rc.1/). The current RC API docs are at [hexdocs.pm/arbor_mcp/2.0.0-rc.3](https://hexdocs.pm/arbor_mcp/2.0.0-rc.3/). The [documentation index](docs/README.md) separates guides, contributor checks and release policy.
+after fetching development dependencies. The original RC API docs are at [hexdocs.pm/arbor_mcp/2.0.0-rc.1](https://hexdocs.pm/arbor_mcp/2.0.0-rc.1/). The current RC API docs are at [hexdocs.pm/arbor_mcp/2.0.0-rc.4](https://hexdocs.pm/arbor_mcp/2.0.0-rc.4/). The [documentation index](docs/README.md) separates guides, contributor checks and release policy.
 
 ## AI agent guidance
 

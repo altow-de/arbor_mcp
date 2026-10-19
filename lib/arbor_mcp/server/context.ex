@@ -48,6 +48,11 @@ defmodule Arbor.MCP.Server.Context do
   connection/session, direction and invocation token. Cancellation prevents
   that invocation from committing state and the runtime stops unresponsive
   callback tasks after the configured grace period.
+
+  Handler-process callbacks dispatched by `Arbor.MCP.MessageProcessor` only
+  observe a cancellation sent from the same HTTP session, or for a
+  sessionless request from the same authenticated principal, tenant and
+  endpoint. Anonymous sessionless requests cannot be cancelled this way.
   """
   @spec cancelled?() :: boolean()
   def cancelled? do
@@ -55,8 +60,8 @@ defmodule Arbor.MCP.Server.Context do
       CallbackContext.cancelled?()
     else
       case current() do
-        %RequestContext{request_id: request_id} when not is_nil(request_id) ->
-          Cancellation.cancelled?(request_id)
+        %RequestContext{request_id: request_id, cancellation_scope: scope} ->
+          Cancellation.cancelled?(scope, request_id)
 
         _other ->
           false
@@ -194,7 +199,6 @@ defmodule Arbor.MCP.Server.Context do
       fun.()
     after
       restore(previous)
-      unless CallbackContext.current(), do: Cancellation.clear(context.request_id)
     end
   end
 
