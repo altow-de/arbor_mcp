@@ -1,6 +1,8 @@
 defmodule Arbor.MCP.Server.HTTPBanditCompatibilityTest do
   use ExUnit.Case, async: false
 
+  import Arbor.MCP.TestHelpers, only: [assert_socket_closed: 2, listening_socket: 1]
+
   alias Arbor.MCP.Server.HTTP.Bandit.Owned
   alias Arbor.MCP.Server.{Runtime, Transport}
 
@@ -77,6 +79,7 @@ defmodule Arbor.MCP.Server.HTTPBanditCompatibilityTest do
     @tag :physical_http
     test "#{ownership} Bandit serves MCP over #{protocol} and respects listener ownership" do
       {root, listener, port} = start_listener(unquote(ownership))
+      socket = listening_socket(port)
       conn = connect(port, unquote(protocol))
 
       body =
@@ -105,6 +108,7 @@ defmodule Arbor.MCP.Server.HTTPBanditCompatibilityTest do
       assert result["result"]["protocolVersion"] == "2025-11-25"
 
       monitor = Process.monitor(listener)
+      socket_monitor = :erlang.monitor(:port, socket)
       assert :ok = Runtime.stop(root)
 
       if unquote(ownership) == :host do
@@ -119,13 +123,14 @@ defmodule Arbor.MCP.Server.HTTPBanditCompatibilityTest do
       end
 
       assert_receive {:DOWN, ^monitor, :process, ^listener, _}, 1_000
-      assert_port_closed(port)
+      assert_socket_closed(socket, socket_monitor)
     end
   end
 
   @tag :physical_http
   test "host Bandit upgrades WebSockets, echoes data and ping, and closes active connections" do
     {root, listener, port} = start_listener(:host)
+    socket = listening_socket(port)
     {conn, ref, websocket} = websocket(port)
     assert_receive {:websocket_connection, connection}, 1_000
 
@@ -151,10 +156,11 @@ defmodule Arbor.MCP.Server.HTTPBanditCompatibilityTest do
     {conn, _ref, _websocket} = websocket(port)
     assert_receive {:websocket_connection, connection}, 1_000
     monitor = Process.monitor(connection)
+    socket_monitor = :erlang.monitor(:port, socket)
     assert :ok = Supervisor.stop(listener)
     assert_receive {:DOWN, ^monitor, :process, ^connection, _}, 1_000
     Mint.HTTP.close(conn)
-    assert_port_closed(port)
+    assert_socket_closed(socket, socket_monitor)
   end
 
   @tag :physical_http
@@ -249,10 +255,5 @@ defmodule Arbor.MCP.Server.HTTPBanditCompatibilityTest do
     {:ok, conn, events} = Mint.WebSocket.recv(conn, 0, 2_000)
     {:ok, websocket, frames} = Mint.WebSocket.decode(websocket, response_body(events, ref))
     if frames == [], do: frames(conn, ref, websocket), else: {conn, websocket, frames}
-  end
-
-  defp assert_port_closed(port) do
-    assert {:error, :econnrefused} =
-             :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false], 500)
   end
 end
