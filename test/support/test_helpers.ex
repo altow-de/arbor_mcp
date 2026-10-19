@@ -37,6 +37,49 @@ defmodule Arbor.MCP.TestHelpers do
   end
 
   @doc """
+  Returns the listening TCP socket bound to `port`.
+
+  Capture it while the listener runs, monitor it with
+  `:erlang.monitor(:port, socket)`, and pass both to `assert_socket_closed/3`
+  after shutdown. Connecting to the old port number instead is not proof of
+  closure: the probe can be reset mid-handshake while the socket closes, reach
+  a replacement listener, or even self-connect on Linux.
+  """
+  @spec listening_socket(:inet.port_number()) :: port()
+  def listening_socket(port) do
+    sockets =
+      for socket <- Port.list(),
+          Port.info(socket, :name) == {:name, ~c"tcp_inet"},
+          match?({:ok, {_address, ^port}}, :inet.sockname(socket)),
+          :listen in socket_states(socket),
+          do: socket
+
+    case sockets do
+      [socket] -> socket
+      other -> flunk("expected one listening socket on port #{port}, found #{inspect(other)}")
+    end
+  end
+
+  @doc """
+  Asserts that `socket`, monitored as `monitor`, has closed.
+  """
+  @spec assert_socket_closed(port(), reference(), timeout()) :: true
+  def assert_socket_closed(socket, monitor, timeout \\ 1_000) do
+    assert_receive {:DOWN, ^monitor, :port, ^socket, _reason}, timeout
+    assert Port.info(socket) == nil
+  end
+
+  defp socket_states(socket) do
+    case :inet.info(socket) do
+      %{states: states} -> states
+      _closed -> []
+    end
+  catch
+    # The socket can close between Port.list/0 and this call.
+    _kind, _reason -> []
+  end
+
+  @doc """
   Starts a test HTTP server on an available port.
 
   Returns `{:ok, server_pid, port}` or `{:error, reason}`.
@@ -329,10 +372,12 @@ defmodule Arbor.MCP.TestHelpers do
   # Capture this Runtime's actual listener before registering its exit cleanup.
   defp register_cleanup(pid, port) do
     {:ok, %{listener: listener}} = Arbor.MCP.Server.Transport.http_listener(pid)
+    socket = listening_socket(port)
 
     on_exit(fn ->
       root_monitor = Process.monitor(pid)
       listener_monitor = Process.monitor(listener)
+      socket_monitor = :erlang.monitor(:port, socket)
 
       case Arbor.MCP.Server.Runtime.stop(pid) do
         :ok -> :ok
@@ -341,9 +386,7 @@ defmodule Arbor.MCP.TestHelpers do
 
       assert_receive {:DOWN, ^root_monitor, :process, ^pid, _reason}, 1_000
       assert_receive {:DOWN, ^listener_monitor, :process, ^listener, _reason}, 1_000
-
-      assert {:error, :econnrefused} =
-               :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false], 1_000)
+      assert_socket_closed(socket, socket_monitor)
     end)
   end
 

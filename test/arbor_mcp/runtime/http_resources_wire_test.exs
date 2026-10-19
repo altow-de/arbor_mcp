@@ -1,6 +1,8 @@
 defmodule Arbor.MCP.Server.Runtime.HTTPResourcesWireTest do
   use ExUnit.Case, async: false
 
+  import Arbor.MCP.TestHelpers, only: [assert_socket_closed: 2, listening_socket: 1]
+
   alias Arbor.MCP.{HttpPlug, SessionManager}
   alias Arbor.MCP.Server.Runtime
   alias Arbor.MCP.Server.Runtime.{HTTPWriterProxy, HTTPWriterRegistry}
@@ -179,14 +181,14 @@ defmodule Arbor.MCP.Server.Runtime.HTTPResourcesWireTest do
     ref = make_ref()
     {:ok, listener} = Plug.Cowboy.http(Router, [], port: 0, ip: {127, 0, 0, 1}, ref: ref)
     {{127, 0, 0, 1}, port} = :ranch.get_addr(ref)
+    socket = listening_socket(port)
 
     on_exit(fn ->
       monitor = Process.monitor(listener)
+      socket_monitor = :erlang.monitor(:port, socket)
       assert :ok = :ranch.stop_listener(ref)
       assert_receive {:DOWN, ^monitor, :process, ^listener, _reason}, 1_000
-
-      assert {:error, :econnrefused} =
-               :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false], 1_000)
+      assert_socket_closed(socket, socket_monitor)
     end)
 
     {runtime, port}

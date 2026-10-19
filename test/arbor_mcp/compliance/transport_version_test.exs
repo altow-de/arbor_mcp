@@ -1,6 +1,8 @@
 defmodule Arbor.MCP.Compliance.TransportVersionTest do
   use ExUnit.Case, async: false
 
+  import Arbor.MCP.TestHelpers, only: [assert_socket_closed: 2, listening_socket: 1]
+
   # Aliases
   alias Arbor.MCP.Client
   alias Arbor.MCP.Protocol.VersionNegotiator
@@ -86,6 +88,7 @@ defmodule Arbor.MCP.Compliance.TransportVersionTest do
     # Start the server using the high-level API with unique ranch ref
     {:ok, pid} = VersionTestServer.start_link(transport: :http, port: port, ranch_ref: ranch_ref)
     {:ok, %{listener: listener}} = Transport.http_listener(pid)
+    socket = listening_socket(port)
     base_url = "http://localhost:#{port}"
 
     # Return the base_url and a function to stop the server
@@ -97,6 +100,7 @@ defmodule Arbor.MCP.Compliance.TransportVersionTest do
        stop_server_fn: fn ->
          root_monitor = Process.monitor(pid)
          listener_monitor = Process.monitor(listener)
+         socket_monitor = :erlang.monitor(:port, socket)
 
          case Runtime.stop(pid) do
            :ok -> :ok
@@ -105,9 +109,7 @@ defmodule Arbor.MCP.Compliance.TransportVersionTest do
 
          assert_receive {:DOWN, ^root_monitor, :process, ^pid, _reason}, 1_000
          assert_receive {:DOWN, ^listener_monitor, :process, ^listener, _reason}, 1_000
-
-         assert {:error, :econnrefused} =
-                  :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false], 1_000)
+         assert_socket_closed(socket, socket_monitor)
        end
      }}
   end

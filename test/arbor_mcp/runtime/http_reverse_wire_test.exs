@@ -1,6 +1,9 @@
 defmodule Arbor.MCP.Server.Runtime.HTTPReverseWireTest do
   use ExUnit.Case, async: false
 
+  import Arbor.MCP.TestHelpers,
+    only: [assert_socket_closed: 2, assert_socket_closed: 3, listening_socket: 1]
+
   alias Arbor.MCP.{HttpPlug, SessionManager}
   alias Arbor.MCP.Server.Runtime
 
@@ -308,7 +311,7 @@ defmodule Arbor.MCP.Server.Runtime.HTTPReverseWireTest do
     ref = make_ref()
     {:ok, listener} = Plug.Cowboy.http(Router, [], port: 0, ip: {127, 0, 0, 1}, ref: ref)
     {{127, 0, 0, 1}, port} = :ranch.get_addr(ref)
-    socket = listening_socket(listener, port)
+    socket = listening_socket(port)
 
     on_exit(fn ->
       monitor = Process.monitor(listener)
@@ -323,27 +326,6 @@ defmodule Arbor.MCP.Server.Runtime.HTTPReverseWireTest do
     end)
 
     {runtime, port}
-  end
-
-  defp listening_socket(listener, port) do
-    {:ranch_acceptors_sup, acceptors, :supervisor, _modules} =
-      List.keyfind(Supervisor.which_children(listener), :ranch_acceptors_sup, 0)
-
-    {:links, links} = Process.info(acceptors, :links)
-
-    [socket] =
-      Enum.filter(links, fn link ->
-        is_port(link) and :inet.sockname(link) == {:ok, {{127, 0, 0, 1}, port}}
-      end)
-
-    socket
-  end
-
-  defp assert_socket_closed(socket, monitor, timeout \\ 1_000) do
-    # Observe the exact resource: a new connection to its old numeric port can
-    # reach a replacement listener or even self-connect on Linux.
-    assert_receive {:DOWN, ^monitor, :port, ^socket, _reason}, timeout
-    assert Port.info(socket) == nil
   end
 
   defp reverse_event(socket, method) do
