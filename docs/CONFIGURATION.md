@@ -1104,6 +1104,97 @@ resolver functions. OAuth token `sub` and `tenant_id` claims are used by
 default when available; these identities are authenticated into the sealed
 state without embedding bearer tokens.
 
+## Proxy mode
+
+A process that forwards a downstream MCP request to an upstream server, such
+as a gateway in front of several MCP servers, must leave some decisions to its
+own caller: the downstream client answers input requests, declares the
+capabilities, receives the progress and decides about cancellation. Proxy
+mode consists of request options on `Arbor.MCP.Client` operations. They are
+opt-in per request and change nothing for requests that do not set them. A
+`nil` value leaves an option unset, so values received from downstream can be
+passed through unchanged.
+
+| Option | Effect |
+|---|---|
+| `mrtr: :manual` | Returns a validated `input_required` result to the caller instead of fulfilling it with the client handler. `:max_input_requests` and `:max_mrtr_bytes` still apply; `:max_mrtr_rounds` does not, because the caller runs the rounds. |
+| `input_responses:`, `request_state:` | Put the caller's `inputResponses` map and opaque `requestState` string on the retried request. Valid for `tools/call`, `resources/read` and `prompts/get`. |
+| `client_capabilities:` | Replaces the connection's capabilities in this request's MCP 2026-07-28 `_meta`. Legacy requests carry no per-request capabilities. |
+| `progress_to: pid` | Sends this request's progress notifications to `pid` as `{:arbor_mcp_progress, progress_token, params}` instead of `c:Arbor.MCP.Client.Handler.handle_progress/3`. Needs a `:progress_token` and an MCP 2026-07-28 request stream. |
+| `cancel_on_caller_exit: true` | Monitors the process that called the operation. If it exits while the request is in flight, the client cancels the request upstream. |
+
+On MCP 2026-07-28 a server chooses its input requests from the capabilities of
+the request it is answering, and it must not infer them from earlier
+requests. A proxy therefore declares exactly what its downstream client
+declared for that request. If it declares more, the server may ask for a URL
+elicitation that the downstream client cannot answer. The client's own checks,
+such as automatic MRTR fulfillment and Tasks result validation, keep using the
+capabilities the client was started with.
+
+Cancellation after a caller exit closes a modern HTTP request stream, which is
+the cancellation signal of that revision, and sends `notifications/cancelled`
+on every transport. A server that correlates sessionless cancellations by
+authenticated principal, as a Runtime-mounted `Arbor.MCP.HttpPlug` with
+`:principal_id` does, then stops the work at once rather than at its next write
+to the closed stream. A legacy request is cancelled with
+`notifications/cancelled` alone.
+
+A request with `progress_to:` or `cancel_on_caller_exit: true` always gets its
+own request stream on modern Streamable HTTP, so other requests through the
+same client do not wait for it. A legacy Streamable HTTP request stays in
+flight outside the client process only with `use_sse: true`; with
+`use_sse: false` it completes synchronously inside the client process, and
+there is nothing left to watch.
+
+Run the upstream call in a helper process, so the forwarding process stays
+free to relay progress. The helper is linked: when the forwarding process
+exits, for example because the Runtime stops a cancelled callback, the helper
+exits with it, and the client cancels the upstream request.
+
+```elixir
+def forward_call(client, tool, arguments, downstream) do
+  owner = self()
+  token = "gateway-#{System.unique_integer([:positive])}"
+
+  task =
+    Task.async(fn ->
+      Arbor.MCP.Client.call_tool(client, tool, arguments,
+        format: :map,
+        timeout: 300_000,
+        mrtr: :manual,
+        input_responses: downstream.input_responses,
+        request_state: downstream.request_state,
+        client_capabilities: downstream.client_capabilities,
+        progress_token: token,
+        progress_to: owner,
+        cancel_on_caller_exit: true
+      )
+    end)
+
+  await_upstream(task, token)
+end
+
+defp await_upstream(%Task{ref: ref} = task, token) do
+  receive do
+    {:arbor_mcp_progress, ^token, %{"progress" => progress} = params} ->
+      _ = Arbor.MCP.Server.Context.report_progress(progress, params["total"], params["message"])
+      await_upstream(task, token)
+
+    {^ref, result} ->
+      Process.demonitor(ref, [:flush])
+      result
+  end
+end
+```
+
+An `input_required` result comes back with `"resultType" => "input_required"`,
+its `inputRequests` and its `requestState`; with the default `format: :struct`,
+`Arbor.MCP.Response.to_raw/1` returns those fields. The forwarding server returns its
+own `input_required` to the downstream client and seals the upstream
+`requestState` in its own application request state; on the downstream retry
+it passes the upstream state and the downstream `inputResponses` back with
+`request_state:` and `input_responses:`.
+
 ## Modern subscriptions (MCP 2026-07-28)
 
 Open an immutable notification stream with `Arbor.MCP.Client.listen/3`. The call

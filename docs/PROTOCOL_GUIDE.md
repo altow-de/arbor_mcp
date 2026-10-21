@@ -353,6 +353,8 @@ token:
 ```
 
 `Arbor.MCP.Client.call_tool/4` also accepts `:meta` and merges it with `:progress_token`.
+With `progress_to: pid`, one request's progress goes to that process instead of
+the client handler; see [Proxy mode](CONFIGURATION.md#proxy-mode).
 
 ## Cancellation
 
@@ -378,6 +380,9 @@ A server can emit the same notification toward a client request:
 
 You cannot cancel `initialize`. `send_cancelled/3` returns
 `{:error, :cannot_cancel_initialize}` in that case.
+
+To cancel a request when the process that made it exits, pass
+`cancel_on_caller_exit: true`; see [Proxy mode](CONFIGURATION.md#proxy-mode).
 
 This is request cancellation, not the experimental Tasks extension
 (`Arbor.MCP.Client.cancel_task/3`).

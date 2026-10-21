@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Proxy mode for `Arbor.MCP.Client` operations, for a process that forwards a
+  downstream MCP request to an upstream server. Every option is opt-in per
+  request, and `nil` leaves it unset.
+  - `mrtr: :manual` returns a validated `input_required` result instead of
+    fulfilling it with the client handler. `input_responses:` and
+    `request_state:` carry the caller's continuation on the next round of
+    `tools/call`, `resources/read` or `prompts/get`.
+  - `client_capabilities:` replaces the connection's capabilities in one
+    MCP 2026-07-28 request's `_meta`. Legacy requests carry none.
+  - `progress_to:` sends a request's progress to a process as
+    `{:arbor_mcp_progress, progress_token, params}` instead of the client
+    handler.
+  - `cancel_on_caller_exit: true` cancels a request upstream when the
+    calling process exits while it is in flight: a modern request stream is
+    closed, and `notifications/cancelled` is sent on every transport.
+
+  A request with `progress_to:` or `cancel_on_caller_exit: true` runs on its
+  own modern request stream, so parallel calls through one client do not
+  wait for each other. See "Proxy mode" in `docs/CONFIGURATION.md`.
+
 ## [2.0.0-rc.4] — 2026-10-19
 
 ### Fixed

@@ -66,6 +66,9 @@ defmodule Arbor.MCP.Client.Operations.Tools do
   - `:idempotency_key_path` - String or list path for the injected key
     (default: `["idempotencyKey"]`). If the path already contains a different
     value, the call fails instead of silently changing it.
+  - `:mrtr`, `:input_responses`, `:request_state`, `:client_capabilities`,
+    `:progress_to`, `:cancel_on_caller_exit` - proxy-mode options; see
+    `Arbor.MCP.Client.call_tool/4`
 
   ## Examples
 

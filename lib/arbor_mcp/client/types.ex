@@ -25,6 +25,12 @@ defmodule Arbor.MCP.Client.Types do
           | {:idempotency_key, String.t()}
           | {:idempotency_key_path, String.t() | [String.t()]}
           | {:cursor, String.t()}
+          | {:mrtr, :auto | :manual}
+          | {:input_responses, map() | nil}
+          | {:request_state, String.t() | nil}
+          | {:client_capabilities, map() | nil}
+          | {:progress_to, pid() | nil}
+          | {:cancel_on_caller_exit, boolean() | nil}
           | {atom(), term()}
   @type request_opts :: [request_option()]
 

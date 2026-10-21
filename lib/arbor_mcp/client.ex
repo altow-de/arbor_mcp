@@ -558,6 +558,35 @@ defmodule Arbor.MCP.Client do
 
   - `:timeout` - Request timeout (default: 30000)
   - `:format` - Return format (:map or :struct, default: :struct)
+
+  `Arbor.MCP.Client.Operations.Tools.call_tool/4` lists the remaining
+  request options.
+
+  ## Proxy mode
+
+  A process that forwards a downstream request, such as an MCP gateway, can
+  leave MRTR, capabilities, progress and cancellation to its caller. These
+  options are opt-in per request and also apply to `read_resource/3` and
+  `get_prompt/4` where noted. `nil` leaves an option unset.
+
+  - `:mrtr` - `:auto` (default) fulfills `input_required` with the client
+    handler; `:manual` returns the validated `input_required` result
+  - `:input_responses` - `inputResponses` map for the next MRTR round
+    (`tools/call`, `resources/read`, `prompts/get`)
+  - `:request_state` - opaque `requestState` string for the next MRTR round
+  - `:client_capabilities` - replaces the connection's capabilities in this
+    request's MCP 2026-07-28 `_meta`; legacy requests carry none
+  - `:progress_to` - pid that receives this request's progress as
+    `{:arbor_mcp_progress, progress_token, params}` instead of the client
+    handler; requires `:progress_token`
+  - `:cancel_on_caller_exit` - when `true`, the client monitors the calling
+    process and cancels the request upstream if that process exits while the
+    request is in flight
+
+  A request with `:progress_to` or `cancel_on_caller_exit: true` gets its own
+  request stream on modern Streamable HTTP, so other requests through the same
+  client do not wait for it. See the "Proxy mode" section of the
+  configuration guide for the full contract and an example.
   """
   @spec call_tool(t(), String.t(), map(), keyword() | timeout()) ::
           {:ok, Arbor.MCP.Response.t() | map()} | {:error, term()}
