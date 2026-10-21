@@ -341,6 +341,26 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
       assert_receive :app_cancelled, 1_000
       assert Client.get_pending_requests(client) == []
     end
+
+    test "settles its caller at once when it is cancelled", %{url: url} do
+      client = start_client(url)
+
+      task =
+        Task.async(fn ->
+          Client.call_tool(client, "hold", %{},
+            cancel_on_caller_exit: true,
+            format: :map,
+            timeout: 10_000
+          )
+        end)
+
+      assert_receive {:app_waiting, _app}, 2_000
+      assert [request_id] = Client.get_pending_requests(client)
+      assert :ok = Client.send_cancelled(client, request_id, "superseded")
+
+      assert {:error, :cancelled} = Task.await(task, 1_000)
+      assert Client.get_pending_requests(client) == []
+    end
   end
 
   describe "a watched request on MCP 2025-06-18" do
