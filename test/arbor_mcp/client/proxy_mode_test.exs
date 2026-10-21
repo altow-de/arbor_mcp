@@ -5,6 +5,7 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
   use ExUnit.Case, async: false
 
   alias Arbor.MCP.Client
+  alias Arbor.MCP.Error.ProtocolError
   alias Arbor.MCP.Server.{Context, Runtime}
 
   @key :binary.copy(<<7>>, 32)
@@ -205,6 +206,43 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
 
       assert message["content"]["text"] == "Greet Tom"
       assert_received {:app_retry, ^responses, %{"step" => 1}}
+    end
+
+    test "returns input_required with an explicit timeout as well", %{url: url} do
+      client = start_client(url, capabilities: %{"elicitation" => %{"form" => %{}}})
+
+      assert {:ok, %{"resultType" => "input_required", "requestState" => request_state}} =
+               Client.call_tool(client, "ask", %{}, mrtr: :manual, timeout: 5_000, format: :map)
+
+      refute_received {:app_retry, _responses, _request_state}
+      responses = %{"name" => %{"action" => "accept", "content" => %{"name" => "Tom"}}}
+
+      assert {:ok, %{"resultType" => "complete", "content" => [%{"text" => "Welcome, Tom"}]}} =
+               Client.call_tool(client, "ask", %{},
+                 mrtr: :manual,
+                 input_responses: responses,
+                 request_state: request_state,
+                 timeout: 5_000,
+                 format: :map
+               )
+    end
+
+    test "checks input_required against the MRTR limits", %{url: url} do
+      client = start_client(url, capabilities: %{"elicitation" => %{"form" => %{}}})
+
+      assert {:error, %ProtocolError{message: "MRTR input request limit exceeded"}} =
+               Client.call_tool(client, "ask", %{},
+                 mrtr: :manual,
+                 max_input_requests: 0,
+                 format: :map
+               )
+
+      assert {:error, %ProtocolError{message: "MRTR byte limit exceeded"}} =
+               Client.call_tool(client, "ask", %{},
+                 mrtr: :manual,
+                 max_mrtr_bytes: 16,
+                 format: :map
+               )
     end
   end
 
