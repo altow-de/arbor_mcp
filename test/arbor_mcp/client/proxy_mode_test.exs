@@ -26,23 +26,29 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
     end
 
     @impl true
+    def handle_list_prompts(_cursor, state) do
+      {:ok, [%{name: "greeting", description: "Greets a named person"}], nil, state}
+    end
+
+    @impl true
+    def handle_get_prompt("greeting", _arguments, state) do
+      case Context.input_responses() do
+        nil ->
+          {:input_required, name_request(), %{"step" => 1}, state}
+
+        responses ->
+          send(state.test_pid, {:app_retry, responses, Context.request_state()})
+          name = get_in(responses, ["name", "content", "name"])
+          message = %{role: "user", content: %{type: "text", text: "Greet #{name}"}}
+          {:ok, %{messages: [message]}, state}
+      end
+    end
+
+    @impl true
     def handle_call_tool("ask", _arguments, state) do
       case Context.input_responses() do
         nil ->
-          requests = %{
-            "name" => %{
-              "method" => "elicitation/create",
-              "params" => %{
-                "message" => "What should we call you?",
-                "requestedSchema" => %{
-                  "type" => "object",
-                  "properties" => %{"name" => %{"type" => "string"}}
-                }
-              }
-            }
-          }
-
-          {:input_required, requests, %{"step" => 1}, state}
+          {:input_required, name_request(), %{"step" => 1}, state}
 
         responses ->
           send(state.test_pid, {:app_retry, responses, Context.request_state()})
@@ -64,6 +70,21 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
       receive do
         :release -> {:ok, %{content: [%{type: "text", text: "done"}]}, state}
       end
+    end
+
+    defp name_request do
+      %{
+        "name" => %{
+          "method" => "elicitation/create",
+          "params" => %{
+            "message" => "What should we call you?",
+            "requestedSchema" => %{
+              "type" => "object",
+              "properties" => %{"name" => %{"type" => "string"}}
+            }
+          }
+        }
+      }
     end
 
     # Holds the request open without writing to its response stream until the
@@ -157,6 +178,51 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
       assert result["resultType"] == "complete"
       assert result["content"] == [%{"type" => "text", "text" => "Welcome, Tom"}]
       assert_received {:app_retry, ^responses, %{"step" => 1}}
+    end
+
+    test "applies to prompts/get the same way", %{url: url} do
+      client = start_client(url, capabilities: %{"elicitation" => %{"form" => %{}}})
+
+      assert {:ok, %{"resultType" => "input_required", "requestState" => request_state}} =
+               Client.get_prompt(client, "greeting", %{}, mrtr: :manual, format: :map)
+
+      responses = %{"name" => %{"action" => "accept", "content" => %{"name" => "Tom"}}}
+
+      assert {:ok, %{"resultType" => "complete", "messages" => [message]}} =
+               Client.get_prompt(client, "greeting", %{},
+                 mrtr: :manual,
+                 input_responses: responses,
+                 request_state: request_state,
+                 format: :map
+               )
+
+      assert message["content"]["text"] == "Greet Tom"
+      assert_received {:app_retry, ^responses, %{"step" => 1}}
+    end
+  end
+
+  describe "proxy options" do
+    test "reject invalid values before anything is sent", %{url: url} do
+      client = start_client(url)
+
+      for {opts, message} <- [
+            {[mrtr: :later], "mrtr must be :auto or :manual"},
+            {[input_responses: []], "input_responses must be a map"},
+            {[request_state: %{}], "request_state must be a string"},
+            {[client_capabilities: []], "client_capabilities must be a map"},
+            {[progress_to: :owner], "progress_to must be a pid"},
+            {[cancel_on_caller_exit: :yes], "cancel_on_caller_exit must be a boolean"}
+          ] do
+        assert_raise ArgumentError, message, fn ->
+          Client.call_tool(client, "context", %{}, [format: :map] ++ opts)
+        end
+      end
+
+      assert_raise ArgumentError, ~r/only valid for tools\/call/, fn ->
+        Client.list_tools(client, input_responses: %{})
+      end
+
+      refute_received {:app_context, _era, _capabilities, _meta}
     end
   end
 
