@@ -4,6 +4,8 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
   # against a real Runtime-mounted Arbor.MCP.HttpPlug on Bandit.
   use ExUnit.Case, async: false
 
+  import Arbor.MCP.TestHelpers, only: [wait_until: 2]
+
   alias Arbor.MCP.Client
   alias Arbor.MCP.Error.ProtocolError
   alias Arbor.MCP.Server.{Context, Runtime}
@@ -388,6 +390,72 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
       assert Client.get_pending_requests(client) == []
     end
 
+    test "keeps progress and cancellation apart from a parallel watched request", %{url: url} do
+      client = start_client(url, handler: {ClientHandler, [test_pid: self()]})
+      owner = self()
+
+      watched_call = fn token ->
+        Client.call_tool(client, "hold", %{},
+          progress_token: token,
+          progress_to: owner,
+          cancel_on_caller_exit: true,
+          format: :map,
+          timeout: 10_000
+        )
+      end
+
+      {first, first_ref} = spawn_monitor(fn -> watched_call.("first") end)
+      assert_receive {:app_waiting, first_app}, 2_000
+
+      second = Task.async(fn -> watched_call.("second") end)
+      assert_receive {:app_waiting, second_app}, 2_000
+      assert length(Client.get_pending_requests(client)) == 2
+
+      send(first_app, {:report, self(), 1})
+      assert_receive {:app_reported, ^first_app, :ok}, 2_000
+      assert_receive {:arbor_mcp_progress, "first", %{"progress" => 1}}, 2_000
+
+      Process.exit(first, :kill)
+      assert_receive {:DOWN, ^first_ref, :process, ^first, :killed}
+      assert_receive {:app_cancelled, ^first_app}, 1_000
+
+      send(second_app, {:report, self(), 2})
+      assert_receive {:app_reported, ^second_app, :ok}, 2_000
+      assert_receive {:arbor_mcp_progress, "second", %{"progress" => 2}}, 2_000
+
+      send(second_app, :release)
+      assert {:ok, %{"content" => [%{"text" => "released"}]}} = Task.await(second, 2_000)
+      refute_received {:client_handler_progress, _request_id, _params}
+    end
+
+    # Without :principal_id the app cannot match the sessionless
+    # notifications/cancelled to its request; only the closed request stream
+    # reaches it, at its next write.
+    test "closes its request stream when its caller exits" do
+      client = start_client(start_app(principal_id: nil))
+
+      {caller, caller_ref} =
+        spawn_monitor(fn ->
+          Client.call_tool(client, "hold", %{},
+            progress_token: "closing",
+            cancel_on_caller_exit: true,
+            format: :map,
+            timeout: 10_000
+          )
+        end)
+
+      assert_receive {:app_waiting, app}, 2_000
+      send(app, {:report, self(), 1})
+      assert_receive {:app_reported, ^app, :ok}, 2_000
+
+      Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^caller_ref, :process, ^caller, :killed}
+      wait_until(fn -> Client.get_pending_requests(client) == [] end, timeout: 2_000)
+
+      wait_until(fn -> report(app) == {:error, :stream_closed} end, timeout: 2_000)
+      send(app, :release)
+    end
+
     test "settles its caller at once when it is cancelled", %{url: url} do
       client = start_client(url)
 
@@ -434,7 +502,17 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
     end
   end
 
-  defp start_app do
+  defp report(app) do
+    send(app, {:report, self(), 1})
+
+    receive do
+      {:app_reported, ^app, result} -> result
+    after
+      1_000 -> :no_answer
+    end
+  end
+
+  defp start_app(opts \\ []) do
     runtime =
       start_supervised!(
         {Runtime,
@@ -450,9 +528,14 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
       runtime: runtime,
       path: "/mcp",
       protocol_mode: :prefer_modern,
-      request_state: [active_key_id: "proxy", keys: %{"proxy" => @key}],
-      principal_id: "proxy-test"
+      request_state: [active_key_id: "proxy", keys: %{"proxy" => @key}]
     ]
+
+    plug_opts =
+      case Keyword.get(opts, :principal_id, "proxy-test") do
+        nil -> plug_opts
+        principal_id -> Keyword.put(plug_opts, :principal_id, principal_id)
+      end
 
     listener =
       start_supervised!(
