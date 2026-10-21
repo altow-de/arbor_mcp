@@ -145,6 +145,35 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
     def handle_create_message(_params, state), do: {:error, "not supported", state}
   end
 
+  # Serves the app like Arbor.MCP.HttpPlug, but holds every
+  # notifications/cancelled POST until the test releases it, as a slow
+  # upstream would. The timeout only frees a hold that a failing test left
+  # behind.
+  defmodule SlowCancelPlug do
+    @behaviour Plug
+
+    @impl true
+    def init(opts) do
+      {test_pid, opts} = Keyword.pop!(opts, :test_pid)
+      {test_pid, Arbor.MCP.HttpPlug.init(opts)}
+    end
+
+    @impl true
+    def call(conn, {test_pid, opts}) do
+      if Plug.Conn.get_req_header(conn, "mcp-method") == ["notifications/cancelled"] do
+        send(test_pid, {:cancel_arrived, self()})
+
+        receive do
+          :release -> :ok
+        after
+          5_000 -> :ok
+        end
+      end
+
+      Arbor.MCP.HttpPlug.call(conn, opts)
+    end
+  end
+
   setup do
     url = start_app()
     {:ok, url: url}
@@ -456,6 +485,31 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
       send(app, :release)
     end
 
+    test "is cancelled without holding up the client's other requests" do
+      client = start_client(start_app(slow_cancel: true))
+
+      {caller, caller_ref} =
+        spawn_monitor(fn ->
+          Client.call_tool(client, "hold", %{},
+            cancel_on_caller_exit: true,
+            format: :map,
+            timeout: 10_000
+          )
+        end)
+
+      assert_receive {:app_waiting, app}, 2_000
+      Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^caller_ref, :process, ^caller, :killed}
+      assert_receive {:cancel_arrived, cancel}, 2_000
+
+      assert {:ok, %{"content" => [%{"text" => "seen"}]}} =
+               Client.call_tool(client, "context", %{}, format: :map, timeout: 5_000)
+
+      send(cancel, :release)
+      assert_receive {:app_cancelled, ^app}, 2_000
+      assert Client.get_pending_requests(client) == []
+    end
+
     test "settles its caller at once when it is cancelled", %{url: url} do
       client = start_client(url)
 
@@ -537,9 +591,14 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
         principal_id -> Keyword.put(plug_opts, :principal_id, principal_id)
       end
 
+    plug =
+      if Keyword.get(opts, :slow_cancel, false),
+        do: {SlowCancelPlug, [test_pid: self()] ++ plug_opts},
+        else: {Arbor.MCP.HttpPlug, plug_opts}
+
     listener =
       start_supervised!(
-        {Bandit, plug: {Arbor.MCP.HttpPlug, plug_opts}, ip: {127, 0, 0, 1}, port: 0},
+        {Bandit, plug: plug, ip: {127, 0, 0, 1}, port: 0},
         id: make_ref()
       )
 

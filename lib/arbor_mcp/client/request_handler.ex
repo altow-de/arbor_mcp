@@ -577,21 +577,43 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
     case Map.get(state.pending_requests, request_id) do
       {_from, :single, _method} ->
-        state = close_request_stream(request_id, state)
-
-        {:noreply, state} =
-          handle_cast_notification(
-            "notifications/cancelled",
-            %{"requestId" => request_id},
-            state
-          )
-
+        state = request_id |> close_request_stream(state) |> notify_cancelled(request_id)
         pending_requests = Map.delete(state.pending_requests, request_id)
         {:noreply, prune_legacy_posts(%{state | pending_requests: pending_requests})}
 
       _settled ->
         {:noreply, state}
     end
+  end
+
+  # Nobody waits for this notification. On modern HTTP it is a synchronous
+  # POST, so a helper process sends it: a slow upstream must not hold the
+  # client loop that the other requests share. Delivery is best effort, as
+  # for any notification.
+  defp notify_cancelled(
+         %{
+           transport_mod: HTTP,
+           transport_state: %HTTP{protocol_era: :modern} = transport_state
+         } = state,
+         request_id
+       ) do
+    with {:ok, notification} <-
+           build_request("notifications/cancelled", %{"requestId" => request_id}, nil, state),
+         {:ok, encoded} <- encode_for_transport(HTTP, notification) do
+      {_pid, monitor} =
+        ConnectionScope.spawn_monitor(fn -> HTTP.send_message(encoded, transport_state) end)
+
+      Process.demonitor(monitor, [:flush])
+    end
+
+    state
+  end
+
+  defp notify_cancelled(state, request_id) do
+    {:noreply, state} =
+      handle_cast_notification("notifications/cancelled", %{"requestId" => request_id}, state)
+
+    state
   end
 
   # When the caller did not provide an explicit timeout, the client process

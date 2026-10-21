@@ -1137,7 +1137,9 @@ on every transport. A server that correlates sessionless cancellations by
 authenticated principal, as a Runtime-mounted `Arbor.MCP.HttpPlug` with
 `:principal_id` does, then stops the work at once rather than at its next write
 to the closed stream. A legacy request is cancelled with
-`notifications/cancelled` alone.
+`notifications/cancelled` alone. On modern HTTP the client sends this
+notification from a helper process, so a slow upstream does not hold up the
+client's other requests; as for any notification, delivery is best effort.
 
 A request with `progress_to:` or `cancel_on_caller_exit: true` always gets its
 own request stream on modern Streamable HTTP, so other requests through the

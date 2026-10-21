@@ -23,7 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     handler.
   - `cancel_on_caller_exit: true` cancels a request upstream when the
     calling process exits while it is in flight: a modern request stream is
-    closed, and `notifications/cancelled` is sent on every transport.
+    closed, and `notifications/cancelled` is sent on every transport, on
+    modern HTTP from a helper process outside the client loop.
 
   A request with `progress_to:` or `cancel_on_caller_exit: true` runs on its
   own modern request stream, so parallel calls through one client do not
