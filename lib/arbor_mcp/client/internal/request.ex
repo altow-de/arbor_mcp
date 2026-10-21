@@ -352,12 +352,28 @@ defmodule Arbor.MCP.Client.Internal.Request do
   # Per-request options that the client process applies when it sends the
   # request (see Arbor.MCP.Client.RequestHandler.handle_request/5).
   defp request_meta!(opts) do
-    case Keyword.fetch(opts, :client_capabilities) do
-      :error -> %{}
-      {:ok, capabilities} when is_map(capabilities) -> %{client_capabilities: capabilities}
-      {:ok, _invalid} -> raise ArgumentError, "client_capabilities must be a map"
-    end
+    Enum.reduce([:client_capabilities, :progress_to, :cancel_on_caller_exit], %{}, fn key, meta ->
+      case Keyword.fetch(opts, key) do
+        :error -> meta
+        {:ok, value} -> Map.put(meta, key, request_meta_value!(key, value))
+      end
+    end)
   end
+
+  defp request_meta_value!(:client_capabilities, capabilities) when is_map(capabilities),
+    do: capabilities
+
+  defp request_meta_value!(:progress_to, pid) when is_pid(pid), do: pid
+  defp request_meta_value!(:cancel_on_caller_exit, flag) when is_boolean(flag), do: flag
+
+  defp request_meta_value!(:client_capabilities, _invalid),
+    do: raise(ArgumentError, "client_capabilities must be a map")
+
+  defp request_meta_value!(:progress_to, _invalid),
+    do: raise(ArgumentError, "progress_to must be a pid")
+
+  defp request_meta_value!(:cancel_on_caller_exit, _invalid),
+    do: raise(ArgumentError, "cancel_on_caller_exit must be a boolean")
 
   defp fulfill_mrtr(client, input_requests, opts, timeout, scope_ref) do
     GenServer.call(client, {:fulfill_mrtr, input_requests, opts, scope_ref}, timeout)

@@ -18,7 +18,7 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
     @impl true
     def handle_list_tools(_cursor, state) do
       tools =
-        for name <- ~w(ask context) do
+        for name <- ~w(ask context progress hold) do
           %{name: name, description: name, inputSchema: %{"type" => "object"}}
         end
 
@@ -56,6 +56,62 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
       send(state.test_pid, {:app_context, context.era, context.client_capabilities, context.meta})
       {:ok, %{content: [%{type: "text", text: "seen"}]}, state}
     end
+
+    def handle_call_tool("progress", _arguments, state) do
+      :ok = Context.report_progress(50, 100, "half")
+      send(state.test_pid, {:app_waiting, self()})
+
+      receive do
+        :release -> {:ok, %{content: [%{type: "text", text: "done"}]}, state}
+      end
+    end
+
+    # Holds the request open without writing to its response stream until the
+    # test releases it or the request is cancelled.
+    def handle_call_tool("hold", _arguments, state) do
+      send(state.test_pid, {:app_waiting, self()})
+      hold(state, System.monotonic_time(:millisecond) + 5_000)
+    end
+
+    defp hold(state, deadline) do
+      cond do
+        Context.cancelled?() ->
+          send(state.test_pid, :app_cancelled)
+          {:error, "cancelled", state}
+
+        System.monotonic_time(:millisecond) > deadline ->
+          {:ok, %{content: [%{type: "text", text: "never cancelled"}]}, state}
+
+        true ->
+          receive do
+            :release -> {:ok, %{content: [%{type: "text", text: "released"}]}, state}
+          after
+            10 -> hold(state, deadline)
+          end
+      end
+    end
+  end
+
+  defmodule ClientHandler do
+    @behaviour Arbor.MCP.Client.Handler
+
+    @impl true
+    def init(opts), do: {:ok, Keyword.fetch!(opts, :test_pid)}
+
+    @impl true
+    def handle_progress(request_id, params, test_pid) do
+      send(test_pid, {:client_handler_progress, request_id, params})
+      {:ok, test_pid}
+    end
+
+    @impl true
+    def handle_ping(state), do: {:ok, %{}, state}
+
+    @impl true
+    def handle_list_roots(state), do: {:ok, [], state}
+
+    @impl true
+    def handle_create_message(_params, state), do: {:error, "not supported", state}
   end
 
   setup do
@@ -136,6 +192,96 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
     end
   end
 
+  describe "a watched request on MCP 2026-07-28" do
+    test "delivers its progress to progress_to instead of the client handler", %{url: url} do
+      client = start_client(url, handler: {ClientHandler, [test_pid: self()]})
+      owner = self()
+
+      task =
+        Task.async(fn ->
+          Client.call_tool(client, "progress", %{},
+            progress_token: "gateway-1",
+            progress_to: owner,
+            format: :map,
+            timeout: 5_000
+          )
+        end)
+
+      assert_receive {:arbor_mcp_progress, "gateway-1",
+                      %{"progress" => 50, "total" => 100, "message" => "half"}},
+                     2_000
+
+      assert_receive {:app_waiting, app}, 2_000
+      send(app, :release)
+
+      assert {:ok, %{"content" => [%{"text" => "done"}]}} = Task.await(task, 2_000)
+      refute_received {:client_handler_progress, _request_id, _params}
+    end
+
+    test "leaves the client free for other requests while it runs", %{url: url} do
+      client = start_client(url)
+
+      task =
+        Task.async(fn ->
+          Client.call_tool(client, "hold", %{},
+            cancel_on_caller_exit: true,
+            format: :map,
+            timeout: 5_000
+          )
+        end)
+
+      assert_receive {:app_waiting, app}, 2_000
+
+      assert {:ok, %{"content" => [%{"text" => "seen"}]}} =
+               Client.call_tool(client, "context", %{}, format: :map, timeout: 1_000)
+
+      send(app, :release)
+      assert {:ok, %{"content" => [%{"text" => "released"}]}} = Task.await(task, 2_000)
+    end
+
+    test "is cancelled at the app when its caller exits", %{url: url} do
+      client = start_client(url)
+
+      {caller, caller_ref} =
+        spawn_monitor(fn ->
+          Client.call_tool(client, "hold", %{},
+            cancel_on_caller_exit: true,
+            format: :map,
+            timeout: 10_000
+          )
+        end)
+
+      assert_receive {:app_waiting, _app}, 2_000
+      Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^caller_ref, :process, ^caller, :killed}
+
+      assert_receive :app_cancelled, 1_000
+      assert Client.get_pending_requests(client) == []
+    end
+  end
+
+  describe "a watched request on MCP 2025-06-18" do
+    test "is cancelled at the app when its caller exits", %{url: url} do
+      client = start_legacy_client(url, use_sse: true)
+
+      {caller, caller_ref} =
+        spawn_monitor(fn ->
+          Client.call_tool(client, "hold", %{},
+            cancel_on_caller_exit: true,
+            format: :map,
+            timeout: 10_000
+          )
+        end)
+
+      assert_receive {:app_waiting, _app}, 2_000
+      Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^caller_ref, :process, ^caller, :killed}
+
+      assert_receive :app_cancelled, 1_000
+      assert Client.get_pending_requests(client) == []
+    end
+  end
+
   defp start_app do
     runtime =
       start_supervised!(
@@ -166,7 +312,7 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
     "http://127.0.0.1:#{port}/mcp"
   end
 
-  defp start_client(url, opts) do
+  defp start_client(url, opts \\ []) do
     defaults = [
       transport: :http,
       url: url,

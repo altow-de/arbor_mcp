@@ -129,6 +129,11 @@ defmodule Arbor.MCP.Client do
     # In-flight MRTR input fulfillment tasks. Each task may perform several
     # input callbacks sequentially while the client loop remains responsive.
     mrtr_tasks: %{},
+    # Requests sent with `progress_to:` or `cancel_on_caller_exit: true`:
+    # request id => %{progress_to: pid | nil, monitor: ref | nil}, plus the
+    # caller monitors => request id. See RequestHandler.watch_request/3.
+    request_watches: %{},
+    request_watch_monitors: %{},
     # Modern long-lived subscription request id => Subscription process.
     subscriptions: %{},
     # Monitor ref => Subscription process. Monitors survive reconnects while
@@ -2163,6 +2168,14 @@ defmodule Arbor.MCP.Client do
       Logger.error("Async POST task exited", reason: LogSummary.describe(reason))
       {:noreply, fail_async_post_request(state, request_id, reason)}
     end
+  end
+
+  def handle_info(
+        {:DOWN, ref, :process, _caller, _reason},
+        %{request_watch_monitors: monitors} = state
+      )
+      when is_map(monitors) and is_map_key(monitors, ref) do
+    RequestHandler.handle_request_caller_down(ref, state)
   end
 
   # A server-request handler task (sampling/elicitation/custom) finished.

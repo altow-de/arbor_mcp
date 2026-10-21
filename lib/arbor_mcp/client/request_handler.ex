@@ -234,6 +234,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
   defp send_request(request, method, id, from, state, meta) do
     {deadline, meta} = request_send_context(from, state, meta)
+    watch = request_watch(from, meta)
 
     result =
       case state do
@@ -241,7 +242,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
           send_legacy_request(request, from, state, deadline, request["id"])
 
         _other ->
-          send_by_deadline(request, state, deadline)
+          send_by_deadline(request, state, deadline, watch != nil)
       end
 
     case result do
@@ -254,7 +255,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
         maybe_schedule_request_timeout(id, meta, updated_state)
         pending_requests = Map.put(updated_state.pending_requests, id, {from, :single, method})
         new_state = %{updated_state | pending_requests: pending_requests}
-        {:noreply, new_state}
+        {:noreply, watch_request(new_state, id, watch)}
 
       {:error, :not_connected} ->
         {:reply, {:error, :not_connected}, state}
@@ -450,13 +451,14 @@ defmodule Arbor.MCP.Client.RequestHandler do
   # A synchronous send (HTTP without a stream) runs in the client process;
   # capping it at the caller's deadline frees the client when the caller has
   # given up, instead of holding it for the transport's own request timeout.
-  defp send_by_deadline(request, state, nil), do: send_request_message(request, state)
+  defp send_by_deadline(request, state, nil, stream?),
+    do: send_request_message(request, state, stream?)
 
-  defp send_by_deadline(request, state, deadline) do
+  defp send_by_deadline(request, state, deadline, stream?) do
     previous = Deadline.on_transport(state.transport_mod, state.transport_state)
 
     request
-    |> send_request_message(put_transport_deadline(state, deadline))
+    |> send_request_message(put_transport_deadline(state, deadline), stream?)
     |> case do
       {:ok, updated_state, response_data} ->
         {:ok, put_transport_deadline(updated_state, previous), response_data}
@@ -477,16 +479,19 @@ defmodule Arbor.MCP.Client.RequestHandler do
     }
   end
 
+  # A watched request (see watch_request/3) always gets its own stream, so
+  # the client process stays free and can act on the caller's exit.
   defp send_request_message(
          %{"params" => %{"_meta" => meta}} = request,
          %{
            transport_mod: HTTP,
            transport_state: %HTTP{protocol_era: :modern} = transport_state
-         } = state
+         } = state,
+         watched?
        )
        when is_map(meta) do
     stream_requested? =
-      Map.has_key?(meta, "progressToken") or
+      watched? or Map.has_key?(meta, "progressToken") or
         Map.has_key?(meta, "io.modelcontextprotocol/logLevel")
 
     if stream_requested? do
@@ -496,13 +501,96 @@ defmodule Arbor.MCP.Client.RequestHandler do
     end
   end
 
-  defp send_request_message(request, state), do: send_message(request, state)
+  defp send_request_message(request, state, _watched?), do: send_message(request, state)
 
   defp open_request_stream(request, state, transport_state) do
     with {:ok, encoded} <- encode_for_transport(HTTP, request),
          {:ok, transport_state} <-
            HTTP.open_stream(encoded, transport_state, self(), stream_kind: :request) do
       {:ok, %{state | transport_state: transport_state}}
+    end
+  end
+
+  # A request is watched when its caller asked for `progress_to:` or
+  # `cancel_on_caller_exit: true`. Watches are only kept for requests that
+  # stay in flight in `pending_requests`; a request answered synchronously
+  # has nothing left to watch.
+  defp request_watch({caller, _tag}, meta) when is_pid(caller) do
+    progress_to = Map.get(meta, :progress_to)
+    cancel? = Map.get(meta, :cancel_on_caller_exit, false)
+
+    if progress_to || cancel?,
+      do: %{caller: caller, progress_to: progress_to, cancel_on_caller_exit: cancel?}
+  end
+
+  defp request_watch(_from, _meta), do: nil
+
+  # Settled requests leave pending_requests through many paths. Rather than
+  # touching each of them, a new watch first drops the watches (and caller
+  # monitors) of requests that are no longer pending, so the bookkeeping stays
+  # bounded by the watched requests in flight.
+  defp watch_request(state, _id, nil), do: state
+
+  defp watch_request(state, id, watch) do
+    state = prune_request_watches(state)
+    monitor = if watch.cancel_on_caller_exit, do: Process.monitor(watch.caller)
+    entry = %{progress_to: watch.progress_to, monitor: monitor}
+    monitors = state.request_watch_monitors
+
+    %{
+      state
+      | request_watches: Map.put(state.request_watches, id, entry),
+        request_watch_monitors: if(monitor, do: Map.put(monitors, monitor, id), else: monitors)
+    }
+  end
+
+  defp prune_request_watches(state) do
+    {live, settled} =
+      Enum.split_with(state.request_watches, fn {id, _entry} ->
+        Map.has_key?(state.pending_requests, id)
+      end)
+
+    settled_monitors = for {_id, %{monitor: ref}} <- settled, is_reference(ref), do: ref
+    Enum.each(settled_monitors, &Process.demonitor(&1, [:flush]))
+
+    %{
+      state
+      | request_watches: Map.new(live),
+        request_watch_monitors: Map.drop(state.request_watch_monitors, settled_monitors)
+    }
+  end
+
+  @doc false
+  # The caller of a request sent with `cancel_on_caller_exit: true` exited.
+  # Nobody will read the result, so the request is cancelled upstream: a
+  # modern HTTP request stream is closed, and every transport also sends
+  # `notifications/cancelled`, which a server that correlates sessionless
+  # cancellations by principal acts on before its next write to the stream.
+  def handle_request_caller_down(monitor, state) do
+    {request_id, monitors} = Map.pop(state.request_watch_monitors, monitor)
+
+    state = %{
+      state
+      | request_watch_monitors: monitors,
+        request_watches: Map.delete(state.request_watches, request_id)
+    }
+
+    case Map.get(state.pending_requests, request_id) do
+      {_from, :single, _method} ->
+        state = close_request_stream(request_id, state)
+
+        {:noreply, state} =
+          handle_cast_notification(
+            "notifications/cancelled",
+            %{"requestId" => request_id},
+            state
+          )
+
+        pending_requests = Map.delete(state.pending_requests, request_id)
+        {:noreply, prune_legacy_posts(%{state | pending_requests: pending_requests})}
+
+      _settled ->
+        {:noreply, state}
     end
   end
 
@@ -1016,6 +1104,26 @@ defmodule Arbor.MCP.Client.RequestHandler do
       %{request_id: request_id, method: callback}
     )
 
+    case progress_receiver(callback, request_id, state) do
+      pid when is_pid(pid) ->
+        send(pid, {:arbor_mcp_progress, Map.get(params, "progressToken"), params})
+        {:noreply, state}
+
+      nil ->
+        dispatch_to_client_handler(callback, request_id, params, state)
+    end
+  end
+
+  defp progress_receiver(:handle_progress, request_id, state) do
+    case state |> Map.get(:request_watches, %{}) |> Map.get(request_id) do
+      %{progress_to: pid} -> pid
+      nil -> nil
+    end
+  end
+
+  defp progress_receiver(_callback, _request_id, _state), do: nil
+
+  defp dispatch_to_client_handler(callback, request_id, params, state) do
     {handler, handler_state, state} = ensure_client_handler(state)
 
     if handler != :none and function_exported?(handler, callback, 3) do
