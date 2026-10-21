@@ -55,11 +55,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
       _invalid -> raise ArgumentError, "timeout must be a finite non-negative millisecond value"
     end
 
-    case Keyword.get(opts, :mrtr, :auto) do
-      mode when mode in [:auto, :manual] -> :ok
-      _invalid -> raise ArgumentError, "mrtr must be :auto or :manual"
-    end
-
+    validate_mrtr_mode!(opts)
     params = RequestParams.with_mrtr_continuation(params, method, opts)
     stream_retry_mode = Keyword.get(opts, :http_stream_retry, :at_least_once)
 
@@ -228,6 +224,13 @@ defmodule Arbor.MCP.Client.Internal.Request do
 
       other ->
         other
+    end
+  end
+
+  defp validate_mrtr_mode!(opts) do
+    case Keyword.get(opts, :mrtr, :auto) do
+      mode when mode in [:auto, :manual] -> :ok
+      _invalid -> raise ArgumentError, "mrtr must be :auto or :manual"
     end
   end
 
