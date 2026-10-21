@@ -1120,7 +1120,7 @@ passed through unchanged.
 | `mrtr: :manual` | Returns a validated `input_required` result to the caller instead of fulfilling it with the client handler. `:max_input_requests` and `:max_mrtr_bytes` still apply; `:max_mrtr_rounds` does not, because the caller runs the rounds. |
 | `input_responses:`, `request_state:` | Put the caller's `inputResponses` map and opaque `requestState` string on the retried request. Valid for `tools/call`, `resources/read` and `prompts/get`. |
 | `client_capabilities:` | Replaces the connection's capabilities in this request's MCP 2026-07-28 `_meta`. Legacy requests carry no per-request capabilities. |
-| `progress_to: pid` | Sends this request's progress notifications to `pid` as `{:arbor_mcp_progress, progress_token, params}` instead of `c:Arbor.MCP.Client.Handler.handle_progress/3`. Needs a `:progress_token` and an MCP 2026-07-28 request stream. |
+| `progress_to: pid` | Sends this request's progress notifications to `pid` as `{:arbor_mcp_progress, progress_token, params}` instead of `c:Arbor.MCP.Client.Handler.handle_progress/3`, on an MCP 2026-07-28 request stream. A server sends progress only for a request with a progress token, set with `:progress_token` or as `"progressToken"` in `:meta`; without one, `pid` receives nothing. |
 | `cancel_on_caller_exit: true` | Monitors the process that called the operation. If it exits while the request is in flight, the client cancels the request upstream. |
 
 On MCP 2026-07-28 a server chooses its input requests from the capabilities of
@@ -1143,20 +1143,42 @@ client's other requests; as for any notification, delivery is best effort.
 
 A request with `progress_to:` or `cancel_on_caller_exit: true` always gets its
 own request stream on modern Streamable HTTP, so other requests through the
-same client do not wait for it. A legacy Streamable HTTP request stays in
-flight outside the client process only with `use_sse: true`; with
-`use_sse: false` it completes synchronously inside the client process, and
-there is nothing left to watch.
+same client do not wait for it. The stream's limits then apply instead of
+`:request_timeout`: `:stream_handshake_timeout` (default 15 s) bounds the wait
+until the server starts its response, and a server that answers with plain
+JSON starts it only with the result; `:stream_idle_timeout` (default 60 s)
+bounds the time between events. Raise both for long calls. A broken stream
+also falls under `:http_stream_retry`: with the default `:at_least_once` the
+client reissues the request once with a new JSON-RPC id, so the upstream may
+run the call twice. A legacy Streamable HTTP request stays in flight outside
+the client process only with `use_sse: true`; with `use_sse: false` it
+completes synchronously inside the client process, and there is nothing left
+to watch.
 
 Run the upstream call in a helper process, so the forwarding process stays
 free to relay progress. The helper is linked: when the forwarding process
-exits, for example because the Runtime stops a cancelled callback, the helper
-exits with it, and the client cancels the upstream request.
+exits abnormally, for example because the Runtime stops a cancelled callback,
+the helper exits with it, and the client cancels the upstream request. A link
+does not end the helper when the forwarding process returns normally, so a
+forwarding process that stops waiting early, for example at its own deadline,
+ends the helper with `Task.shutdown/2`.
+
+Every round of one call must carry the same request apart from
+`input_responses:` and `request_state:`: the same arguments,
+`client_capabilities:`, `:progress_token` and other `_meta` values. An
+arbor_mcp server binds its `requestState` to the request's params, `_meta`
+included, and to the declared capabilities, and rejects a retry that differs
+with `-32602` and the reason `request_state_binding_mismatch`. A proxy that
+picks its own upstream progress token therefore keeps it for all rounds of the
+call.
 
 ```elixir
-def forward_call(client, tool, arguments, downstream) do
+# `call` describes one downstream call. On the first round it holds a new
+# upstream progress token; on a retry it holds the same token and the
+# upstream requestState, both taken from the gateway's own sealed state, and
+# the downstream inputResponses.
+def forward_call(client, tool, arguments, call) do
   owner = self()
-  token = "gateway-#{System.unique_integer([:positive])}"
 
   task =
     Task.async(fn ->
@@ -1164,16 +1186,16 @@ def forward_call(client, tool, arguments, downstream) do
         format: :map,
         timeout: 300_000,
         mrtr: :manual,
-        input_responses: downstream.input_responses,
-        request_state: downstream.request_state,
-        client_capabilities: downstream.client_capabilities,
-        progress_token: token,
+        input_responses: call.input_responses,
+        request_state: call.upstream_request_state,
+        client_capabilities: call.client_capabilities,
+        progress_token: call.progress_token,
         progress_to: owner,
         cancel_on_caller_exit: true
       )
     end)
 
-  await_upstream(task, token)
+  await_upstream(task, call.progress_token)
 end
 
 defp await_upstream(%Task{ref: ref} = task, token) do
@@ -1193,9 +1215,10 @@ An `input_required` result comes back with `"resultType" => "input_required"`,
 its `inputRequests` and its `requestState`; with the default `format: :struct`,
 `Arbor.MCP.Response.to_raw/1` returns those fields. The forwarding server returns its
 own `input_required` to the downstream client and seals the upstream
-`requestState` in its own application request state; on the downstream retry
-it passes the upstream state and the downstream `inputResponses` back with
-`request_state:` and `input_responses:`.
+`requestState` and its upstream progress token in its own application request
+state; on the downstream retry it passes both back unchanged with
+`request_state:` and `progress_token:`, together with the downstream
+`inputResponses` in `input_responses:`.
 
 ## Modern subscriptions (MCP 2026-07-28)
 

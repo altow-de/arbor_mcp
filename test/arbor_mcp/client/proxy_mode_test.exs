@@ -275,6 +275,29 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
                  format: :map
                )
     end
+
+    # An arbor_mcp server binds its requestState to the request's params,
+    # _meta included, so every round of one call carries the same
+    # progress token.
+    test "a retry with the same progress_token and progress_to reaches the app", %{url: url} do
+      client = start_client(url, capabilities: %{"elicitation" => %{"form" => %{}}})
+      round = [mrtr: :manual, progress_token: "upstream-1", progress_to: self(), format: :map]
+
+      assert {:ok, %{"resultType" => "input_required", "requestState" => request_state}} =
+               Client.call_tool(client, "ask", %{}, round)
+
+      responses = %{"name" => %{"action" => "accept", "content" => %{"name" => "Tom"}}}
+      retry = round ++ [input_responses: responses, request_state: request_state]
+
+      assert {:error,
+              %{"code" => -32_602, "data" => %{"reason" => "request_state_binding_mismatch"}}} =
+               Client.call_tool(client, "ask", %{}, Keyword.put(retry, :progress_token, "new"))
+
+      assert {:ok, %{"resultType" => "complete", "content" => [%{"text" => "Welcome, Tom"}]}} =
+               Client.call_tool(client, "ask", %{}, retry)
+
+      assert_received {:app_retry, ^responses, %{"step" => 1}}
+    end
   end
 
   describe "proxy options" do

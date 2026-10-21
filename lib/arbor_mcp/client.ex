@@ -578,14 +578,20 @@ defmodule Arbor.MCP.Client do
     request's MCP 2026-07-28 `_meta`; legacy requests carry none
   - `:progress_to` - pid that receives this request's progress as
     `{:arbor_mcp_progress, progress_token, params}` instead of the client
-    handler; requires `:progress_token`
+    handler; the server sends progress only for a request with a progress
+    token (`:progress_token` or `"progressToken"` in `:meta`)
   - `:cancel_on_caller_exit` - when `true`, the client monitors the calling
     process and cancels the request upstream if that process exits while the
     request is in flight
 
   A request with `:progress_to` or `cancel_on_caller_exit: true` gets its own
   request stream on modern Streamable HTTP, so other requests through the same
-  client do not wait for it. See the "Proxy mode" section of the
+  client do not wait for it. The stream follows `:stream_handshake_timeout`
+  and `:stream_idle_timeout` instead of `:request_timeout`, and with the
+  default `http_stream_retry: :at_least_once` a broken stream is reissued
+  once. Every MRTR round of one call must repeat the arguments,
+  `:client_capabilities`, `:progress_token` and `:meta`, because a server may
+  bind its `requestState` to them. See the "Proxy mode" section of the
   configuration guide for the full contract and an example.
   """
   @spec call_tool(t(), String.t(), map(), keyword() | timeout()) ::

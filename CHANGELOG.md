@@ -27,8 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     modern HTTP from a helper process outside the client loop.
 
   A request with `progress_to:` or `cancel_on_caller_exit: true` runs on its
-  own modern request stream, so parallel calls through one client do not
-  wait for each other. See "Proxy mode" in `docs/CONFIGURATION.md`.
+  own modern request stream, so other calls through the same client do not
+  wait for it. That stream follows `:stream_handshake_timeout`,
+  `:stream_idle_timeout` and `:http_stream_retry` instead of
+  `:request_timeout`. Every MRTR round of one call repeats the same
+  arguments, capabilities and `_meta`, progress token included. See "Proxy
+  mode" in `docs/CONFIGURATION.md`.
 
 ## [2.0.0-rc.4] — 2026-10-19
 
