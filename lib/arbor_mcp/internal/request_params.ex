@@ -72,6 +72,42 @@ defmodule Arbor.MCP.Internal.RequestParams do
 
   defp with_progress_token(params, _), do: params
 
+  @mrtr_methods ["tools/call", "resources/read", "prompts/get"]
+
+  # Puts a caller-supplied MRTR continuation (`:input_responses` and
+  # `:request_state`) on the request, for callers that run MRTR rounds
+  # themselves with `mrtr: :manual`. Invalid values are programmer errors.
+  @doc false
+  @spec with_mrtr_continuation(map(), String.t(), keyword()) :: map()
+  def with_mrtr_continuation(params, method, opts) do
+    input_responses = Keyword.get(opts, :input_responses)
+    request_state = Keyword.get(opts, :request_state)
+
+    cond do
+      is_nil(input_responses) and is_nil(request_state) ->
+        params
+
+      method not in @mrtr_methods ->
+        raise ArgumentError,
+              "input_responses and request_state are only valid for " <>
+                Enum.join(@mrtr_methods, ", ")
+
+      not (is_nil(input_responses) or is_map(input_responses)) ->
+        raise ArgumentError, "input_responses must be a map"
+
+      not (is_nil(request_state) or is_binary(request_state)) ->
+        raise ArgumentError, "request_state must be a string"
+
+      true ->
+        params
+        |> put_present("inputResponses", input_responses)
+        |> put_present("requestState", request_state)
+    end
+  end
+
+  defp put_present(params, _key, nil), do: params
+  defp put_present(params, key, value), do: Map.put(params, key, value)
+
   @spec with_progress_or_meta(map(), Arbor.MCP.Types.progress_token() | nil | map()) :: map()
   def with_progress_or_meta(params, nil), do: params
 
