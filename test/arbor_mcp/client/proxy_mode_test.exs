@@ -72,6 +72,38 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
       end
     end
 
+    # Holds the request open until the test releases it or the request is
+    # cancelled. It writes to its response stream only when the test sends
+    # {:report, from, progress}. The deadline only ends a hold that a failing
+    # test left behind; a passing test releases or cancels every hold.
+    def handle_call_tool("hold", _arguments, state) do
+      send(state.test_pid, {:app_waiting, self()})
+      hold(state, System.monotonic_time(:millisecond) + 5_000)
+    end
+
+    defp hold(state, deadline) do
+      cond do
+        Context.cancelled?() ->
+          send(state.test_pid, {:app_cancelled, self()})
+          {:error, "cancelled", state}
+
+        System.monotonic_time(:millisecond) > deadline ->
+          {:ok, %{content: [%{type: "text", text: "never cancelled"}]}, state}
+
+        true ->
+          receive do
+            :release ->
+              {:ok, %{content: [%{type: "text", text: "released"}]}, state}
+
+            {:report, from, progress} ->
+              send(from, {:app_reported, self(), Context.report_progress(progress, 100, "step")})
+              hold(state, deadline)
+          after
+            10 -> hold(state, deadline)
+          end
+      end
+    end
+
     defp name_request do
       %{
         "name" => %{
@@ -85,31 +117,6 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
           }
         }
       }
-    end
-
-    # Holds the request open without writing to its response stream until the
-    # test releases it or the request is cancelled.
-    def handle_call_tool("hold", _arguments, state) do
-      send(state.test_pid, {:app_waiting, self()})
-      hold(state, System.monotonic_time(:millisecond) + 5_000)
-    end
-
-    defp hold(state, deadline) do
-      cond do
-        Context.cancelled?() ->
-          send(state.test_pid, :app_cancelled)
-          {:error, "cancelled", state}
-
-        System.monotonic_time(:millisecond) > deadline ->
-          {:ok, %{content: [%{type: "text", text: "never cancelled"}]}, state}
-
-        true ->
-          receive do
-            :release -> {:ok, %{content: [%{type: "text", text: "released"}]}, state}
-          after
-            10 -> hold(state, deadline)
-          end
-      end
     end
   end
 
@@ -334,11 +341,11 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
           )
         end)
 
-      assert_receive {:app_waiting, _app}, 2_000
+      assert_receive {:app_waiting, app}, 2_000
       Process.exit(caller, :kill)
       assert_receive {:DOWN, ^caller_ref, :process, ^caller, :killed}
 
-      assert_receive :app_cancelled, 1_000
+      assert_receive {:app_cancelled, ^app}, 1_000
       assert Client.get_pending_requests(client) == []
     end
 
@@ -354,12 +361,15 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
           )
         end)
 
-      assert_receive {:app_waiting, _app}, 2_000
+      assert_receive {:app_waiting, app}, 2_000
       assert [request_id] = Client.get_pending_requests(client)
       assert :ok = Client.send_cancelled(client, request_id, "superseded")
 
       assert {:error, :cancelled} = Task.await(task, 1_000)
       assert Client.get_pending_requests(client) == []
+
+      # Closing the stream cancels nothing at an app that does not write.
+      send(app, :release)
     end
   end
 
@@ -376,11 +386,11 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
           )
         end)
 
-      assert_receive {:app_waiting, _app}, 2_000
+      assert_receive {:app_waiting, app}, 2_000
       Process.exit(caller, :kill)
       assert_receive {:DOWN, ^caller_ref, :process, ^caller, :killed}
 
-      assert_receive :app_cancelled, 1_000
+      assert_receive {:app_cancelled, ^app}, 1_000
       assert Client.get_pending_requests(client) == []
     end
   end
