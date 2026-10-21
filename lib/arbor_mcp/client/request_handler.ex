@@ -182,7 +182,9 @@ defmodule Arbor.MCP.Client.RequestHandler do
   defp retryable_subscription_stream_close?(_reason), do: true
 
   defp send_built_request(method, params, id, from, state, timeout_meta) do
-    case build_request(method, params, id, state) do
+    request_opts = [client_capabilities: Map.get(timeout_meta, :client_capabilities)]
+
+    case build_request(method, params, id, state, request_opts) do
       {:ok, request} ->
         send_request(request, method, id, from, state, timeout_meta)
 
@@ -1174,8 +1176,8 @@ defmodule Arbor.MCP.Client.RequestHandler do
     |> Maps.put_present("id", id)
   end
 
-  defp build_request(method, params, id, state) do
-    with {:ok, params} <- RequestParams.for_request(params || %{}, state) do
+  defp build_request(method, params, id, state, opts \\ []) do
+    with {:ok, params} <- RequestParams.for_request(params || %{}, state, opts) do
       {:ok, build_request(method, params, id)}
     end
   end

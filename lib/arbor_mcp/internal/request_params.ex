@@ -119,14 +119,17 @@ defmodule Arbor.MCP.Internal.RequestParams do
     with_non_empty_meta(params, meta)
   end
 
+  # A request-level `:client_capabilities` option replaces the connection's
+  # capabilities in that one modern request's `_meta`. Legacy requests carry
+  # no per-request capabilities.
   @doc false
-  @spec for_request(map(), map()) :: {:ok, map()} | {:error, Meta.validation_error()}
-  def for_request(params, context) when is_map(params) and is_map(context) do
+  @spec for_request(map(), map(), keyword()) :: {:ok, map()} | {:error, Meta.validation_error()}
+  def for_request(params, context, opts \\ []) when is_map(params) and is_map(context) do
     protocol_version = context_value(context, :protocol_version)
 
     if VersionRegistry.modern?(protocol_version) do
       meta = Map.get(params, "_meta", %{})
-      capabilities = client_capabilities(context)
+      capabilities = Keyword.get(opts, :client_capabilities) || client_capabilities(context)
 
       case Meta.build_request_meta(meta, protocol_version, capabilities,
              client_info: context_value(context, :client_info),

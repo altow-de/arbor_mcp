@@ -18,7 +18,7 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
     @impl true
     def handle_list_tools(_cursor, state) do
       tools =
-        for name <- ~w(ask) do
+        for name <- ~w(ask context) do
           %{name: name, description: name, inputSchema: %{"type" => "object"}}
         end
 
@@ -49,6 +49,12 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
           name = get_in(responses, ["name", "content", "name"])
           {:ok, %{content: [%{type: "text", text: "Welcome, #{name}"}]}, state}
       end
+    end
+
+    def handle_call_tool("context", _arguments, state) do
+      context = Context.current()
+      send(state.test_pid, {:app_context, context.era, context.client_capabilities, context.meta})
+      {:ok, %{content: [%{type: "text", text: "seen"}]}, state}
     end
   end
 
@@ -98,11 +104,47 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
     end
   end
 
+  describe "client capabilities per request" do
+    test "replace the start capabilities for that request only on MCP 2026-07-28", %{url: url} do
+      started = %{"elicitation" => %{"form" => %{}, "url" => %{}}}
+      client = start_client(url, capabilities: started)
+      requested = %{"elicitation" => %{"form" => %{}}}
+
+      assert {:ok, _result} =
+               Client.call_tool(client, "context", %{},
+                 client_capabilities: requested,
+                 format: :map
+               )
+
+      assert_received {:app_context, :modern, ^requested, _meta}
+
+      assert {:ok, _result} = Client.call_tool(client, "context", %{}, format: :map)
+      assert_received {:app_context, :modern, ^started, _meta}
+    end
+
+    test "do not reach the wire on MCP 2025-06-18", %{url: url} do
+      client = start_legacy_client(url)
+
+      assert {:ok, _result} =
+               Client.call_tool(client, "context", %{},
+                 client_capabilities: %{"elicitation" => %{"form" => %{}}},
+                 format: :map
+               )
+
+      assert_received {:app_context, :legacy, nil, meta}
+      refute Map.has_key?(meta, "io.modelcontextprotocol/clientCapabilities")
+    end
+  end
+
   defp start_app do
     runtime =
       start_supervised!(
         {Runtime,
-         handler: AppHandler, handler_args: [test_pid: self()], transport: :mounted_http},
+         handler: AppHandler,
+         handler_args: [test_pid: self()],
+         transport: :mounted_http,
+         execution: :stateless,
+         max_concurrency: 4},
         id: make_ref()
       )
 
@@ -137,7 +179,18 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
     ]
 
     {:ok, client} = Client.start_link(Keyword.merge(defaults, opts))
+    on_exit_disconnect(client)
+    client
+  end
 
+  defp start_legacy_client(url, opts \\ []) do
+    start_client(
+      url,
+      Keyword.merge([protocol_mode: :legacy_only, protocol_version: "2025-06-18"], opts)
+    )
+  end
+
+  defp on_exit_disconnect(client) do
     on_exit(fn ->
       if Process.alive?(client) do
         try do

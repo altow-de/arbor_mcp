@@ -92,6 +92,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
     started_at = System.monotonic_time(:millisecond)
     explicit_timeout = Keyword.get(opts, :timeout)
     retry_policy = Keyword.get(opts, :retry_policy, :use_default)
+    request_meta = request_meta!(opts)
     scope_ref = make_ref()
 
     result =
@@ -102,7 +103,8 @@ defmodule Arbor.MCP.Client.Internal.Request do
         control = %{
           deadline: deadline,
           scope_ref: scope_ref,
-          stream_retry_mode: stream_retry_mode
+          stream_retry_mode: stream_retry_mode,
+          request_meta: request_meta
         }
 
         do_mrtr_request(
@@ -116,13 +118,13 @@ defmodule Arbor.MCP.Client.Internal.Request do
           control
         )
       else
-        first_operation = fn -> request_once(client, method, params, nil) end
+        first_operation = fn -> request_once(client, method, params, nil, request_meta) end
 
         retry_operation = fn ->
           deadline = started_at + fetch_default_timeout(client, default_timeout)
 
           with {:ok, remaining} <- remaining_timeout(deadline) do
-            request_once(client, method, params, remaining)
+            request_once(client, method, params, remaining, request_meta)
           end
         end
 
@@ -150,7 +152,8 @@ defmodule Arbor.MCP.Client.Internal.Request do
                 control = %{
                   deadline: deadline,
                   scope_ref: scope_ref,
-                  stream_retry_mode: stream_retry_mode
+                  stream_retry_mode: stream_retry_mode,
+                  request_meta: request_meta
                 }
 
                 continue_mrtr(
@@ -188,7 +191,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
        ) do
     operation = fn ->
       with {:ok, remaining} <- remaining_timeout(control.deadline) do
-        request_before(client, method, round_params, remaining, control.deadline)
+        request_before(client, method, round_params, remaining, control)
       end
     end
 
@@ -326,26 +329,34 @@ defmodule Arbor.MCP.Client.Internal.Request do
 
   # The absolute deadline travels with the request so the client does not
   # send it after the caller has given up (see RequestHandler.handle_request/5).
-  defp request_once(client, method, params, timeout) when is_integer(timeout) do
+  defp request_once(client, method, params, timeout, request_meta) when is_integer(timeout) do
     deadline = System.monotonic_time(:millisecond) + timeout
-    meta = %{timeout: timeout, deadline: deadline}
+    meta = Map.merge(request_meta, %{timeout: timeout, deadline: deadline})
     GenServer.call(client, {:request, method, params, meta}, timeout)
   catch
     :exit, {:timeout, _} -> {:error, :timeout}
   end
 
-  defp request_once(client, method, params, nil) do
-    GenServer.call(client, {:request, method, params, %{timeout: nil}}, :infinity)
+  defp request_once(client, method, params, nil, request_meta) do
+    meta = Map.put(request_meta, :timeout, nil)
+    GenServer.call(client, {:request, method, params, meta}, :infinity)
   end
 
-  defp request_before(client, method, params, timeout, deadline) do
-    GenServer.call(
-      client,
-      {:request, method, params, %{timeout: timeout, deadline: deadline}},
-      timeout
-    )
+  defp request_before(client, method, params, timeout, control) do
+    meta = Map.merge(control.request_meta, %{timeout: timeout, deadline: control.deadline})
+    GenServer.call(client, {:request, method, params, meta}, timeout)
   catch
     :exit, {:timeout, _call} -> {:error, :timeout}
+  end
+
+  # Per-request options that the client process applies when it sends the
+  # request (see Arbor.MCP.Client.RequestHandler.handle_request/5).
+  defp request_meta!(opts) do
+    case Keyword.fetch(opts, :client_capabilities) do
+      :error -> %{}
+      {:ok, capabilities} when is_map(capabilities) -> %{client_capabilities: capabilities}
+      {:ok, _invalid} -> raise ArgumentError, "client_capabilities must be a map"
+    end
   end
 
   defp fulfill_mrtr(client, input_requests, opts, timeout, scope_ref) do
