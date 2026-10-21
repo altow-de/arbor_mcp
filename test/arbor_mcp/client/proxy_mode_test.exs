@@ -224,6 +224,23 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
 
       refute_received {:app_context, _era, _capabilities, _meta}
     end
+
+    test "treat nil as unset", %{url: url} do
+      started = %{"elicitation" => %{"form" => %{}}}
+      client = start_client(url, capabilities: started)
+
+      assert {:ok, %{"content" => [%{"text" => "seen"}]}} =
+               Client.call_tool(client, "context", %{},
+                 format: :map,
+                 input_responses: nil,
+                 request_state: nil,
+                 client_capabilities: nil,
+                 progress_to: nil,
+                 cancel_on_caller_exit: nil
+               )
+
+      assert_received {:app_context, :modern, ^started, _meta}
+    end
   end
 
   describe "client capabilities per request" do

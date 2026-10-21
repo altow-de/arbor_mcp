@@ -350,12 +350,14 @@ defmodule Arbor.MCP.Client.Internal.Request do
   end
 
   # Per-request options that the client process applies when it sends the
-  # request (see Arbor.MCP.Client.RequestHandler.handle_request/5).
+  # request (see Arbor.MCP.Client.RequestHandler.handle_request/5). As with
+  # `:input_responses` and `:request_state`, `nil` means the option is unset,
+  # so a forwarding caller can pass its downstream values through unchanged.
   defp request_meta!(opts) do
     Enum.reduce([:client_capabilities, :progress_to, :cancel_on_caller_exit], %{}, fn key, meta ->
-      case Keyword.fetch(opts, key) do
-        :error -> meta
-        {:ok, value} -> Map.put(meta, key, request_meta_value!(key, value))
+      case Keyword.get(opts, key) do
+        nil -> meta
+        value -> Map.put(meta, key, request_meta_value!(key, value))
       end
     end)
   end
