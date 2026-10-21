@@ -227,14 +227,15 @@ defmodule Arbor.MCP.Client.Internal.Request do
     end
   end
 
+  # `nil` leaves the option unset, like the other proxy-mode options.
   defp validate_mrtr_mode!(opts) do
-    case Keyword.get(opts, :mrtr, :auto) do
-      mode when mode in [:auto, :manual] -> :ok
+    case Keyword.get(opts, :mrtr) do
+      mode when mode in [nil, :auto, :manual] -> :ok
       _invalid -> raise ArgumentError, "mrtr must be :auto or :manual"
     end
   end
 
-  defp manual_mrtr?(opts), do: Keyword.get(opts, :mrtr, :auto) == :manual
+  defp manual_mrtr?(opts), do: Keyword.get(opts, :mrtr) == :manual
 
   # Manual MRTR hands the caller the same validated round that automatic
   # fulfillment would act on, so a forwarding caller never relays a malformed

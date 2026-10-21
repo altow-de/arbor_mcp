@@ -25,7 +25,7 @@ defmodule Arbor.MCP.Client.Types do
           | {:idempotency_key, String.t()}
           | {:idempotency_key_path, String.t() | [String.t()]}
           | {:cursor, String.t()}
-          | {:mrtr, :auto | :manual}
+          | {:mrtr, :auto | :manual | nil}
           | {:input_responses, map() | nil}
           | {:request_state, String.t() | nil}
           | {:client_capabilities, map() | nil}

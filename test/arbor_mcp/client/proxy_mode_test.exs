@@ -239,6 +239,7 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
       assert {:ok, %{"content" => [%{"text" => "seen"}]}} =
                Client.call_tool(client, "context", %{},
                  format: :map,
+                 mrtr: nil,
                  input_responses: nil,
                  request_state: nil,
                  client_capabilities: nil,
