@@ -40,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `server_info/1`, every new connection and a successful `discover/2`
   replace the value, and the client status carries it as
   `:server_instructions`.
+- `Arbor.MCP.HttpPlug` options `:discover_ttl_ms` and
+  `:discover_cache_scope` set `ttlMs` and `cacheScope` of the
+  `server/discover` result, which stay `3600000` and `"public"` when unset.
+  A host plug in front of the plug can set them and `:instructions` for one
+  request by replacing those keys in the map from `init/1` before it calls
+  `call/2`. The plug raises `ArgumentError` for an invalid value of any of
+  the three, at initialization and for each request. See "Discovery
+  instructions and cache hints" in `docs/CONFIGURATION.md`.
 
 ## [2.0.0-rc.4] — 2026-10-19
 

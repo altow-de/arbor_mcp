@@ -34,6 +34,15 @@ defmodule Arbor.MCP.HttpPlug do
   extend the original HTTP entry deadline. Configure the runtime's
   `:request_timeout_ms` for work lifetime.
 
+  The plug answers `server/discover` itself. `:instructions`,
+  `:discover_ttl_ms` (default `3_600_000`) and `:discover_cache_scope`
+  (default `"public"`) set the `instructions`, `ttlMs` and `cacheScope` of
+  that result. A host plug may replace these three keys in the map that
+  `init/1` returns before it calls `call/2`, to set them for one request;
+  `call/2` validates them again and raises `ArgumentError` for an invalid
+  value. See "Discovery instructions and cache hints" in the
+  [configuration guide](CONFIGURATION.md).
+
   ## Usage
 
       # In the host application's supervision tree
@@ -195,6 +204,8 @@ defmodule Arbor.MCP.HttpPlug do
       server_capabilities: Keyword.get(opts, :server_capabilities),
       protocol_mode: Keyword.get(opts, :protocol_mode),
       instructions: Keyword.get(opts, :instructions),
+      discover_ttl_ms: Keyword.get(opts, :discover_ttl_ms),
+      discover_cache_scope: Keyword.get(opts, :discover_cache_scope),
       request_state: Keyword.get(opts, :request_state),
       endpoint: Keyword.get(opts, :path, "/mcp"),
       max_input_requests: Keyword.get(opts, :max_input_requests, 16),
@@ -1650,6 +1661,8 @@ defmodule Arbor.MCP.HttpPlug do
     keys = [
       :protocol_mode,
       :instructions,
+      :discover_ttl_ms,
+      :discover_cache_scope,
       :request_state,
       :endpoint,
       :http_endpoint,

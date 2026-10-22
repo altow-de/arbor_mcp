@@ -15,7 +15,13 @@ defmodule Arbor.MCP.Server.Discover do
           :result_must_be_object
           | {:invalid_discover_field, String.t()}
 
-  @doc "Builds the body of a modern discovery result."
+  @doc """
+  Builds the body of a modern discovery result.
+
+  `:ttl_ms` and `:cache_scope` default to #{@default_ttl_ms} ms and
+  `"public"` when they are missing or `nil`; `:instructions` is omitted when
+  it is `nil`.
+  """
   @spec build(map(), map(), keyword()) :: map()
   def build(server_info, capabilities, opts \\ []) do
     mode = Keyword.get(opts, :protocol_mode) || VersionRegistry.protocol_mode()
@@ -23,8 +29,8 @@ defmodule Arbor.MCP.Server.Discover do
     supported_versions =
       Keyword.get(opts, :supported_versions) || VersionRegistry.enabled_versions(mode)
 
-    ttl_ms = Keyword.get(opts, :ttl_ms, @default_ttl_ms)
-    cache_scope = Keyword.get(opts, :cache_scope, "public")
+    ttl_ms = Keyword.get(opts, :ttl_ms) || @default_ttl_ms
+    cache_scope = Keyword.get(opts, :cache_scope) || "public"
 
     %{
       "supportedVersions" => supported_versions,

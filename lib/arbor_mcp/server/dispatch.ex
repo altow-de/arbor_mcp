@@ -191,7 +191,9 @@ defmodule Arbor.MCP.Server.Dispatch do
       Discover.build(handler_server_info(ctx.module) || %{}, handler_capabilities(ctx.module),
         protocol_mode: Keyword.get(ctx.dispatch_opts, :protocol_mode) || protocol_mode(state),
         instructions:
-          Keyword.get(ctx.dispatch_opts, :instructions) || state_value(state, :instructions)
+          Keyword.get(ctx.dispatch_opts, :instructions) || state_value(state, :instructions),
+        ttl_ms: Keyword.get(ctx.dispatch_opts, :discover_ttl_ms),
+        cache_scope: Keyword.get(ctx.dispatch_opts, :discover_cache_scope)
       )
 
     {:response, JSONRPC.response(ctx.id, result), state}

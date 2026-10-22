@@ -46,7 +46,26 @@ defmodule Arbor.MCP.HttpPlug.Configuration do
               "MCP HTTP option #{inspect(key)} requires a valid authorizer or finite positive limit"
     end
 
-    :ok
+    validate_discover_options!(opts)
+  end
+
+  # Checked at initialization and again for every request, because a host
+  # plug may set these options for one request before it calls the plug.
+  defp validate_discover_options!(opts) do
+    checks = [
+      {:instructions, &is_binary/1, "a string"},
+      {:discover_ttl_ms, &(is_integer(&1) and &1 >= 0), "a non-negative integer"},
+      {:discover_cache_scope, &(&1 in [:public, :private, "public", "private"]),
+       ":public, :private, \"public\" or \"private\""}
+    ]
+
+    Enum.each(checks, fn {key, valid?, expected} ->
+      value = Keyword.get(opts, key)
+
+      unless is_nil(value) or valid?.(value) do
+        raise ArgumentError, "MCP HTTP option #{inspect(key)} must be #{expected} or nil"
+      end
+    end)
   end
 
   # The mount captured this opaque kind at initialization. Request-time resolution

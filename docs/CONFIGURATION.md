@@ -1614,6 +1614,57 @@ forward "/mcp", Arbor.MCP.HttpPlug,
   end
 ```
 
+### Discovery instructions and cache hints
+
+A Runtime-mounted `Arbor.MCP.HttpPlug` answers `server/discover` without
+calling the handler. Three plug options set fields of that result:
+
+| Option | Result field | When unset |
+|---|---|---|
+| `:instructions` | `instructions` | omitted |
+| `:discover_ttl_ms` | `ttlMs` | `3_600_000` |
+| `:discover_cache_scope` | `cacheScope` | `"public"` |
+
+`:instructions` must be a string, `:discover_ttl_ms` a non-negative integer
+and `:discover_cache_scope` one of `:public`, `:private`, `"public"` or
+`"private"`; `nil` leaves an option unset. The plug raises `ArgumentError`
+for any other value, both in `init/1` and for each request. The legacy
+`initialize` result comes from the handler's `handle_initialize/2`, and
+these options do not change it.
+
+The defaults suit a discovery result that is the same for every caller. When
+the instructions depend on the caller, the result must not be shared, so set
+`cacheScope` to `private` and keep `ttlMs` short. A host plug in front of
+`Arbor.MCP.HttpPlug` sets the three options for one request: `init/1`
+returns a map, and the host replaces these keys in it before it calls
+`call/2`. They are the only keys of that map a host may change per request.
+Only `server/discover` reads them, so a host that has already decoded the
+request may compute them for that method alone.
+
+```elixir
+defmodule MyApp.MCPPlug do
+  @behaviour Plug
+
+  @impl Plug
+  def init(opts), do: Arbor.MCP.HttpPlug.init(opts)
+
+  @impl Plug
+  def call(conn, opts) do
+    person = conn.assigns.current_person
+
+    Arbor.MCP.HttpPlug.call(conn, %{
+      opts
+      | instructions: MyApp.Instructions.for_person(person),
+        discover_ttl_ms: 300_000,
+        discover_cache_scope: :private
+    })
+  end
+end
+
+# In the router:
+forward "/mcp", MyApp.MCPPlug, runtime: MyApp.MCPRuntime, path: "/mcp"
+```
+
 ## Resilience
 
 Retries:
