@@ -70,4 +70,19 @@ defmodule Arbor.MCP.Server.DiscoverTest do
     assert {:error, {:invalid_discover_field, "cacheScope"}} =
              Discover.parse_result(%{valid | "cacheScope" => "shared"})
   end
+
+  test "parses instructions that are not text as none" do
+    result = %{
+      "supportedVersions" => ["2026-07-28"],
+      "capabilities" => %{},
+      "ttlMs" => 10,
+      "cacheScope" => "public"
+    }
+
+    assert {:ok, %{instructions: "Ask first."}} =
+             Discover.parse_result(Map.put(result, "instructions", "Ask first."))
+
+    assert {:ok, %{instructions: nil}} =
+             Discover.parse_result(Map.put(result, "instructions", 42))
+  end
 end

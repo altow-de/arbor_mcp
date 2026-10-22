@@ -1,8 +1,9 @@
 defmodule Arbor.MCP.Client.ServerInstructionsTest do
   # The instructions a server sends while the client establishes the
   # connection: in the initialize result on MCP 2025-06-18, in the
-  # server/discover result on MCP 2026-07-28. Every test runs the client
-  # against a real Runtime-mounted Arbor.MCP.HttpPlug on Bandit.
+  # server/discover result on MCP 2026-07-28. The tests run the client
+  # against a real Runtime-mounted Arbor.MCP.HttpPlug on Bandit, except one
+  # against a plug that sends legacy instructions which are not text.
   use ExUnit.Case, async: false
 
   alias Arbor.MCP.Client
@@ -49,6 +50,40 @@ defmodule Arbor.MCP.Client.ServerInstructionsTest do
     end
   end
 
+  # A legacy server whose initialize result carries instructions that are
+  # not text. Accepts notifications/initialized and nothing else.
+  defmodule ObjectInstructionsPlug do
+    @behaviour Plug
+
+    @impl true
+    def init(opts), do: opts
+
+    @impl true
+    def call(conn, _opts) do
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      case Jason.decode!(body) do
+        %{"method" => "initialize", "id" => id} ->
+          result = %{
+            "protocolVersion" => "2025-06-18",
+            "capabilities" => %{},
+            "serverInfo" => %{"name" => "object-instructions", "version" => "1.0.0"},
+            "instructions" => %{"text" => "Use the search tool before you answer."}
+          }
+
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.send_resp(
+            200,
+            Jason.encode!(%{"jsonrpc" => "2.0", "id" => id, "result" => result})
+          )
+
+        %{"method" => "notifications/initialized"} ->
+          Plug.Conn.send_resp(conn, 202, "")
+      end
+    end
+  end
+
   for {era, version, mode} <- [
         {"MCP 2026-07-28", "2026-07-28", :modern_only},
         {"MCP 2025-06-18", "2025-06-18", :legacy_only}
@@ -83,6 +118,24 @@ defmodule Arbor.MCP.Client.ServerInstructionsTest do
         assert Client.server_instructions(client) == {:ok, nil}
       end
     end
+  end
+
+  test "server_instructions/1 returns nil for legacy instructions that are not text" do
+    listener =
+      start_supervised!(
+        {Bandit, plug: ObjectInstructionsPlug, ip: {127, 0, 0, 1}, port: 0},
+        id: make_ref()
+      )
+
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(listener)
+
+    client =
+      start_client("http://127.0.0.1:#{port}/mcp", %{version: "2025-06-18", mode: :legacy_only})
+
+    assert Client.server_info(client) ==
+             {:ok, %{"name" => "object-instructions", "version" => "1.0.0"}}
+
+    assert Client.server_instructions(client) == {:ok, nil}
   end
 
   test "server_instructions/1 answers like server_info/1 before the connection" do
