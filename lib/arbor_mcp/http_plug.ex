@@ -1950,8 +1950,19 @@ defmodule Arbor.MCP.HttpPlug do
   defp close_with(conn, opts, status, message) do
     conn
     |> maybe_add_cors_headers(opts)
-    |> put_resp_header("connection", "close")
+    |> put_close_header()
     |> send_resp(status, message)
+  end
+
+  # Only HTTP/1.x closes a connection with this header. HTTP/2 forbids it
+  # (RFC 9113, 8.2.2), and the server ends the stream there. Bandit and
+  # Cowboy name HTTP/1.0 `:"HTTP/1.0"`, the Plug adapter type `:"HTTP/1"`.
+  defp put_close_header(conn) do
+    if get_http_protocol(conn) in [:"HTTP/1", :"HTTP/1.0", :"HTTP/1.1"] do
+      put_resp_header(conn, "connection", "close")
+    else
+      conn
+    end
   end
 
   defp runtime_read_options(

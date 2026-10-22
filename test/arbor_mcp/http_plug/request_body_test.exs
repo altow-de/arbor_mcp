@@ -102,6 +102,42 @@ defmodule Arbor.MCP.HttpPlug.RequestBodyTest do
     assert response =~ "Request body too large"
   end
 
+  # HTTP/2 forbids connection-specific header fields (RFC 9113, 8.2.2); a
+  # client treats a response with `connection` as malformed. Bandit ends the
+  # stream itself, so the 413 needs no close there.
+  test "under HTTP/2 a too large body gets 413 without a connection header", %{
+    runtime: runtime
+  } do
+    port = start_listener(runtime)
+    {:ok, conn} = Mint.HTTP2.connect(:http, "127.0.0.1", port)
+
+    {:ok, conn, ref} =
+      Mint.HTTP2.request(
+        conn,
+        "POST",
+        "/mcp",
+        [
+          {"content-type", "application/json"},
+          {"accept", "application/json, text/event-stream"},
+          {"content-length", "1000000"}
+        ],
+        :stream
+      )
+
+    # Bandit's HTTP/2 read reports the rest only once it holds more than the
+    # limit.
+    {:ok, conn} = Mint.HTTP2.stream_request_body(conn, ref, :binary.copy("x", 2 * @body_limit))
+
+    started = System.monotonic_time(:millisecond)
+    assert {:done, response} = receive_h2_response(conn, ref, started + @deadline, %{})
+
+    assert response.status == 413
+    refute List.keymember?(response.headers, "connection", 0)
+    assert response.body == "Request body too large"
+
+    Mint.HTTP2.close(conn)
+  end
+
   test "an unreadable body gets 400 and closes the connection", %{runtime: runtime} do
     opts = Arbor.MCP.HttpPlug.init(runtime: runtime, path: "/mcp", body_limit: @body_limit)
 
@@ -143,4 +179,46 @@ defmodule Arbor.MCP.HttpPlug.RequestBodyTest do
       {:error, reason} -> {reason, received}
     end
   end
+
+  defp receive_h2_response(conn, ref, deadline, response) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      message ->
+        case Mint.HTTP2.stream(conn, message) do
+          {:ok, conn, responses} ->
+            case collect_h2_response(responses, ref, response) do
+              {:done, response} -> {:done, response}
+              {:cont, response} -> receive_h2_response(conn, ref, deadline, response)
+            end
+
+          {:error, _conn, reason, _responses} ->
+            {:error, reason, response}
+
+          :unknown ->
+            receive_h2_response(conn, ref, deadline, response)
+        end
+    after
+      remaining -> {:timeout, response}
+    end
+  end
+
+  defp collect_h2_response([], _ref, response), do: {:cont, response}
+
+  defp collect_h2_response([{:status, ref, status} | rest], ref, response),
+    do: collect_h2_response(rest, ref, Map.put(response, :status, status))
+
+  defp collect_h2_response([{:headers, ref, headers} | rest], ref, response),
+    do: collect_h2_response(rest, ref, Map.put(response, :headers, headers))
+
+  defp collect_h2_response([{:data, ref, data} | rest], ref, response),
+    do: collect_h2_response(rest, ref, Map.update(response, :body, data, &(&1 <> data)))
+
+  defp collect_h2_response([{:done, ref} | _rest], ref, response), do: {:done, response}
+
+  defp collect_h2_response([{:error, ref, reason} | _rest], ref, response),
+    do: {{:error, reason}, response}
+
+  defp collect_h2_response([_other | rest], ref, response),
+    do: collect_h2_response(rest, ref, response)
 end
