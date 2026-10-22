@@ -45,8 +45,8 @@ defmodule Arbor.MCP.Client.PreferModernLegacyServerTest do
     end
   end
 
-  # Answers server/discover with -32022 and supported versions the client
-  # does not enable, and reports every request to the test.
+  # Answers every request with -32022 and the `:supported` versions, by
+  # default one the client does not enable, and reports it to the test.
   defmodule ForeignVersionPlug do
     @behaviour Plug
 
@@ -65,7 +65,10 @@ defmodule Arbor.MCP.Client.PreferModernLegacyServerTest do
         "error" => %{
           "code" => -32022,
           "message" => "Unsupported protocol version",
-          "data" => %{"supported" => ["2024-01-01"], "requested" => "2026-07-28"}
+          "data" => %{
+            "supported" => Keyword.get(opts, :supported, ["2024-01-01"]),
+            "requested" => "2026-07-28"
+          }
         }
       }
 
@@ -132,6 +135,27 @@ defmodule Arbor.MCP.Client.PreferModernLegacyServerTest do
       assert_receive {:app_request, "server/discover"}
       refute_received {:app_request, "initialize"}
     end
+  end
+
+  # The client retries the shared modern version once. A shared legacy
+  # version next to it is no evidence of a legacy-only server.
+  test "supported versions with a shared modern one keep the error and stay unobserved" do
+    url =
+      start_listener(
+        {ForeignVersionPlug, test_pid: self(), supported: ["2026-07-28", "2025-06-18"]}
+      )
+
+    assert {:error, {:transport_connect_failed, reason}} = start_client(url, :prefer_modern)
+    assert reason =~ "no_mutually_supported_modern_version"
+    assert_received {:app_request, "server/discover"}
+    refute_received {:app_request, "initialize"}
+    flush_requests()
+
+    # No legacy observation stays behind: the next connection probes again.
+    assert {:error, {:transport_connect_failed, reason}} = start_client(url, :prefer_modern)
+    assert reason =~ "no_mutually_supported_modern_version"
+    assert_received {:app_request, "server/discover"}
+    refute_received {:app_request, "initialize"}
   end
 
   defp flush_requests do
