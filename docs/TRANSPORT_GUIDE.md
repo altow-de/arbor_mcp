@@ -370,6 +370,10 @@ children = [
 Open GET `/sse` with `Accept: text/event-stream` first. The first event is
 `endpoint`; JSON-RPC then goes to the advertised POST URI (default
 `/message?sessionId=...`). This is **not** Streamable HTTP.
+
+Over HTTPS, the client takes the same TLS settings as `transport: :http`
+under `security: %{tls: ...}`, for example `security: %{tls: %{cacerts: certs}}`
+to trust a private CA. Other `:security` keys do not apply to this transport.
 `Arbor.MCP.Client.start_link(transport: :http, use_sse: true)` GETs the same MCP
 endpoint after `initialize`; `use_sse: false` disables that standalone GET.
 `transport: :sse` is the 2024-11-05 two-endpoint client.

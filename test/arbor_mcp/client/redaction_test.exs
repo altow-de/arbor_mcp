@@ -49,7 +49,8 @@ defmodule Arbor.MCP.Client.RedactionTest do
       base_url: "https://mcp.example.com",
       post_url: "https://mcp.example.com/message?sessionId=SECRET-SESSION",
       session_id: "SECRET-SESSION",
-      headers: [{"authorization", "Bearer SECRET-BEARER"}]
+      headers: [{"authorization", "Bearer SECRET-BEARER"}],
+      security: %{tls: %{cert: "client.pem", key: {:RSAPrivateKey, "SECRET-SECURITY"}}}
     }
 
     refute_secrets(inspect(state, limit: :infinity, printable_limit: :infinity))

@@ -172,6 +172,45 @@ defmodule Arbor.MCP.Internal.CACertsTest do
     end
   end
 
+  describe "put_default/3" do
+    test "adds the default certificates to an HTTPS connection that verifies the peer",
+         %{key: key} do
+      assert CACerts.put_default(:https, [timeout: 1_000], opts(key, loader: fn -> @os_certs end)) ==
+               {:ok, [cacerts: @os_certs, timeout: 1_000]}
+    end
+
+    test "leaves options alone when Mint would not choose certificates itself", %{key: key} do
+      cacerts_opts = opts(key, loader: counting(@os_certs))
+
+      for {scheme, transport_opts} <- [
+            {:https, [cacerts: [<<9>>]]},
+            {:https, [cacertfile: ~c"/etc/ssl/custom.pem"]},
+            {:https, [verify: :verify_none]},
+            {:http, []}
+          ] do
+        assert CACerts.put_default(scheme, transport_opts, cacerts_opts) == {:ok, transport_opts}
+      end
+
+      refute_received :os_load_attempted
+    end
+
+    test "fails closed when the trust store is unavailable", %{key: key} do
+      capture_log(fn ->
+        assert CACerts.put_default(:https, [], opts(key, loader: fn -> [] end)) ==
+                 {:error, {:trust_store_unavailable, :no_certificates}}
+      end)
+    end
+  end
+
+  test "valid?/1 accepts non-empty lists of DER or combined certificates only" do
+    assert CACerts.valid?([<<1, 2, 3>>])
+    assert CACerts.valid?([{:cert, <<1, 2, 3>>, :otp_certificate}])
+
+    for invalid <- [nil, [], "ca.pem", [~c"ca.pem"], [:not_a_certificate], %{}] do
+      refute CACerts.valid?(invalid)
+    end
+  end
+
   test "the CAStore bundle parses to DER certificates" do
     certs = CACerts.castore_certs()
 

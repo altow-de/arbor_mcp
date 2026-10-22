@@ -153,7 +153,8 @@ defmodule Arbor.MCP.Internal.Redaction do
       | headers: headers(state.headers),
         session_id: secret(state.session_id),
         sse_url: url(state.sse_url),
-        post_url: url(state.post_url)
+        post_url: url(state.post_url),
+        security: security(state.security)
     }
   end
 

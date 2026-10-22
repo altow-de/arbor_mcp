@@ -1,6 +1,7 @@
 defmodule Arbor.MCP.Internal.PinnedHTTPClient do
   @moduledoc false
 
+  alias Arbor.MCP.Internal.CACerts
   alias Arbor.MCP.Internal.HTTPResponseReducer, as: Reducer
 
   @type response :: %{
@@ -18,16 +19,17 @@ defmodule Arbor.MCP.Internal.PinnedHTTPClient do
     timeout = opts[:request_timeout_ms]
     max_bytes = opts[:max_response_bytes]
 
-    connect_opts = [
-      hostname: uri.host,
-      mode: :passive,
-      transport_opts: transport_opts(address, opts)
-    ]
-
     pinned_address = address |> :inet.ntoa() |> to_string()
 
-    case Mint.HTTP1.connect(scheme, pinned_address, port, connect_opts) do
-      {:ok, conn} -> request_and_receive(conn, uri, opts[:request_headers], timeout, max_bytes)
+    with {:ok, transport_opts} <- CACerts.put_default(scheme, transport_opts(address, opts)),
+         {:ok, conn} <-
+           Mint.HTTP1.connect(scheme, pinned_address, port,
+             hostname: uri.host,
+             mode: :passive,
+             transport_opts: transport_opts
+           ) do
+      request_and_receive(conn, uri, opts[:request_headers], timeout, max_bytes)
+    else
       {:error, _reason} -> {:error, :fetch_failed}
     end
   rescue
@@ -96,6 +98,13 @@ defmodule Arbor.MCP.Internal.PinnedHTTPClient do
   end
 
   defp transport_opts(address, opts) do
-    [{:timeout, opts[:connect_timeout_ms]} | Reducer.address_family_options(address)]
+    transport_opts = [
+      {:timeout, opts[:connect_timeout_ms]} | Reducer.address_family_options(address)
+    ]
+
+    case opts[:cacerts] do
+      nil -> transport_opts
+      cacerts -> [{:cacerts, cacerts} | transport_opts]
+    end
   end
 end

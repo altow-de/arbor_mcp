@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- CA certificate options for the HTTPS connections that had none:
+  - `Arbor.MCP.Authorization.MetadataFetcher` takes `:cacerts`, per call, in
+    `config :arbor_mcp, :oauth_metadata_fetch`, or in a flow's
+    `metadata_fetch:` options. It covers protected resource metadata, OIDC
+    discovery, client ID metadata and JWKS fetches, and is separate from the
+    `:cacerts` in `config :arbor_mcp, :oauth_http`.
+  - Remote JSON Schema references take `network_refs: [cacerts: ...]`.
+  - The legacy HTTP+SSE transport (`transport: :sse`) takes
+    `security: %{tls: ...}`, built like the HTTP transport's TLS settings:
+    CA certificates, client certificate, verification and TLS versions.
+
+### Fixed
+
+- HTTPS connections from the legacy HTTP+SSE transport, OAuth metadata, OIDC
+  discovery and JWKS fetches, and remote JSON Schema fetches now use the same
+  trust store as the HTTP transport. They passed no CA certificates to Mint,
+  which then loaded the OS store with no deadline and, if that failed, silently
+  trusted the `castore` bundle. Now, when the OS store can't be loaded, they fail
+  closed like other HTTPS requests unless `config :arbor_mcp, :cacerts,
+  fallback: :castore` is set.
+- `security: %{tls: %{verify: :verify_none}}` no longer loads the trust store,
+  so connections that skip peer verification keep working while the store is
+  unavailable. `Arbor.MCP.Transport.HTTP.build_ssl_options/1` now returns
+  `:cacerts` only when the peer is verified or certificates are given.
+
 ## [2.0.0-rc.4] — 2026-10-19
 
 ### Fixed

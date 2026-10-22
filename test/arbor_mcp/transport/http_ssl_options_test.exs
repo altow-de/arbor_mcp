@@ -62,6 +62,16 @@ defmodule Arbor.MCP.Transport.HTTPSslOptionsTest do
       assert Keyword.get(opts, :ciphers) == ["ECDHE-RSA-AES256-GCM-SHA384"]
       assert Keyword.get(opts, :verify_fun) == verify_fun
     end
+
+    test "returns no :cacerts for verify_none unless they are given" do
+      refute Keyword.has_key?(HTTP.build_ssl_options(%{verify: :verify_none}), :cacerts)
+
+      assert Keyword.get(
+               HTTP.build_ssl_options(%{verify: :verify_none, cacerts: [<<1>>]}),
+               :cacerts
+             ) ==
+               [<<1>>]
+    end
   end
 
   describe "httpc_http_options/2" do
