@@ -1098,8 +1098,9 @@ defmodule Arbor.MCP.Client do
   Discovers a modern MCP server's versions, capabilities, and identity.
 
   A successful discovery also updates the client's protocol version,
-  `server_info`, `server_instructions`, and `server_capabilities` state. Automatic discovery during
-  connection establishment is handled separately by the era probe.
+  `server_info`, `server_instructions`, and `server_capabilities` state.
+  Automatic discovery during connection establishment is handled separately
+  by the era probe.
   """
   @spec discover(t(), keyword()) :: {:ok, map()} | {:error, any()}
   def discover(client, opts \\ []) do
