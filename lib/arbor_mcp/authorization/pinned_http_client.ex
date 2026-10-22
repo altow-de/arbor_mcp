@@ -1,6 +1,7 @@
 defmodule Arbor.MCP.Authorization.PinnedHTTPClient do
   @moduledoc false
 
+  alias Arbor.MCP.Internal.CACerts
   alias Arbor.MCP.Internal.HTTPResponseReducer, as: Reducer
 
   @type httpc_response ::
@@ -33,13 +34,15 @@ defmodule Arbor.MCP.Authorization.PinnedHTTPClient do
       |> Keyword.put(:send_timeout_close, true)
       |> Keyword.merge(Reducer.address_family_options(address))
 
-    Mint.HTTP1.connect(scheme, pinned_address, port,
-      hostname: uri.host,
-      mode: :passive,
-      transport_opts: transport_opts,
-      max_header_list_size: Keyword.fetch!(opts, :max_header_bytes),
-      optional_responses: [:status_reason]
-    )
+    with {:ok, transport_opts} <- CACerts.put_default(scheme, transport_opts) do
+      Mint.HTTP1.connect(scheme, pinned_address, port,
+        hostname: uri.host,
+        mode: :passive,
+        transport_opts: transport_opts,
+        max_header_list_size: Keyword.fetch!(opts, :max_header_bytes),
+        optional_responses: [:status_reason]
+      )
+    end
   end
 
   defp request_and_receive(conn, method, uri, headers, body, opts) do

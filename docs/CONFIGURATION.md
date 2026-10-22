@@ -774,7 +774,10 @@ request. `subscriptions/listen` opens its own POST response stream.
 Outbound HTTPS (this transport and the OAuth HTTP boundary) verifies peers
 against the operating system's trust store unless you pass certificates
 yourself, so CAs installed on the host, such as a private or corporate CA,
-are trusted automatically.
+are trusted automatically. The legacy HTTP+SSE transport, fetches through
+`Arbor.MCP.Authorization.MetadataFetcher` (protected resource metadata, OIDC
+discovery, client ID metadata and JWKS), and remote JSON Schema fetches always
+use this trust store; they don't take certificates of their own.
 
 Loading that store can stall: on macOS it runs `/usr/bin/security`, which can
 hang on the keychain, for example while the session is locked. ArborMCP loads it

@@ -82,6 +82,33 @@ defmodule Arbor.MCP.Internal.CACerts do
     end
   end
 
+  @doc """
+  Adds the default CA certificates to Mint `transport_opts` when Mint would
+  otherwise choose them itself: an HTTPS connection that verifies the peer and
+  sets neither `:cacerts` nor `:cacertfile`. Mint's own default loads the OS
+  store with no deadline and falls back to CAStore without the opt-in that
+  `get/1` requires, so every Mint connection goes through here.
+
+  `opts` are passed to `get/1`.
+  """
+  @spec put_default(atom(), keyword(), keyword()) ::
+          {:ok, keyword()} | {:error, {:trust_store_unavailable, term()}}
+  def put_default(scheme, transport_opts, opts \\ [])
+
+  def put_default(:https, transport_opts, opts) do
+    if Keyword.get(transport_opts, :verify, :verify_peer) == :verify_peer and
+         not Keyword.has_key?(transport_opts, :cacerts) and
+         not Keyword.has_key?(transport_opts, :cacertfile) do
+      {:ok, Keyword.put(transport_opts, :cacerts, get(opts))}
+    else
+      {:ok, transport_opts}
+    end
+  rescue
+    e in UnavailableError -> {:error, {:trust_store_unavailable, e.reason}}
+  end
+
+  def put_default(_scheme, transport_opts, _opts), do: {:ok, transport_opts}
+
   @doc "The CAStore bundle as DER-encoded certificates."
   @spec castore_certs() :: [:public_key.der_encoded()]
   def castore_certs do

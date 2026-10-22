@@ -1,6 +1,7 @@
 defmodule Arbor.MCP.Transport.HTTP.BoundedStream do
   @moduledoc false
 
+  alias Arbor.MCP.Internal.CACerts
   alias Arbor.MCP.Transport.HTTP.TargetPolicy
 
   @default_max_header_bytes 65_536
@@ -91,13 +92,15 @@ defmodule Arbor.MCP.Transport.HTTP.BoundedStream do
       |> Keyword.put(:timeout, Keyword.fetch!(opts, :connect_timeout))
       |> Keyword.merge(address_family_options(address))
 
-    Mint.HTTP1.connect(scheme, pinned_address, port,
-      hostname: uri.host,
-      mode: :passive,
-      transport_opts: transport_opts,
-      max_header_list_size: Keyword.get(opts, :max_header_bytes, @default_max_header_bytes),
-      optional_responses: [:status_reason]
-    )
+    with {:ok, transport_opts} <- CACerts.put_default(scheme, transport_opts) do
+      Mint.HTTP1.connect(scheme, pinned_address, port,
+        hostname: uri.host,
+        mode: :passive,
+        transport_opts: transport_opts,
+        max_header_list_size: Keyword.get(opts, :max_header_bytes, @default_max_header_bytes),
+        optional_responses: [:status_reason]
+      )
+    end
   end
 
   defp receive_response(conn, request_ref, response, owner, opts) do

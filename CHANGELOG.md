@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- HTTPS connections from the legacy HTTP+SSE transport, OAuth metadata, OIDC
+  discovery and JWKS fetches, and remote JSON Schema fetches now use the same
+  trust store as the HTTP transport. They passed no CA certificates to Mint,
+  which then loaded the OS store with no deadline and, if that failed, silently
+  trusted the `castore` bundle. Now, when the OS store can't be loaded, they fail
+  closed like other HTTPS requests unless `config :arbor_mcp, :cacerts,
+  fallback: :castore` is set.
+
 ## [2.0.0-rc.4] — 2026-10-19
 
 ### Fixed
