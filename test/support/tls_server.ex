@@ -24,13 +24,14 @@ defmodule Arbor.MCP.Test.TLSServer do
   def start(handler) when is_function(handler, 1) do
     {:ok, _apps} = Application.ensure_all_started(:ssl)
     san = {:Extension, {2, 5, 29, 17}, false, [dNSName: ~c"localhost"]}
-    # The default generated keys fail the TLS 1.3 handshake with
-    # :unable_to_supply_acceptable_cert; RSA keys work.
-    rsa = [key: {:rsa, 2048, 17}]
+    # pkix_test_data signs with SHA-1 by default, which TLS 1.3 rejects for
+    # certificates on some OTP releases (:unable_to_supply_acceptable_cert on
+    # OTP 27.0). ECDSA P-256 with SHA-256 is mandatory for TLS 1.3 clients.
+    key = [key: {:namedCurve, :secp256r1}, digest: :sha256]
 
     %{server_config: server_config, client_config: client_config} =
       :public_key.pkix_test_data(%{
-        server_chain: %{root: rsa, intermediates: [], peer: rsa ++ [extensions: [san]]},
+        server_chain: %{root: key, intermediates: [], peer: key ++ [extensions: [san]]},
         client_chain: %{root: [], peer: []}
       })
 
