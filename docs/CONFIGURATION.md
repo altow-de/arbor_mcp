@@ -1638,6 +1638,11 @@ for any other value, both in `init/1` and for each request. The legacy
 `initialize` result comes from the handler's `handle_initialize/2`, and
 these options do not change it.
 
+They are mount options of the plug, given to `forward` or `init/1` with
+`transport: :mounted_http`. A Runtime with `transport: :http` mounts the
+plug on a listener of its own and takes the three options among its HTTP
+options, for example `http: [port: 4000, discover_cache_scope: :private]`.
+
 The defaults suit a discovery result that is the same for every caller. When
 the instructions depend on the caller, the result must not be shared, so set
 `cacheScope` to `private` and keep `ttlMs` short. A host plug in front of

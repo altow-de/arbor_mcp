@@ -43,7 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Arbor.MCP.HttpPlug` options `:discover_ttl_ms` and
   `:discover_cache_scope` set `ttlMs` and `cacheScope` of the
   `server/discover` result, which stay `3600000` and `"public"` when unset.
-  A host plug in front of the plug can set them and `:instructions` for one
+  A Runtime with `transport: :http` takes them among its HTTP options, as
+  it takes `:instructions`. A host plug in front of a plug mounted with
+  `transport: :mounted_http` can set them and `:instructions` for one
   request by replacing those keys in the map from `init/1` before it calls
   `call/2`. The plug raises `ArgumentError` for an invalid value of any of
   the three, at initialization and for each request. See "Discovery

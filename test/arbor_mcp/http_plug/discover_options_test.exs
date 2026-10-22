@@ -1,8 +1,9 @@
 defmodule Arbor.MCP.HttpPlug.DiscoverOptionsTest do
   # The instructions and cache hints of server/discover on a Runtime-mounted
-  # Arbor.MCP.HttpPlug: set on the mount, or for one request by a host plug
-  # that passes them to HttpPlug.call/2. The tests send real HTTP requests to
-  # Bandit with Arbor.MCP.Client.
+  # Arbor.MCP.HttpPlug: set on the mount, in the HTTP options of a Runtime
+  # that owns its listener, or for one request by a host plug that passes
+  # them to HttpPlug.call/2. The tests send real HTTP requests to Bandit with
+  # Arbor.MCP.Client.
   use ExUnit.Case, async: false
 
   alias Arbor.MCP.Client
@@ -104,6 +105,24 @@ defmodule Arbor.MCP.HttpPlug.DiscoverOptionsTest do
             }} = Client.discover(client, format: :map)
   end
 
+  test "the HTTP options of a runtime-owned listener set them for every request" do
+    url =
+      start_owned_app(
+        instructions: "Every person reaches the same apps.",
+        discover_ttl_ms: 60_000,
+        discover_cache_scope: :private
+      )
+
+    client = start_client(url, nil)
+
+    assert {:ok,
+            %{
+              "instructions" => "Every person reaches the same apps.",
+              "ttlMs" => 60_000,
+              "cacheScope" => "private"
+            }} = Client.discover(client, format: :map)
+  end
+
   describe "invalid discovery options" do
     test "are rejected when the plug is initialized" do
       for invalid <- [
@@ -158,6 +177,34 @@ defmodule Arbor.MCP.HttpPlug.DiscoverOptionsTest do
         id: make_ref()
       )
 
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(listener)
+    "http://127.0.0.1:#{port}/mcp"
+  end
+
+  # A Runtime with `transport: :http` starts its own Bandit listener and
+  # mounts the plug with the plug options among its HTTP options.
+  defp start_owned_app(http_opts) do
+    runtime =
+      start_supervised!(
+        {Runtime,
+         handler: AppHandler,
+         handler_args: [],
+         transport: :http,
+         execution: :stateless,
+         max_concurrency: 4,
+         http:
+           [
+             adapter: :bandit,
+             host: {127, 0, 0, 1},
+             port: 0,
+             path: "/mcp",
+             protocol_mode: :prefer_modern,
+             listener_options: [startup_log: false]
+           ] ++ http_opts},
+        id: make_ref()
+      )
+
+    {:ok, %{listener: listener}} = Arbor.MCP.Server.Transport.http_listener(runtime)
     {:ok, {_ip, port}} = ThousandIsland.listener_info(listener)
     "http://127.0.0.1:#{port}/mcp"
   end

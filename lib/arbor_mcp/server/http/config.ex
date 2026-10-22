@@ -41,6 +41,8 @@ defmodule Arbor.MCP.Server.HTTP.Config do
     :legacy_http_sse_post_path,
     :protocol_mode,
     :instructions,
+    :discover_ttl_ms,
+    :discover_cache_scope,
     :server_capabilities,
     :max_input_requests,
     :max_mrtr_bytes,
