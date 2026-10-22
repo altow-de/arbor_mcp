@@ -1170,13 +1170,18 @@ forwarding process that stops waiting early, for example at its own deadline,
 ends the helper with `Task.shutdown/2`.
 
 Every round of one call must carry the same request apart from
-`input_responses:` and `request_state:`: the same arguments,
-`client_capabilities:`, `:progress_token` and other `_meta` values. An
-arbor_mcp server binds its `requestState` to the request's params, `_meta`
-included, and to the declared capabilities, and rejects a retry that differs
-with `-32602` and the reason `request_state_binding_mismatch`. A proxy that
-picks its own upstream progress token therefore keeps it for all rounds of the
-call.
+`input_responses:`, `request_state:` and the progress token: the same
+arguments, `client_capabilities:` and other `_meta` values. An arbor_mcp
+server binds its `requestState` to the request's params, including `_meta`
+without `progressToken`, and to the declared capabilities, and rejects a
+retry that differs with `-32602` and the reason
+`request_state_binding_mismatch`. The progress token stays out of the binding
+because every round is a new request and a client may give each one its own
+token; the TypeScript SDK client does so for every request with a progress
+handler. Against an arbor_mcp upstream a proxy may therefore pick a new
+upstream progress token for each round. Another server may bind its state to
+all of `_meta`, so a proxy whose upstream it does not know keeps one upstream
+progress token for all rounds of the call, as the example below does.
 
 ```elixir
 # `call` describes one downstream call. On the first round it holds a new

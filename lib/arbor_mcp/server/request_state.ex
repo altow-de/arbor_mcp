@@ -115,15 +115,34 @@ defmodule Arbor.MCP.Server.RequestState do
   defp immutable_params(params) do
     params = Map.drop(params, ["inputResponses", "requestState", :inputResponses, :requestState])
 
-    Enum.reduce(["arguments", :arguments], params, fn key, acc ->
-      case Map.get(acc, key) do
-        arguments when is_map(arguments) ->
-          Map.put(acc, key, Map.drop(arguments, ["_request_id", :_request_id]))
+    params =
+      Enum.reduce(["arguments", :arguments], params, fn key, acc ->
+        case Map.get(acc, key) do
+          arguments when is_map(arguments) ->
+            Map.put(acc, key, Map.drop(arguments, ["_request_id", :_request_id]))
 
-        _other ->
-          acc
-      end
-    end)
+          _other ->
+            acc
+        end
+      end)
+
+    Enum.reduce(["_meta", :_meta], params, &without_progress_token/2)
+  end
+
+  # Every round of a call is a new request, and a client may give each one
+  # a new progress token, so the token stays out of the binding. An `_meta`
+  # that held nothing else binds like a missing one.
+  defp without_progress_token(key, params) do
+    case Map.get(params, key) do
+      meta when is_map(meta) ->
+        case Map.drop(meta, ["progressToken", :progressToken]) do
+          rest when map_size(rest) == 0 -> Map.delete(params, key)
+          rest -> Map.put(params, key, rest)
+        end
+
+      _other ->
+        params
+    end
   end
 
   @doc false

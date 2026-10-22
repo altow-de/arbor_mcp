@@ -31,8 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wait for it. That stream follows `:stream_handshake_timeout`,
   `:stream_idle_timeout` and `:http_stream_retry` instead of
   `:request_timeout`. Every MRTR round of one call repeats the same
-  arguments, capabilities and `_meta`, progress token included. See "Proxy
-  mode" in `docs/CONFIGURATION.md`.
+  arguments, capabilities and `_meta` apart from the progress token. See
+  "Proxy mode" in `docs/CONFIGURATION.md`.
 - `Arbor.MCP.Client.server_instructions/1` returns the `instructions` a
   server sent while the connection was established: from the `initialize`
   result on a legacy revision, from the `server/discover` result on MCP
@@ -53,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An MRTR retry with a new `_meta.progressToken` failed with `-32602` and
+  `request_state_binding_mismatch`, because the `requestState` binding
+  covered all of `_meta`. Every round is a new request, and a client may give
+  each one its own progress token: the TypeScript SDK client, and with it
+  Claude Code, sends the new request ID as the token. The binding now leaves
+  `progressToken` out of `_meta` and binds an `_meta` that held only the
+  token like a missing one. The arguments and the rest of `_meta` stay bound.
 - A `:prefer_modern` client did not connect to a legacy-only server that
   answers `server/discover` with `-32022`, an arbor_mcp server with
   `protocol_mode: :legacy_only` among them: it failed with

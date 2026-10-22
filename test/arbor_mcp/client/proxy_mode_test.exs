@@ -276,27 +276,33 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
                )
     end
 
-    # An arbor_mcp server binds its requestState to the request's params,
-    # _meta included, so every round of one call carries the same
-    # progress token.
-    test "a retry with the same progress_token and progress_to reaches the app", %{url: url} do
-      client = start_client(url, capabilities: %{"elicitation" => %{"form" => %{}}})
-      round = [mrtr: :manual, progress_token: "upstream-1", progress_to: self(), format: :map]
-
-      assert {:ok, %{"resultType" => "input_required", "requestState" => request_state}} =
-               Client.call_tool(client, "ask", %{}, round)
-
-      responses = %{"name" => %{"action" => "accept", "content" => %{"name" => "Tom"}}}
-      retry = round ++ [input_responses: responses, request_state: request_state]
-
-      assert {:error,
-              %{"code" => -32_602, "data" => %{"reason" => "request_state_binding_mismatch"}}} =
-               Client.call_tool(client, "ask", %{}, Keyword.put(retry, :progress_token, "new"))
+    # Every MRTR round is a new request, and a client such as Claude Code
+    # sends a new progress token with each one. An arbor_mcp server binds its
+    # requestState to the arguments and to _meta without the progress token.
+    test "a retry with a new progress token and progress_to reaches the app", %{url: url} do
+      retry = answer_first_round(url)
 
       assert {:ok, %{"resultType" => "complete", "content" => [%{"text" => "Welcome, Tom"}]}} =
-               Client.call_tool(client, "ask", %{}, retry)
+               Client.call_tool(retry.client, "ask", retry.arguments, retry.opts)
 
-      assert_received {:app_retry, ^responses, %{"step" => 1}}
+      assert_received {:app_retry, %{"name" => %{"content" => %{"name" => "Tom"}}},
+                       %{"step" => 1}}
+    end
+
+    test "a retry with other arguments or another _meta value is rejected", %{url: url} do
+      retry = answer_first_round(url)
+      other_meta = Keyword.put(retry.opts, :meta, %{"example.com/trace" => "t-2"})
+
+      for {arguments, opts} <- [
+            {%{"city" => "Boston"}, retry.opts},
+            {retry.arguments, other_meta}
+          ] do
+        assert {:error,
+                %{"code" => -32_602, "data" => %{"reason" => "request_state_binding_mismatch"}}} =
+                 Client.call_tool(retry.client, "ask", arguments, opts)
+      end
+
+      refute_received {:app_retry, _responses, _request_state}
     end
   end
 
@@ -627,6 +633,28 @@ defmodule Arbor.MCP.Client.ProxyModeTest do
 
     {:ok, {_ip, port}} = ThousandIsland.listener_info(listener)
     "http://127.0.0.1:#{port}/mcp"
+  end
+
+  # Runs the first round of "ask" with progress token 1 and returns the retry
+  # that answers it as a caller sends it: the same arguments and other _meta,
+  # progress token 2.
+  defp answer_first_round(url) do
+    client = start_client(url, capabilities: %{"elicitation" => %{"form" => %{}}})
+    arguments = %{"city" => "Austin"}
+
+    round = [
+      mrtr: :manual,
+      meta: %{"example.com/trace" => "t-1"},
+      progress_to: self(),
+      format: :map
+    ]
+
+    assert {:ok, %{"resultType" => "input_required", "requestState" => request_state}} =
+             Client.call_tool(client, "ask", arguments, [progress_token: 1] ++ round)
+
+    responses = %{"name" => %{"action" => "accept", "content" => %{"name" => "Tom"}}}
+    opts = [progress_token: 2, input_responses: responses, request_state: request_state] ++ round
+    %{client: client, arguments: arguments, opts: opts}
   end
 
   defp start_client(url, opts \\ []) do

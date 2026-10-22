@@ -593,8 +593,10 @@ defmodule Arbor.MCP.Client do
   and `:stream_idle_timeout` instead of `:request_timeout`, and with the
   default `http_stream_retry: :at_least_once` a broken stream is reissued
   once. Every MRTR round of one call must repeat the arguments,
-  `:client_capabilities`, `:progress_token` and `:meta`, because a server may
-  bind its `requestState` to them. See the "Proxy mode" section of the
+  `:client_capabilities` and `:meta`, because a server may bind its
+  `requestState` to them. An arbor_mcp server leaves `:progress_token` out of
+  that binding; another server may not, so a proxy repeats it as well when it
+  does not know its upstream. See the "Proxy mode" section of the
   configuration guide for the full contract and an example.
   """
   @spec call_tool(t(), String.t(), map(), keyword() | timeout()) ::
