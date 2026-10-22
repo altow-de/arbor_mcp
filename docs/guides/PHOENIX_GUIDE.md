@@ -5,7 +5,7 @@ runtime separately from the host endpoint. The runtime initializes its handler
 once and owns scheduled callbacks, bounded output and configured services. The
 Phoenix request process owns its `Plug.Conn` and the host listener.
 
-ArborMCP `2.0.0-rc.4` is published. This guide describes the Runtime mounting
+ArborMCP `2.0.0-rc.5` is published. This guide describes the Runtime mounting
 contract; see the [RC notes](V2_RELEASE_CANDIDATE.md) for current consumer scope
 and open stable-release gates.
 
@@ -13,7 +13,7 @@ and open stable-release gates.
 
 ```elixir
 # mix.exs, alongside your existing Phoenix dependencies
-{:arbor_mcp, "== 2.0.0-rc.4"}
+{:arbor_mcp, "== 2.0.0-rc.5"}
 ```
 
 Resolve normally from Hex. Local path dependencies and `ARBOR_RPC_PATH` are

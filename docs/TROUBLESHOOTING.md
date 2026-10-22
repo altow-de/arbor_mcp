@@ -1,6 +1,6 @@
 # ArborMCP Troubleshooting Guide
 
-ArborMCP `2.0.0-rc.4` and ArborRPC `1.0.0-rc.1` are published.
+ArborMCP `2.0.0-rc.5` and ArborRPC `1.0.0-rc.1` are published.
 Normal installation resolves both from Hex; local source overrides are optional
 development settings.
 
@@ -8,7 +8,7 @@ development settings.
 
 ### Hex cannot find `arbor_mcp` or `arbor_rpc`
 
-Use the explicit `2.0.0-rc.4` MCP requirement and normal Hex resolution.
+Use the explicit `2.0.0-rc.5` MCP requirement and normal Hex resolution.
 RPC's transitive requirement includes `1.0.0-rc.1`; stable-only constraints do
 not select prereleases. Check registry connectivity, dependency conflicts and
 the application's lockfile. Local path overrides are optional for development.
