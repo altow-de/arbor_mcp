@@ -180,6 +180,40 @@ defmodule Arbor.MCP.Transport.HTTPTrustStoreTest do
     end
   end
 
+  describe "verify: :verify_none does not need the trust store" do
+    test "for the HTTP transport" do
+      server = TLSServer.start(fn _head -> {:close, http_response(202, "")} end)
+
+      {:ok, state} =
+        HTTP.connect(
+          url: "https://127.0.0.1:#{server.port}/mcp",
+          use_sse: false,
+          security: %{tls: %{verify: :verify_none}}
+        )
+
+      message = Jason.encode!(%{"jsonrpc" => "2.0", "method" => "notifications/initialized"})
+
+      capture_log(fn -> HTTP.send_message(message, state) end)
+      assert_received {:tls_request, "POST /mcp HTTP/1.1" <> _}
+    end
+
+    test "for the legacy HTTP+SSE transport" do
+      server =
+        TLSServer.start(fn "GET /sse " <> _ ->
+          {:keep_open, sse_response("event: endpoint\ndata: /messages?sessionId=abc\n\n")}
+        end)
+
+      assert {:ok, state} =
+               LegacySSE.connect(
+                 url: "https://localhost:#{server.port}",
+                 dns_resolver: fn "localhost", _timeout -> {:ok, [@loopback]} end,
+                 security: %{tls: %{verify: :verify_none}}
+               )
+
+      LegacySSE.close(state)
+    end
+  end
+
   defp refute_connected(listener) do
     assert :gen_tcp.accept(listener, 0) == {:error, :timeout}
   end

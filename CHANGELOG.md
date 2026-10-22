@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trusted the `castore` bundle. Now, when the OS store can't be loaded, they fail
   closed like other HTTPS requests unless `config :arbor_mcp, :cacerts,
   fallback: :castore` is set.
+- `security: %{tls: %{verify: :verify_none}}` no longer loads the trust store,
+  so connections that skip peer verification keep working while the store is
+  unavailable. `Arbor.MCP.Transport.HTTP.build_ssl_options/1` now returns
+  `:cacerts` only when the peer is verified or certificates are given.
 
 ## [2.0.0-rc.4] — 2026-10-19
 

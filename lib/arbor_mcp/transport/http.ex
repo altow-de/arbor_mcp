@@ -1598,7 +1598,8 @@ defmodule Arbor.MCP.Transport.HTTP do
   deadline; see "TLS trust store" in the configuration guide), TLS 1.2/1.3,
   and HTTPS hostname matching with wildcard support
   (`:customize_hostname_check`). Each default can be overridden through the
-  TLS configuration map.
+  TLS configuration map. With `verify: :verify_none` and no `:cacerts`, the
+  trust store is not loaded and no `:cacerts` option is returned.
 
   ## Examples
 
@@ -1613,13 +1614,16 @@ defmodule Arbor.MCP.Transport.HTTP do
       # => [verify: :verify_peer, cacerts: [...], versions: [...], ...]
   """
   def build_ssl_options(tls_config) when is_map(tls_config) do
-    base_ssl_opts = [
-      verify: Map.get(tls_config, :verify, :verify_peer),
-      cacerts: Map.get_lazy(tls_config, :cacerts, &CACerts.get/0),
-      versions: Map.get(tls_config, :versions, [:"tlsv1.2", :"tlsv1.3"]),
-      customize_hostname_check:
-        Map.get(tls_config, :customize_hostname_check, default_hostname_check())
-    ]
+    verify = Map.get(tls_config, :verify, :verify_peer)
+
+    base_ssl_opts =
+      [verify: verify] ++
+        cacerts_option(tls_config, verify) ++
+        [
+          versions: Map.get(tls_config, :versions, [:"tlsv1.2", :"tlsv1.3"]),
+          customize_hostname_check:
+            Map.get(tls_config, :customize_hostname_check, default_hostname_check())
+        ]
 
     # Add client certificate if provided
     ssl_opts =
@@ -1652,6 +1656,17 @@ defmodule Arbor.MCP.Transport.HTTP do
   def build_ssl_options(_) do
     # Default secure SSL options
     build_ssl_options(%{})
+  end
+
+  # Only peer verification uses trust anchors. Loading the default store for
+  # `verify: :verify_none` would fail the connection whenever the store is
+  # unavailable, for certificates that are never checked.
+  defp cacerts_option(tls_config, verify) do
+    case {Map.fetch(tls_config, :cacerts), verify} do
+      {{:ok, cacerts}, _verify} -> [cacerts: cacerts]
+      {:error, :verify_peer} -> [cacerts: CACerts.get()]
+      {:error, _verify} -> []
+    end
   end
 
   # Enables wildcard certificate matching for HTTPS per RFC 6125. Without
