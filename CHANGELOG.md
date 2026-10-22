@@ -58,6 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that answer share only legacy revisions with the client, the client now
   falls back to `initialize` and records a legacy era observation. A list
   without a shared version, or with a shared modern one, keeps the error.
+- `Arbor.MCP.HttpPlug` answered a body larger than `:body_limit` with 413 on
+  the conn from before it read the body and kept the connection open. Under
+  Bandit the connection then waited up to 15 s for the rest of the body, and
+  behind a proxy the next request on that connection failed. The 413, and
+  the 400 for a body that cannot be read, now go out on the conn of the last
+  read with `connection: close` (RFC 9110, 15.5.14). On a Runtime mount a
+  body read error now gets that 400 instead of a 500.
 
 ## [2.0.0-rc.4] — 2026-10-19
 

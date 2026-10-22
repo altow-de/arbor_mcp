@@ -841,10 +841,8 @@ defmodule Arbor.MCP.HttpPlug do
             handle_legacy_mcp_request(conn, opts)
         end
 
-      {:error, :body_too_large} ->
-        conn
-        |> maybe_add_cors_headers(opts)
-        |> send_resp(413, "Request body too large")
+      {:error, reason, conn} ->
+        reject_request_body(conn, reason, opts)
 
       {:error, reason} ->
         Logger.error("Failed to read MCP request body", reason: LogSummary.describe(reason))
@@ -862,6 +860,7 @@ defmodule Arbor.MCP.HttpPlug do
       {:error, :invalid_session_id} -> reject_invalid_session_id(conn, opts)
       # Preserve the existing parse/body error handling in do_handle_mcp_request.
       {:error, _reason} -> do_handle_mcp_request(conn, opts, nil)
+      {:error, _reason, _conn} -> do_handle_mcp_request(conn, opts, nil)
     end
   end
 
@@ -1389,17 +1388,17 @@ defmodule Arbor.MCP.HttpPlug do
     |> send_resp(400, Jason.encode!(error_response))
   end
 
+  # The body step returns the conn it read with; the caller's conn is older.
   defp reject_mcp_request(
-         {:error, :body_too_large},
-         conn,
+         {:error, reason, %Plug.Conn{} = conn},
+         _caller_conn,
          opts,
          _session_manager,
          _session_id,
          _session_reference
-       ) do
-    conn
-    |> maybe_add_cors_headers(opts)
-    |> send_resp(413, "Request body too large")
+       )
+       when reason in [:body_too_large, :unreadable_body] do
+    reject_request_body(conn, reason, opts)
   end
 
   defp reject_mcp_request(
@@ -1911,21 +1910,48 @@ defmodule Arbor.MCP.HttpPlug do
     if byte_size(body) <= body_limit do
       {:ok, body, conn}
     else
-      {:error, :body_too_large}
+      {:error, :body_too_large, conn}
     end
   end
 
+  # A body that cannot be read in full fails with the conn of the last read,
+  # so that the answer goes out on the adapter's current state.
   defp read_or_cached_body(conn, opts) do
     body_limit = Map.get(opts, :body_limit, 1_000_000)
 
     with {:ok, read_opts} <- runtime_read_options(conn, body_limit) do
       case read_body(conn, read_opts) do
-        {:ok, "", conn} -> parsed_json_body(conn, body_limit)
-        {:ok, body, conn} -> {:ok, body, conn}
-        {:more, _partial, _conn} -> {:error, :body_too_large}
-        {:error, reason} -> {:error, reason}
+        {:ok, "", conn} ->
+          parsed_json_body(conn, body_limit)
+
+        {:ok, body, conn} ->
+          {:ok, body, conn}
+
+        {:more, _partial, conn} ->
+          {:error, :body_too_large, conn}
+
+        {:error, reason} ->
+          Logger.warning("Failed to read MCP request body", reason: LogSummary.describe(reason))
+          {:error, :unreadable_body, conn}
       end
     end
+  end
+
+  # Answers a request whose body was not read in full and closes the
+  # connection. The unread rest of the body stays on it, so neither the
+  # server nor a proxy in front may read the next request from it (RFC 9110,
+  # 15.5.14). Without the close, Bandit would first wait for that rest.
+  defp reject_request_body(conn, :body_too_large, opts),
+    do: close_with(conn, opts, 413, "Request body too large")
+
+  defp reject_request_body(conn, :unreadable_body, opts),
+    do: close_with(conn, opts, 400, "Invalid request body")
+
+  defp close_with(conn, opts, status, message) do
+    conn
+    |> maybe_add_cors_headers(opts)
+    |> put_resp_header("connection", "close")
+    |> send_resp(status, message)
   end
 
   defp runtime_read_options(
@@ -1989,7 +2015,7 @@ defmodule Arbor.MCP.HttpPlug do
       {:ok, body, conn}
     else
       {:error, reason} when reason in [:output_frame_too_large, :output_term_too_large] ->
-        {:error, :body_too_large}
+        {:error, :body_too_large, conn}
 
       _invalid ->
         {:error, :invalid_json_rpc_envelope}
@@ -2005,7 +2031,7 @@ defmodule Arbor.MCP.HttpPlug do
       if byte_size(body) <= body_limit do
         {:ok, body, conn}
       else
-        {:error, :body_too_large}
+        {:error, :body_too_large, conn}
       end
     rescue
       _exception -> {:ok, "", conn}
@@ -2373,10 +2399,8 @@ defmodule Arbor.MCP.HttpPlug do
         |> maybe_add_cors_headers(opts)
         |> send_resp(403, "Origin not allowed")
 
-      {:error, :body_too_large} ->
-        conn
-        |> maybe_add_cors_headers(opts)
-        |> send_resp(413, "Request body too large")
+      {:error, reason, %Plug.Conn{} = conn} when reason in [:body_too_large, :unreadable_body] ->
+        reject_request_body(conn, reason, opts)
 
       {:error, reason} ->
         Logger.debug("Legacy HTTP+SSE POST rejected", reason: LogSummary.describe(reason))
