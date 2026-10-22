@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:request_timeout`. Every MRTR round of one call repeats the same
   arguments, capabilities and `_meta`, progress token included. See "Proxy
   mode" in `docs/CONFIGURATION.md`.
+- `Arbor.MCP.Client.server_instructions/1` returns the `instructions` a
+  server sent while the connection was established: from the `initialize`
+  result on a legacy revision, from the `server/discover` result on MCP
+  2026-07-28. It returns `{:ok, nil}` when the server sent none. As with
+  `server_info/1`, every new connection and a successful `discover/2`
+  replace the value, and the client status carries it as
+  `:server_instructions`.
 
 ## [2.0.0-rc.4] — 2026-10-19
 

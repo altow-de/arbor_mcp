@@ -49,7 +49,7 @@ defmodule Arbor.MCP.Server.Discover do
        %{
          supported_versions: supported_versions,
          capabilities: capabilities,
-         instructions: field(result, "instructions"),
+         instructions: instructions(result),
          server_info: server_info(result),
          ttl_ms: ttl_ms,
          cache_scope: cache_scope
@@ -108,6 +108,14 @@ defmodule Arbor.MCP.Server.Discover do
 
   defp field(result, "cacheScope"),
     do: Map.get(result, "cacheScope") || Map.get(result, :cacheScope)
+
+  # Instructions are optional text; a non-string value counts as none.
+  defp instructions(result) do
+    case field(result, "instructions") do
+      instructions when is_binary(instructions) -> instructions
+      _other -> nil
+    end
+  end
 
   defp server_info(result) do
     case Map.get(result, "_meta") || Map.get(result, :_meta) do

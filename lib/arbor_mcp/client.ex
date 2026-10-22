@@ -84,6 +84,9 @@ defmodule Arbor.MCP.Client do
     :transport_mod,
     :transport_state,
     :server_info,
+    # The `instructions` text of the latest initialize or server/discover
+    # result, or nil.
+    :server_instructions,
     :transport_opts,
     :pending_requests,
     :pending_batches,
@@ -1053,6 +1056,23 @@ defmodule Arbor.MCP.Client do
   end
 
   @doc """
+  Gets the instructions the server sent while the connection was established.
+
+  On MCP 2025-06-18 and the other legacy revisions they come from the
+  `initialize` result, on MCP 2026-07-28 from the `server/discover` result.
+  A server that sends none yields `{:ok, nil}`, as does a client that has
+  not connected yet. Every new connection, a reconnection included, replaces
+  the value, and so does a successful `discover/2`.
+  """
+  @spec server_instructions(t()) :: {:ok, String.t() | nil} | {:error, any()}
+  def server_instructions(client) do
+    case get_status(client) do
+      {:ok, %{server_instructions: instructions}} -> {:ok, instructions}
+      _ -> {:error, :not_connected}
+    end
+  end
+
+  @doc """
   Gets server capabilities.
   """
   @spec server_capabilities(t()) :: {:ok, map()} | {:error, any()}
@@ -1078,7 +1098,7 @@ defmodule Arbor.MCP.Client do
   Discovers a modern MCP server's versions, capabilities, and identity.
 
   A successful discovery also updates the client's protocol version,
-  `server_info`, and `server_capabilities` state. Automatic discovery during
+  `server_info`, `server_instructions`, and `server_capabilities` state. Automatic discovery during
   connection establishment is handled separately by the era probe.
   """
   @spec discover(t(), keyword()) :: {:ok, map()} | {:error, any()}
@@ -1761,6 +1781,7 @@ defmodule Arbor.MCP.Client do
     status = %{
       connection_status: state.connection_status,
       server_info: state.server_info,
+      server_instructions: state.server_instructions,
       server_capabilities: state.server_capabilities,
       protocol_version: state.protocol_version,
       transport: state.transport_mod,
@@ -1779,7 +1800,8 @@ defmodule Arbor.MCP.Client do
         state
         | protocol_version: version,
           server_capabilities: discovery.capabilities,
-          server_info: discovery.server_info
+          server_info: discovery.server_info,
+          server_instructions: discovery.instructions
       }
 
       {:reply, :ok, updated_state}

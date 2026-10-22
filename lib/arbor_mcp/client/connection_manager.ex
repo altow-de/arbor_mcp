@@ -121,6 +121,7 @@ defmodule Arbor.MCP.Client.ConnectionManager do
         |> Map.put(:server_capabilities, result["capabilities"])
         |> Map.put(:protocol_version, result["protocolVersion"])
         |> Map.put(:server_info, result["serverInfo"])
+        |> Map.put(:server_instructions, server_instructions(result))
 
       ConnectionScope.established()
       {:ok, new_state}
@@ -132,6 +133,13 @@ defmodule Arbor.MCP.Client.ConnectionManager do
         {:error, "Unexpected error during connection: #{inspect(error)}"}
     end
   end
+
+  # The legacy initialize result is not validated beyond its envelope, so a
+  # non-string `instructions` field counts as none.
+  defp server_instructions(%{"instructions" => instructions}) when is_binary(instructions),
+    do: instructions
+
+  defp server_instructions(_result), do: nil
 
   defp check_deadline(deadline) do
     if Deadline.expired?(deadline), do: {:error, :establish_timeout}, else: :ok
@@ -359,7 +367,8 @@ defmodule Arbor.MCP.Client.ConnectionManager do
     %{
       "protocolVersion" => discovery.protocol_version,
       "capabilities" => discovery.server_capabilities,
-      "serverInfo" => discovery.server_info
+      "serverInfo" => discovery.server_info,
+      "instructions" => discovery.instructions
     }
   end
 
