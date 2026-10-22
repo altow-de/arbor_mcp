@@ -30,11 +30,11 @@ jobs:
       matrix:
         toolchain:
           - {track: 'Elixir 1.17 / OTP 27', elixir: '1.17', otp: '27', pinned_elixir: '1.17.3', pinned_otp: '27.0'}
-          - {track: 'Elixir 1.18 / OTP 27', elixir: '1.18', otp: '27', pinned_elixir: '1.18.5', pinned_otp: '27.3.4.18'}
-          - {track: 'Elixir 1.19 / OTP 28', elixir: '1.19', otp: '28', pinned_elixir: '1.19.6', pinned_otp: '28.5.0.7'}
-          - {track: 'Elixir 1.20 / OTP 29', elixir: '1.20', otp: '29', pinned_elixir: '1.20.4', pinned_otp: '29.1.1'}
+          - {track: 'Elixir 1.18 / OTP 27', elixir: '1.18', otp: '27', pinned_elixir: '1.18.5', pinned_otp: '27.3.4.19'}
+          - {track: 'Elixir 1.19 / OTP 28', elixir: '1.19', otp: '28', pinned_elixir: '1.19.6', pinned_otp: '28.5.0.8'}
+          - {track: 'Elixir 1.20 / OTP 29', elixir: '1.20', otp: '29', pinned_elixir: '1.20.4', pinned_otp: '29.1.2'}
           # > 0 excludes prereleases; setup-beam's literal "latest" can include RCs.
-          - {track: 'Newest stable pair', elixir: '> 0', otp: '> 0', pinned_elixir: '1.20.4', pinned_otp: '29.1.1'}
+          - {track: 'Newest stable pair', elixir: '> 0', otp: '> 0', pinned_elixir: '1.20.4', pinned_otp: '29.1.2'}
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
