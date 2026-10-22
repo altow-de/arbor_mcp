@@ -135,6 +135,12 @@ does not trigger `initialize`. Similarly, `:prefer_legacy` probes modern only
 after a protocol-level legacy failure while the transport remains usable.
 Strict modes never fall back.
 
+A legacy-only server answers the probe with `-32022` and the versions it
+supports in `data.supported`. Under `:prefer_modern` that answer is legacy
+evidence when the versions the list shares with the client are all legacy
+revisions, and the client falls back to `initialize`. A list that shares no
+version with the client, or shares a modern one, keeps the error.
+
 `protocol_version` is a legacy revision preference, not an era switch or a
 statement of the latest upstream MCP revision. The
 application-level value and the compatibility helper

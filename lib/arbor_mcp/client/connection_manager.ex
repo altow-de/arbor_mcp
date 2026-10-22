@@ -376,6 +376,7 @@ defmodule Arbor.MCP.Client.ConnectionManager do
     not modern_specific_error?(error)
   end
 
+  defp legacy_fallback_evidence?({:legacy_versions_supported, _versions}), do: true
   defp legacy_fallback_evidence?({:probe_timeout, _reason}), do: true
   defp legacy_fallback_evidence?({:http_probe_rejected, _response}), do: true
   defp legacy_fallback_evidence?(_reason), do: false

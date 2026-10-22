@@ -26,6 +26,7 @@ defmodule Arbor.MCP.Client.EraProbe do
           | {:unexpected_response, term()}
           | {:invalid_discover_result, term()}
           | {:no_mutually_supported_modern_version, map()}
+          | {:legacy_versions_supported, map()}
 
   @type result :: %{
           protocol_version: String.t(),
@@ -155,9 +156,7 @@ defmodule Arbor.MCP.Client.EraProbe do
       if candidate do
         {:ok, candidate}
       else
-        {:error,
-         {:no_mutually_supported_modern_version,
-          %{server: supported, client: VersionRegistry.enabled_versions(mode)}}}
+        unsupported_modern_version(supported, mode)
       end
     else
       :not_modern_error
@@ -165,6 +164,23 @@ defmodule Arbor.MCP.Client.EraProbe do
   end
 
   defp retry_version(_error, _mode, _attempted), do: :not_modern_error
+
+  # The server names the versions it supports. If they share a legacy
+  # version with the client and no modern one, the answer is positive
+  # evidence of a legacy server, and the connection manager may fall back to
+  # initialize. A shared modern version, which the probe has already retried,
+  # or no shared version at all keeps the error.
+  defp unsupported_modern_version(supported, mode) do
+    client = VersionRegistry.enabled_versions(mode)
+    shared = Enum.filter(client, &(&1 in supported))
+    detail = %{server: supported, client: client}
+
+    if shared != [] and Enum.all?(shared, &(VersionRegistry.era_for(&1) == :legacy)) do
+      {:error, {:legacy_versions_supported, detail}}
+    else
+      {:error, {:no_mutually_supported_modern_version, detail}}
+    end
+  end
 
   # A server may reject a supported version transiently and advertise that
   # same version in UnsupportedProtocolVersionError. Retrying it once is part

@@ -49,6 +49,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the three, at initialization and for each request. See "Discovery
   instructions and cache hints" in `docs/CONFIGURATION.md`.
 
+### Fixed
+
+- A `:prefer_modern` client did not connect to a legacy-only server that
+  answers `server/discover` with `-32022`, an arbor_mcp server with
+  `protocol_mode: :legacy_only` among them: it failed with
+  `no_mutually_supported_modern_version`. When the `supported` versions of
+  that answer share only legacy revisions with the client, the client now
+  falls back to `initialize` and records a legacy era observation. A list
+  without a shared version, or with a shared modern one, keeps the error.
+
 ## [2.0.0-rc.4] — 2026-10-19
 
 ### Fixed

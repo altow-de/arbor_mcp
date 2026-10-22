@@ -126,9 +126,11 @@ Arbor.MCP.Client.start_link(
 ```
 
 `:prefer_modern` falls back to legacy `initialize` only when a live peer gives
-positive evidence that it is legacy-compatible. A timeout, authentication
-failure, transport break, cached-modern failure, recognized modern error, or
-unsupported modern revision is surfaced instead of being silently downgraded.
+positive evidence that it is legacy-compatible. A `-32022` answer to the probe
+whose `data.supported` shares only legacy revisions with the client is such
+evidence. A timeout, authentication failure, transport break, cached-modern
+failure, recognized modern error, or unsupported modern revision without a
+shared legacy revision is surfaced instead of being silently downgraded.
 Use `:prefer_legacy` for a deliberate rollback, or `reset_era_cache: true` once
 after an operator-controlled endpoint upgrade. Strict `:modern_only` and
 `:legacy_only` modes never fall back.
