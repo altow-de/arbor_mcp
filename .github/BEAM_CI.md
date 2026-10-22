@@ -6,9 +6,9 @@ supported pairs, rather than every combination:
 | Elixir | OTP | Purpose |
 | --- | --- | --- |
 | 1.17.3 | 27.0 | Retained minimum and formatting/quality gate |
-| 1.18.5 | 27.3.4.18 | Elixir 1.18 compatibility |
-| 1.19.6 | 28.5.0.7 | Elixir 1.19 / OTP 28 compatibility |
-| 1.20.4 | 29.1.1 | Elixir 1.20 / OTP 29 compatibility |
+| 1.18.5 | 27.3.4.19 | Elixir 1.18 compatibility |
+| 1.19.6 | 28.5.0.8 | Elixir 1.19 / OTP 28 compatibility |
+| 1.20.4 | 29.1.2 | Elixir 1.20 / OTP 29 compatibility |
 
 All four pairs run unit/integration tests, four-package archive installation,
 and both HTTP listener archive/release probes. Third-party dependencies compile

@@ -45,9 +45,9 @@ jobs:
         toolchain:
           # Keep the minimum pair; refresh the other pins after BEAM latest passes.
           - {elixir: '1.17.3', otp: '27.0'}
-          - {elixir: '1.18.5', otp: '27.3.4.18'}
-          - {elixir: '1.19.6', otp: '28.5.0.7'}
-          - {elixir: '1.20.4', otp: '29.1.1'}
+          - {elixir: '1.18.5', otp: '27.3.4.19'}
+          - {elixir: '1.19.6', otp: '28.5.0.8'}
+          - {elixir: '1.20.4', otp: '29.1.2'}
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
@@ -127,9 +127,9 @@ jobs:
         toolchain:
           # Keep the minimum pair; refresh the other pins after BEAM latest passes.
           - {elixir: '1.17.3', otp: '27.0'}
-          - {elixir: '1.18.5', otp: '27.3.4.18'}
-          - {elixir: '1.19.6', otp: '28.5.0.7'}
-          - {elixir: '1.20.4', otp: '29.1.1'}
+          - {elixir: '1.18.5', otp: '27.3.4.19'}
+          - {elixir: '1.19.6', otp: '28.5.0.8'}
+          - {elixir: '1.20.4', otp: '29.1.2'}
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
@@ -230,13 +230,13 @@ jobs:
           - otp: '27.0'
             elixir: '1.17.3'
             quality: true
-          - otp: '27.3.4.18'
+          - otp: '27.3.4.19'
             elixir: '1.18.5'
             quality: false
-          - otp: '28.5.0.7'
+          - otp: '28.5.0.8'
             elixir: '1.19.6'
             quality: false
-          - otp: '29.1.1'
+          - otp: '29.1.2'
             elixir: '1.20.4'
             quality: false
 
