@@ -11,7 +11,7 @@ Install the published RC through Hex:
 ```elixir
 def deps do
   [
-    {:arbor_mcp, "== 2.0.0-rc.4"}
+    {:arbor_mcp, "== 2.0.0-rc.5"}
   ]
 end
 ```

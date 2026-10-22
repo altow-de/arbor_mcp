@@ -6,7 +6,7 @@ tags remain available:
 
 | Package | Replacement candidate | First stable target |
 | --- | --- | --- |
-| ArborMCP (`arbor_mcp`) | `2.0.0-rc.4` | `2.0.0` |
+| ArborMCP (`arbor_mcp`) | `2.0.0-rc.5` | `2.0.0` |
 | ArborRPC (`arbor_rpc`) | `1.0.0-rc.1` | `1.0.0` |
 | ArborACP (`arbor_acp`) | `1.0.0-rc.1` | `1.0.0` |
 | ArborACP adapters (`arbor_acp_adapters`) | `1.0.0-rc.1` | `1.0.0` |
@@ -24,7 +24,7 @@ needed for protocol output encoding and is independent of the Elixir version.
 For an MCP application, replace `ex_mcp` with:
 
 ```elixir
-{:arbor_mcp, "== 2.0.0-rc.4"}
+{:arbor_mcp, "== 2.0.0-rc.5"}
 ```
 
 ACP applications use `{:arbor_acp, "== 1.0.0-rc.1"}`. Add
@@ -84,6 +84,18 @@ handler-process request cancellation (GHSA-22m7-hr37-pxg3).
 from the same HTTP session or authenticated principal, and bounds the table
 it keeps. Runtime-mounted servers were not affected. The public API is
 unchanged.
+
+ArborMCP `2.0.0-rc.5` replaces `2.0.0-rc.4` with TLS trust fixes.
+- **Fail closed:** the legacy HTTP+SSE transport, OAuth metadata and JWKS
+  fetches, and remote JSON Schema fetches passed no CA certificates, so Mint
+  fell back to the `castore` bundle when the OS trust store could not be
+  loaded. They now fail closed like other HTTPS requests.
+- **CA options:** those connections now accept CA certificates:
+  `MetadataFetcher`'s `:cacerts`, schema `network_refs: [cacerts: ...]`, and
+  `security: %{tls: ...}` on `transport: :sse`.
+- **`verify_none`:** `verify: :verify_none` no longer loads the trust store.
+
+The public API only gains options; the changelog lists the behavior changes.
 Earlier credential-free CLI lifecycle checks do not qualify live model turns.
 No completed continuous 48-hour final-candidate soak is claimed.
 
