@@ -202,6 +202,15 @@ defmodule Arbor.MCP.Internal.CACertsTest do
     end
   end
 
+  test "valid?/1 accepts non-empty lists of DER or combined certificates only" do
+    assert CACerts.valid?([<<1, 2, 3>>])
+    assert CACerts.valid?([{:cert, <<1, 2, 3>>, :otp_certificate}])
+
+    for invalid <- [nil, [], "ca.pem", [~c"ca.pem"], [:not_a_certificate], %{}] do
+      refute CACerts.valid?(invalid)
+    end
+  end
+
   test "the CAStore bundle parses to DER certificates" do
     certs = CACerts.castore_certs()
 

@@ -359,6 +359,36 @@ defmodule Arbor.MCP.Content.SchemaRemoteResolverTest do
     end
   end
 
+  describe "network_refs cacerts" do
+    test "is passed to the HTTP client" do
+      test = self()
+      cacerts = [<<"schema CA">>]
+
+      client = fn _uri, _address, network_opts ->
+        send(test, {:cacerts, network_opts[:cacerts]})
+        {:ok, response(~s({"type":"string"}))}
+      end
+
+      {opts, _agent} = resolver_options(%{}, http_client: client, cacerts: cacerts)
+
+      assert {:ok, _resolved} =
+               SchemaPolicy.compile(%{"$ref" => "https://schemas.example.com/a.json"}, opts)
+
+      assert_received {:cacerts, ^cacerts}
+    end
+
+    test "rejects a value that is not a non-empty list of certificates" do
+      for invalid <- [[], "ca.pem", [:not_a_certificate]] do
+        {opts, agent} = resolver_options(%{}, cacerts: invalid)
+
+        assert SchemaPolicy.compile(%{"$ref" => "https://schemas.example.com/a.json"}, opts) ==
+                 {:error, {:invalid_schema_policy_option, :cacerts}}
+
+        assert fetch_calls(agent) == []
+      end
+    end
+  end
+
   defp resolver_options(routes, overrides \\ []) do
     dns = Keyword.get(overrides, :dns, %{})
     policy_overrides = Keyword.get(overrides, :policy, [])

@@ -109,6 +109,18 @@ defmodule Arbor.MCP.Internal.CACerts do
 
   def put_default(_scheme, transport_opts, _opts), do: {:ok, transport_opts}
 
+  @doc """
+  Whether `certs` can be passed as `:cacerts`: a non-empty list of DER-encoded
+  certificates or of the combined records `:public_key.cacerts_get/0` returns.
+  """
+  @spec valid?(term()) :: boolean()
+  def valid?([_ | _] = certs), do: Enum.all?(certs, &certificate?/1)
+  def valid?(_certs), do: false
+
+  defp certificate?(der) when is_binary(der), do: true
+  defp certificate?({:cert, der, _otp}) when is_binary(der), do: true
+  defp certificate?(_other), do: false
+
   @doc "The CAStore bundle as DER-encoded certificates."
   @spec castore_certs() :: [:public_key.der_encoded()]
   def castore_certs do

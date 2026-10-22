@@ -240,7 +240,10 @@ config :arbor_mcp, :oauth_metadata_fetch,
   dns_timeout_ms: 1_000,
   connect_timeout_ms: 2_000,
   request_timeout_ms: 5_000,
-  allowed_redirect_origins: []
+  allowed_redirect_origins: [],
+  # DER-encoded CAs to trust instead of the OS store (default nil). This is
+  # separate from :oauth_http, which covers token and registration requests.
+  cacerts: nil
 ```
 
 Redirects remain on the current origin by default. If a provider deliberately
@@ -264,7 +267,8 @@ get(uri, approved_address, options)
 It must connect directly to `approved_address`, preserve `uri.host` for TLS and
 HTTP host validation, use only `options[:request_headers]`, enforce
 `options[:connect_timeout_ms]`, `options[:request_timeout_ms]`, and
-`options[:max_response_bytes]` while streaming, and return
+`options[:max_response_bytes]` while streaming, verify TLS peers against
+`options[:cacerts]` when it is set, and return
 `{:ok, %{status: integer, headers: list, body: binary}}`. Per-flow overrides go
 under `metadata_fetch: [...]`; use them only for a tighter policy or an exact
 provider redirect.
@@ -419,7 +423,9 @@ config :arbor_mcp, :json_schema,
     dns_timeout_ms: 1_000,
     connect_timeout_ms: 2_000,
     request_timeout_ms: 3_000,
-    proxy: :disabled
+    proxy: :disabled,
+    # DER-encoded CAs to trust instead of the OS store (default nil).
+    cacerts: nil
   ]
 ```
 
@@ -771,13 +777,13 @@ request. `subscriptions/listen` opens its own POST response stream.
 
 ### TLS trust store
 
-Outbound HTTPS (this transport and the OAuth HTTP boundary) verifies peers
-against the operating system's trust store unless you pass certificates
-yourself, so CAs installed on the host, such as a private or corporate CA,
-are trusted automatically. The legacy HTTP+SSE transport, fetches through
-`Arbor.MCP.Authorization.MetadataFetcher` (protected resource metadata, OIDC
-discovery, client ID metadata and JWKS), and remote JSON Schema fetches always
-use this trust store; they don't take certificates of their own.
+Outbound HTTPS verifies peers against the operating system's trust store
+unless you pass certificates yourself, so CAs installed on the host, such as a
+private or corporate CA, are trusted automatically. This covers this transport,
+the legacy HTTP+SSE transport, the OAuth HTTP boundary, OAuth metadata fetches
+(protected resource metadata, OIDC discovery, client ID metadata and JWKS), and
+remote JSON Schema fetches. The end of this section shows how to pass
+certificates to each.
 
 Loading that store can stall: on macOS it runs `/usr/bin/security`, which can
 hang on the keychain, for example while the session is locked. ArborMCP loads it
@@ -835,8 +841,23 @@ Arbor.MCP.Client.start_link(
   security: %{tls: %{cacerts: castore_certs}}
 )
 
-# The OAuth HTTP boundary (metadata, token, and registration requests):
+# The legacy HTTP+SSE transport takes the same TLS settings:
+Arbor.MCP.Client.start_link(
+  transport: :sse,
+  url: "https://api.example.com",
+  security: %{tls: %{cacerts: castore_certs}}
+)
+
+# The OAuth HTTP boundary (token, registration and authorization requests):
 config :arbor_mcp, :oauth_http, cacerts: castore_certs
+
+# OAuth metadata fetches (protected resource metadata, OIDC discovery, client
+# ID metadata and JWKS), or per flow under metadata_fetch: [...]:
+config :arbor_mcp, :oauth_metadata_fetch, cacerts: castore_certs
+
+# Remote JSON Schema references (with the rest of "Opt-in network references"):
+config :arbor_mcp, :json_schema,
+  network_refs: [enabled: true, allowed_hosts: ["schemas.example.com"], cacerts: castore_certs]
 ```
 
 A fixed bundle does not change when the OS store is updated, so a distrusted

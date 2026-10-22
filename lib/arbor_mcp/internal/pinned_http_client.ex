@@ -98,6 +98,13 @@ defmodule Arbor.MCP.Internal.PinnedHTTPClient do
   end
 
   defp transport_opts(address, opts) do
-    [{:timeout, opts[:connect_timeout_ms]} | Reducer.address_family_options(address)]
+    transport_opts = [
+      {:timeout, opts[:connect_timeout_ms]} | Reducer.address_family_options(address)
+    ]
+
+    case opts[:cacerts] do
+      nil -> transport_opts
+      cacerts -> [{:cacerts, cacerts} | transport_opts]
+    end
   end
 end

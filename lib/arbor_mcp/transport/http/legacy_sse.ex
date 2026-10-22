@@ -18,6 +18,9 @@ defmodule Arbor.MCP.Transport.HTTP.LegacySSE do
     from the `endpoint` event is preserved
   - `:headers` - extra HTTP headers
   - `:timeout` / `:request_timeout` / `:stream_handshake_timeout`
+  - `:security` - only `:tls` is used: TLS settings for HTTPS, built as for
+    `transport: :http` (see `Arbor.MCP.Transport.HTTP.build_ssl_options/1`).
+    Without it, peers are verified against the default trust store.
 
   ## Example
 
@@ -33,7 +36,8 @@ defmodule Arbor.MCP.Transport.HTTP.LegacySSE do
   require Logger
 
   alias Arbor.MCP.Client.{Deadline, Lifetime}
-  alias Arbor.MCP.Internal.{DNSResolver, Options}
+  alias Arbor.MCP.Internal.{CACerts, DNSResolver, Options, Security}
+  alias Arbor.MCP.Transport.HTTP
   alias Arbor.MCP.Transport.HTTP.{BoundedClient, TargetPolicy}
   alias Arbor.MCP.Transport.SSEClient
   alias Arbor.RPC.LogSummary
@@ -52,7 +56,8 @@ defmodule Arbor.MCP.Transport.HTTP.LegacySSE do
     :max_request_bytes,
     :dns_timeout_ms,
     :dns_resolver,
-    :allowed_private_hosts
+    :allowed_private_hosts,
+    :security
   ]
 
   @type t :: %__MODULE__{
@@ -68,7 +73,8 @@ defmodule Arbor.MCP.Transport.HTTP.LegacySSE do
           max_request_bytes: pos_integer(),
           dns_timeout_ms: pos_integer(),
           dns_resolver: module() | function(),
-          allowed_private_hosts: [String.t()]
+          allowed_private_hosts: [String.t()],
+          security: map() | nil
         }
 
   @default_sse_path "/sse"
@@ -102,6 +108,7 @@ defmodule Arbor.MCP.Transport.HTTP.LegacySSE do
     dns_timeout_ms = Options.positive_integer(opts, :dns_timeout_ms, 1_000)
     dns_resolver = Keyword.get(opts, :dns_resolver, DNSResolver)
     allowed_private_hosts = Keyword.get(opts, :allowed_private_hosts, [])
+    security = Keyword.get(opts, :security)
 
     base_url = origin(raw_url)
     sse_url = join_url(raw_url, sse_path)
@@ -112,7 +119,9 @@ defmodule Arbor.MCP.Transport.HTTP.LegacySSE do
       allowed_private_hosts: allowed_private_hosts
     ]
 
-    with :ok <- TargetPolicy.validate_options(network_opts),
+    with :ok <- validate_security(security),
+         :ok <- TargetPolicy.validate_options(network_opts),
+         {:ok, ssl_opts} <- transport_opts(sse_url, security),
          {:ok, sse_pid} <-
            start_sse(
              sse_url,
@@ -120,7 +129,8 @@ defmodule Arbor.MCP.Transport.HTTP.LegacySSE do
              timeouts,
              max_response_bytes,
              max_stream_buffer_bytes,
-             network_opts
+             network_opts,
+             ssl_opts
            ),
          {:ok, advertised_url, session_id} <-
            await_endpoint(sse_pid, timeouts.stream_handshake, base_url) do
@@ -150,7 +160,8 @@ defmodule Arbor.MCP.Transport.HTTP.LegacySSE do
          max_request_bytes: max_request_bytes,
          dns_timeout_ms: dns_timeout_ms,
          dns_resolver: dns_resolver,
-         allowed_private_hosts: allowed_private_hosts
+         allowed_private_hosts: allowed_private_hosts,
+         security: security
        }}
     else
       {:error, reason} = error ->
@@ -172,17 +183,19 @@ defmodule Arbor.MCP.Transport.HTTP.LegacySSE do
       |> Enum.uniq_by(fn {name, _} -> String.downcase(to_string(name)) end)
 
     result =
-      BoundedClient.request(:post, state.post_url, headers, "application/json", body,
-        connect_timeout: state.timeouts.connect,
-        request_timeout: state.timeouts.request,
-        max_request_bytes: state.max_request_bytes,
-        max_response_bytes: state.max_response_bytes,
-        transport_opts: [],
-        dns_timeout_ms: state.dns_timeout_ms,
-        dns_resolver: state.dns_resolver,
-        allowed_private_hosts: state.allowed_private_hosts,
-        deadline: state.deadline
-      )
+      with {:ok, transport_opts} <- transport_opts(state.post_url, state.security) do
+        BoundedClient.request(:post, state.post_url, headers, "application/json", body,
+          connect_timeout: state.timeouts.connect,
+          request_timeout: state.timeouts.request,
+          max_request_bytes: state.max_request_bytes,
+          max_response_bytes: state.max_response_bytes,
+          transport_opts: transport_opts,
+          dns_timeout_ms: state.dns_timeout_ms,
+          dns_resolver: state.dns_resolver,
+          allowed_private_hosts: state.allowed_private_hosts,
+          deadline: state.deadline
+        )
+      end
 
     case result do
       {:ok, {{_, status, _}, _headers, _body}} when status in [200, 202, 204] ->
@@ -235,7 +248,15 @@ defmodule Arbor.MCP.Transport.HTTP.LegacySSE do
   def linked_processes(%__MODULE__{sse_pid: sse_pid}) when is_pid(sse_pid), do: [sse_pid]
   def linked_processes(_state), do: []
 
-  defp start_sse(url, headers, timeouts, max_response_bytes, max_buffer_bytes, network_opts) do
+  defp start_sse(
+         url,
+         headers,
+         timeouts,
+         max_response_bytes,
+         max_buffer_bytes,
+         network_opts,
+         ssl_opts
+       ) do
     opts = [
       url: url,
       headers: headers,
@@ -248,7 +269,8 @@ defmodule Arbor.MCP.Transport.HTTP.LegacySSE do
       max_buffer_bytes: max_buffer_bytes,
       dns_timeout_ms: network_opts[:dns_timeout_ms],
       dns_resolver: network_opts[:dns_resolver],
-      allowed_private_hosts: network_opts[:allowed_private_hosts]
+      allowed_private_hosts: network_opts[:allowed_private_hosts],
+      ssl_opts: ssl_opts
     ]
 
     case SSEClient.start_link(opts) do
@@ -256,6 +278,28 @@ defmodule Arbor.MCP.Transport.HTTP.LegacySSE do
       {:error, reason} -> {:error, reason}
     end
   end
+
+  defp validate_security(nil), do: :ok
+  defp validate_security(security), do: Security.validate_config(security)
+
+  # TLS options for one request, built like the HTTP transport's. A trust store
+  # that cannot be loaded fails the request instead of raising.
+  defp transport_opts(url, security) do
+    case URI.parse(url).scheme do
+      "https" ->
+        try do
+          {:ok, HTTP.build_ssl_options(tls_config(security))}
+        rescue
+          e in CACerts.UnavailableError -> {:error, {:trust_store_unavailable, e.reason}}
+        end
+
+      _other ->
+        {:ok, []}
+    end
+  end
+
+  defp tls_config(%{tls: tls}) when is_map(tls), do: tls
+  defp tls_config(_security), do: %{}
 
   defp await_endpoint(sse_pid, timeout, base_url) do
     deadline = System.monotonic_time(:millisecond) + timeout
