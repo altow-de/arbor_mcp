@@ -63,10 +63,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Bandit the connection then waited up to 15 s for the rest of the body, and
   behind a proxy the next request on that connection failed. The 413, and
   the 400 for a body that cannot be read, now go out on the conn of the last
-  read, over HTTP/1.x with `connection: close` (RFC 9110, 15.5.14). HTTP/2
-  forbids that header (RFC 9113, 8.2.2), and the answer there ends only the
-  stream. On a Runtime mount a body read error now gets that 400 instead of
-  a 500.
+  read. While part of the body is unread, they carry `connection: close`
+  over HTTP/1.x (RFC 9110, 15.5.14). HTTP/2 forbids that header (RFC 9113,
+  8.2.2), and the answer there ends only the stream. A too large body that
+  an upstream plug read in full, as `:raw_body` or parsed, gets the 413 and
+  the connection stays open. On a Runtime mount a body read error now gets
+  that 400 instead of a 500.
 
 ## [2.0.0-rc.4] — 2026-10-19
 

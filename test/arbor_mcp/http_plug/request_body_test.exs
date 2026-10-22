@@ -2,7 +2,8 @@ defmodule Arbor.MCP.HttpPlug.RequestBodyTest do
   # A request body that a Runtime-mounted Arbor.MCP.HttpPlug does not read in
   # full is answered and the connection closed (RFC 9110, 15.5.14): the
   # unread rest stays on it, and the next request over the same connection,
-  # possibly someone else's behind a proxy, must not start inside it.
+  # possibly someone else's behind a proxy, must not start inside it. A body
+  # read in full before the plug leaves nothing on the connection.
   use ExUnit.Case, async: false
 
   alias Arbor.MCP.Server.Runtime
@@ -152,6 +153,44 @@ defmodule Arbor.MCP.HttpPlug.RequestBodyTest do
     assert conn.status == 400
     assert conn.resp_body == "Invalid request body"
     assert Plug.Conn.get_resp_header(conn, "connection") == ["close"]
+  end
+
+  # An upstream plug that read the body has left nothing on the connection,
+  # so a too large body is answered without closing it.
+  test "a too large pre-read body gets 413 and keeps the connection", %{runtime: runtime} do
+    opts = Arbor.MCP.HttpPlug.init(runtime: runtime, path: "/mcp", body_limit: @body_limit)
+
+    conn =
+      Plug.Test.conn(:post, "/mcp", "")
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Plug.Conn.assign(:raw_body, :binary.copy("x", @body_limit + 1))
+      |> Arbor.MCP.HttpPlug.call(opts)
+
+    assert conn.status == 413
+    assert conn.resp_body == "Request body too large"
+    assert Plug.Conn.get_resp_header(conn, "connection") == []
+  end
+
+  test "a too large parsed body gets 413 and keeps the connection", %{runtime: runtime} do
+    opts = Arbor.MCP.HttpPlug.init(runtime: runtime, path: "/mcp", body_limit: @body_limit)
+
+    request = %{
+      "jsonrpc" => "2.0",
+      "id" => 1,
+      "method" => "ping",
+      "params" => %{"padding" => :binary.copy("x", @body_limit)}
+    }
+
+    # As after Plug.Parsers: the body is read, and only `body_params` holds it.
+    conn =
+      Plug.Test.conn(:post, "/mcp", "")
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Map.merge(%{body_params: request, params: request})
+      |> Arbor.MCP.HttpPlug.call(opts)
+
+    assert conn.status == 413
+    assert conn.resp_body == "Request body too large"
+    assert Plug.Conn.get_resp_header(conn, "connection") == []
   end
 
   defp start_listener(runtime) do
