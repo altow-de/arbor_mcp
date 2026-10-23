@@ -40,12 +40,15 @@ defmodule Arbor.MCP.Security.DependencyAdvisoryMitigationTest do
     assert elem(lock[:bandit], 2) == "1.13.1"
     assert elem(lock[:thousand_island], 2) == "1.6.0"
     assert Version.compare(elem(lock[:hpax], 2), "1.1.0") in [:eq, :gt]
+  end
 
-    # Only the independently justified Cowlib exceptions remain.
-    assert Project.config()[:hex][:ignore_advisories] == [
-             "EEF-CVE-2026-43966",
-             "EEF-CVE-2026-43969"
-           ]
+  test "Cowlib and Plug.Crypto locks include the October 2026 advisory fixes" do
+    lock = Lock.read()
+    assert Version.compare(elem(lock[:cowlib], 2), "2.21.0") in [:eq, :gt]
+    assert Version.compare(elem(lock[:plug_crypto], 2), "2.2.1") in [:eq, :gt]
+
+    # Only the independently justified Cowlib exception remains.
+    assert Project.config()[:hex][:ignore_advisories] == ["EEF-CVE-2026-43966"]
   end
 
   test "Plug rejects response-header bytes covered by EEF-CVE-2026-43966" do
@@ -58,7 +61,7 @@ defmodule Arbor.MCP.Security.DependencyAdvisoryMitigationTest do
     end
   end
 
-  test "Arbor.MCP modules do not import cow_cookie:cookie/1 from EEF-CVE-2026-43969" do
+  test "Arbor.MCP modules do not import cow_cookie:cookie/1 (EEF-CVE-2026-43969, fixed in Cowlib 2.21.0)" do
     refute {:cow_cookie, :cookie, 1} in application_imports([:arbor_mcp])
   end
 
