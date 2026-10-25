@@ -14,6 +14,9 @@ defmodule Arbor.MCP.Client.ConnectionNotificationsTest do
     use Arbor.MCP.Server.Handler
 
     @impl true
+    def init(opts), do: {:ok, %{test_pid: Keyword.get(opts, :test_pid)}}
+
+    @impl true
     def handle_initialize(_params, state) do
       {:ok,
        %{
@@ -38,6 +41,12 @@ defmodule Arbor.MCP.Client.ConnectionNotificationsTest do
       token = get_in(args, ["_meta", "progressToken"])
       :ok = Server.notify_progress(self(), token, 1, 2)
       {:ok, %{content: [%{type: "text", text: "done"}]}, state}
+    end
+
+    def handle_call_tool("wait", _args, state) do
+      send(state.test_pid, {:tool_waiting, self()})
+      receive do: (:release -> :ok)
+      {:ok, %{content: [%{type: "text", text: "released"}]}, state}
     end
 
     def handle_call_tool("log", _args, state) do
@@ -77,7 +86,12 @@ defmodule Arbor.MCP.Client.ConnectionNotificationsTest do
   end
 
   setup do
-    {:ok, server} = Server.start_link(handler: ServerHandler, transport: :test)
+    {:ok, server} =
+      Server.start_link(
+        handler: ServerHandler,
+        handler_args: [test_pid: self()],
+        transport: :test
+      )
 
     {:ok, client} =
       Client.start_link(
@@ -100,6 +114,24 @@ defmodule Arbor.MCP.Client.ConnectionNotificationsTest do
                      %{"progressToken" => "job-1", "progress" => 1, "total" => 2}}
 
     refute is_nil(request_id)
+  end
+
+  test "a progress token a pending request carries is refused", %{client: client} do
+    first = Task.async(fn -> Client.call_tool(client, "wait", %{}, progress_token: "shared") end)
+    assert_receive {:tool_waiting, worker}, 1_000
+
+    # Progress names its request only by token, so sharing it would misroute.
+    assert {:error,
+            %Arbor.MCP.Error.TransportError{
+              reason: :not_sent,
+              details: %{cause: :duplicate_progress_token}
+            }} = Client.call_tool(client, "work", %{}, progress_token: "shared")
+
+    send(worker, :release)
+    assert {:ok, _} = Task.await(first)
+
+    # Free again once the first request settled.
+    assert {:ok, _} = Client.call_tool(client, "work", %{}, progress_token: "shared")
   end
 
   test "connection-level log messages reach the handler without a request id", %{

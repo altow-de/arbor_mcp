@@ -231,6 +231,27 @@ defmodule Arbor.MCP.Client.RequestHandler do
   end
 
   defp send_request(request, method, id, from, state, meta) do
+    if progress_token_in_use?(request, state),
+      do: {:reply, {:error, not_sent_error(:duplicate_progress_token, state)}, state},
+      else: send_unique_request(request, method, id, from, state, meta)
+  end
+
+  # Progress names its request only by token, so a token that a pending
+  # request already carries would route that request's progress here.
+  defp progress_token_in_use?(request, state) do
+    case get_in(request, ["params", "_meta", "progressToken"]) do
+      nil ->
+        false
+
+      token ->
+        case Map.get(Map.get(state, :progress_requests) || %{}, token) do
+          nil -> false
+          owner -> Map.has_key?(state.pending_requests, owner)
+        end
+    end
+  end
+
+  defp send_unique_request(request, method, id, from, state, meta) do
     {deadline, meta} = request_send_context(from, state, meta)
 
     result =

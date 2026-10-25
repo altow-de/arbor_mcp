@@ -827,7 +827,10 @@ defmodule Arbor.MCP.Server.Dispatch do
 
         {:error, diagnostics} ->
           message =
-            DSLArguments.input_error_message({:invalid_tool_arguments, List.wrap(diagnostics)})
+            DSLArguments.input_error_message(
+              {:invalid_tool_arguments, List.wrap(diagnostics)},
+              entry.definition["inputSchema"]
+            )
 
           {:ok, Result.error(message)}
       end

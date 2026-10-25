@@ -864,7 +864,12 @@ defmodule Arbor.MCP.Server.DSL do
     input_schema = compile_tool_schema(definition[:inputSchema], :input)
     output_schema = compile_tool_schema(definition[:outputSchema], :output)
 
-    {definition.name, {:"__ex_mcp_dsl_tool_#{index}__", input_schema, output_schema, params}}
+    # The raw schema an input error's path is checked against.
+    error_schema =
+      Arbor.MCP.Server.ResultNormalizer.stringify_keys(definition[:inputSchema] || %{})
+
+    {definition.name,
+     {:"__ex_mcp_dsl_tool_#{index}__", input_schema, output_schema, params, error_schema}}
   end
 
   defp generate_local_tool_execution do
@@ -887,7 +892,7 @@ defmodule Arbor.MCP.Server.DSL do
           end
 
         {:error, reason} ->
-          {:ok, Result.error(DSLArguments.input_error_message(reason)), state}
+          {:ok, Result.error(DSLArguments.input_error_message(reason, error_schema)), state}
       end
     end
   end
@@ -907,7 +912,7 @@ defmodule Arbor.MCP.Server.DSL do
           {:component, module, id} -> module.handle_call_tool(id, arguments, state)
         end,
         quote do
-          {handler, input_schema, output_schema, params} ->
+          {handler, input_schema, output_schema, params, error_schema} ->
             unquote(generate_local_tool_execution())
         end,
         quote do
