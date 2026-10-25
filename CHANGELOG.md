@@ -178,8 +178,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream's newer token only if that token was granted the challenged scopes.
   Migration is decided from published metadata only, never a guessed issuer,
   and a failed flow for a new server, or one after a rejection, doesn't
-  start again with each 401: the HTTP transport now keeps the provider's
-  state when authentication fails, where it used to drop it.
+  start again with each 401, unless the metadata then names a server not
+  yet tried. The HTTP transport now keeps the provider's state when
+  authentication fails, or when the request it retried still fails, where it
+  used to drop it with any refresh token the refresh had rotated.
   The provider struct no longer shows its tokens or its auth config, which
   can hold a client secret, in `inspect/1`.
 - A BEAM or test-transport server sent list changes to a connection that

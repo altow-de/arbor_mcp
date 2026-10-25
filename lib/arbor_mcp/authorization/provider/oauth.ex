@@ -146,9 +146,18 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
       state.auth_completed && state.access_token ->
         reauthenticate_after_rejection(www_authenticate, scopes, state)
 
+      # Unless the resource's published metadata now names a server not
+      # tried yet: then a migration may still run.
       is_binary(state.last_rejected_issuer) ->
-        Logger.warning("Auth failed after a rejection; not retrying the flow")
-        {:error, :auth_loop_detected, state}
+        case moved_to(www_authenticate, state) do
+          {:ok, issuer} ->
+            state = %{state | migration_issuers: [issuer | state.migration_issuers]}
+            do_authenticate(www_authenticate, scopes, state)
+
+          _not_moved ->
+            Logger.warning("Auth failed after a rejection; not retrying the flow")
+            {:error, :auth_loop_detected, state}
+        end
 
       true ->
         do_authenticate(www_authenticate, scopes, state)
