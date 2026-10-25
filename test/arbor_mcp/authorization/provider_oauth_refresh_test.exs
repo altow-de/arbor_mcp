@@ -170,7 +170,7 @@ defmodule Arbor.MCP.Authorization.ProviderOAuthRefreshTest do
 
   # Discovery for https://mcp.example/mcp names `issuer` as its authorization
   # server. The metadata is served without the network.
-  defp discovery(issuer) do
+  defp discovery(issuer, prm? \\ true) do
     test_pid = self()
 
     client = fn uri, _address, _opts ->
@@ -178,7 +178,7 @@ defmodule Arbor.MCP.Authorization.ProviderOAuthRefreshTest do
 
       body =
         case {uri.host, uri.path} do
-          {"mcp.example", "/prm"} ->
+          {"mcp.example", "/prm"} when prm? ->
             %{"authorization_servers" => [issuer]}
 
           {_host, "/.well-known/" <> _kind} ->
@@ -249,6 +249,73 @@ defmodule Arbor.MCP.Authorization.ProviderOAuthRefreshTest do
 
     assert_received {:metadata_fetch, "new-auth.example", _path}
     refute_received {:token_request, _}
+  end
+
+  defp refresh_every_time(bypass) do
+    test_pid = self()
+
+    Bypass.expect(bypass, "POST", "/token", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      send(test_pid, {:token_request, URI.decode_query(body)})
+
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.resp(
+        200,
+        Jason.encode!(%{"access_token" => "new-token", "expires_in" => 3600})
+      )
+    end)
+  end
+
+  test "the refreshed token stays out of inspect output", %{bypass: bypass} = context do
+    expect_refresh(bypass, {200, %{"access_token" => "new-token", "expires_in" => 3600}})
+
+    assert {:ok, "new-token", refreshed} =
+             OAuth.handle_unauthorized(@challenge, [], state(context.token_endpoint, []))
+
+    refute inspect(refreshed) =~ "new-token"
+  end
+
+  test "an issuer guessed without published metadata is not a move",
+       %{bypass: bypass} = context do
+    refresh_every_time(bypass)
+    # No protected resource metadata: only a guessed issuer could differ.
+    config = discovery("https://new-auth.example", false)
+
+    assert {:ok, _token, refreshed} =
+             OAuth.handle_unauthorized(
+               @challenge,
+               [],
+               state(context.token_endpoint, auth_config: config)
+             )
+
+    assert {:ok, _token, _state} = OAuth.handle_unauthorized(@challenge, [], refreshed)
+    assert_received {:token_request, _first}
+    assert_received {:token_request, _second}
+  end
+
+  test "a failed migration flow isn't started again", %{bypass: bypass} = context do
+    refresh_every_time(bypass)
+    config = discovery("https://new-auth.example")
+
+    assert {:ok, _token, refreshed} =
+             OAuth.handle_unauthorized(
+               @challenge,
+               [],
+               state(context.token_endpoint, auth_config: config)
+             )
+
+    assert {:error, {:oauth_failed, _reason}, failed} =
+             OAuth.handle_unauthorized(@challenge, [], refreshed)
+
+    # The next 401 refreshes at the old server; when that token is rejected
+    # too, the flow for the server it already tried doesn't run again.
+    assert {:ok, _token, refreshed} = OAuth.handle_unauthorized(@challenge, [], failed)
+    assert {:ok, _token, _state} = OAuth.handle_unauthorized(@challenge, [], refreshed)
+
+    assert_received {:token_request, _first}
+    assert_received {:token_request, _second}
+    assert_received {:token_request, _third}
   end
 
   test "a refresh that changes the granted scope files later tokens under it",

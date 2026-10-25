@@ -176,6 +176,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   challenges to the client process, which runs one refresh or flow for all of
   them, so a rotating refresh token isn't used twice; a 403 reuses another
   stream's newer token only if that token was granted the challenged scopes.
+  Migration is decided from published metadata only, never a guessed issuer,
+  and a failed flow for a new server doesn't start again with each 401.
   The provider struct no longer shows its tokens or its auth config, which
   can hold a client secret, in `inspect/1`.
 - A BEAM or test-transport server sent list changes to a connection that

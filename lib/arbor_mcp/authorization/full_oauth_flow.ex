@@ -81,11 +81,21 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlow do
   @typep redirect_context :: {redirect_visited(), String.t()}
 
   @doc false
-  # The issuer of the authorization server protecting the resource, found as
-  # execute/1 finds it, without registering or authorizing anything.
+  # The issuer of the authorization server protecting the resource, from its
+  # published metadata, without registering or authorizing anything. Unlike
+  # execute/1 it doesn't fall back to an issuer guessed from the challenge or
+  # the resource's origin: a guess isn't evidence that the resource moved.
   @spec discover_issuer(config()) :: {:ok, String.t()} | {:error, term()}
   def discover_issuer(config) do
-    with {:ok, prm} <- discover_resource_metadata(config),
+    fetch_opts = metadata_fetch_options(config)
+
+    prm =
+      case extract_resource_metadata_url(config[:www_authenticate]) do
+        nil -> discover_prm_with_fallback(config.resource_url, fetch_opts)
+        url -> fetch_prm_directly(url, fetch_opts)
+      end
+
+    with {:ok, prm} <- prm,
          :ok <- validate_prm_resource(prm, config),
          {:ok, as_metadata} <- discover_as_metadata(prm, config) do
       case as_metadata["issuer"] do

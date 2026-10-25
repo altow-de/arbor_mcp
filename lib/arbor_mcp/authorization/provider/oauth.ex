@@ -46,7 +46,7 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
   @refresh_skew 30
 
   # auth_config can hold a client secret or an identity assertion.
-  @derive {Inspect, except: [:access_token, :refresh, :auth_config]}
+  @derive {Inspect, except: [:access_token, :refresh, :auth_config, :rejection_refreshed]}
   defstruct [
     :access_token,
     :resource_url,
@@ -58,9 +58,12 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
     :expires_at,
     # FullOAuthFlow's refresh context, or nil without a refresh token.
     :refresh,
-    # The access token a refresh after a 401 returned. Its own rejection
-    # means refreshing didn't help.
-    :rejection_refreshed_token,
+    # A fingerprint of the access token a refresh after a 401 returned. Its
+    # own rejection means refreshing didn't help.
+    :rejection_refreshed,
+    # An authorization server the resource was found to have moved to. Its
+    # flow runs once, so a failed one doesn't start again with every 401.
+    :migration_issuer,
     granted_scopes: [],
     auth_completed: false
   ]
@@ -97,26 +100,35 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
   # the user, decides: the full flow, which may open a browser, runs only for
   # a different issuer. Otherwise the provider refreshes again.
   def handle_unauthorized(www_authenticate, scopes, %__MODULE__{} = state) do
-    if refreshed_token_rejected?(state) and issuer_moved?(www_authenticate, state) do
-      authenticate_again(www_authenticate, scopes, %{state | rejection_refreshed_token: nil})
+    with true <- refreshed_token_rejected?(state),
+         {:ok, issuer} <- moved_to(www_authenticate, state) do
+      state = %{state | rejection_refreshed: nil, migration_issuer: issuer}
+      authenticate_again(www_authenticate, scopes, state)
     else
-      case refresh(state) do
-        {:ok, token, state} -> {:ok, token, %{state | rejection_refreshed_token: token}}
-        {:error, _reason} -> authenticate_again(www_authenticate, scopes, state)
-      end
+      _not_moved ->
+        case refresh(state) do
+          {:ok, token, state} -> {:ok, token, %{state | rejection_refreshed: fingerprint(token)}}
+          {:error, _reason} -> authenticate_again(www_authenticate, scopes, state)
+        end
     end
   end
 
-  defp refreshed_token_rejected?(%{access_token: token, rejection_refreshed_token: token})
-       when is_binary(token),
-       do: true
+  defp refreshed_token_rejected?(%{access_token: token, rejection_refreshed: print})
+       when is_binary(token) and is_binary(print),
+       do: fingerprint(token) == print
 
   defp refreshed_token_rejected?(_state), do: false
 
-  defp issuer_moved?(www_authenticate, %{authorization_server_issuer: current} = state) do
-    case FullOAuthFlow.discover_issuer(flow_config(www_authenticate, [], state)) do
-      {:ok, issuer} -> is_binary(current) and Issuer.compare(issuer, current) != :ok
-      {:error, _reason} -> false
+  defp fingerprint(token), do: :crypto.hash(:sha256, token)
+
+  # The issuer the resource's metadata now names, if it is neither the current
+  # one nor one already tried.
+  defp moved_to(www_authenticate, %{authorization_server_issuer: current} = state) do
+    with {:ok, issuer} <- FullOAuthFlow.discover_issuer(flow_config(www_authenticate, [], state)),
+         true <- is_binary(current) and Issuer.compare(issuer, current) != :ok,
+         true <-
+           is_nil(state.migration_issuer) or Issuer.compare(issuer, state.migration_issuer) != :ok do
+      {:ok, issuer}
     end
   end
 
