@@ -383,7 +383,8 @@ defmodule Arbor.MCP.Client do
   or a stdio server's shutdown budget plus 500 when that is longer: 3_000 with
   the stdio defaults) are positive finite milliseconds. Establishment uses one cutoff across the
   native constructor and protocol handshake. Cleanup uses a separate single
-  cutoff. `:max_scope_workers` bounds owned reverse-request workers (default 256).
+  cutoff; it bounds the scope only, so set a stdio server's `:eof_grace` or
+  `:cleanup_timeout` in the connection spec. `:max_scope_workers` bounds owned reverse-request workers (default 256).
   Helper names must be local atoms. A stdio child requires a typed cleanup receipt;
   a legacy HTTP session DELETE remains explicitly unconfirmed even after local
   resources close. Arbitrary unregistered custom transport effects are outside

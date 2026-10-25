@@ -14,8 +14,10 @@ defmodule Arbor.MCP.Client.ConnectionScope do
     with true <- Keyword.keyword?(opts),
          {:ok, establish} <- finite_option(opts, :establish_timeout, 12_000),
          deadline = Deadline.after_ms(establish),
+         # The scope's :cleanup_timeout bounds the scope. Passed on, it would
+         # also become a stdio server's shutdown budget and shrink its EOF grace.
          {:ok, client_opts} <-
-           ClientConnection.connection_options(spec, opts),
+           ClientConnection.connection_options(spec, Keyword.delete(opts, :cleanup_timeout)),
          {:ok, cleanup} <-
            finite_option(opts, :cleanup_timeout, Deadline.cleanup_timeout(client_opts)),
          {:ok, workers} <- finite_option(opts, :max_scope_workers, 256),

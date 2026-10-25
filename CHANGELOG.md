@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `with_connection/3`'s `:cleanup_timeout`) covers a stdio server's shutdown
   budget plus 500 ms: 3_000 ms with the stdio defaults. Other transports keep
   1_000 ms.
+- `with_connection/3`'s `:cleanup_timeout` bounds the scope only. It was also
+  passed to a stdio transport, where it became the server's subprocess shutdown
+  budget; set `:eof_grace` or `:cleanup_timeout` in the connection spec instead.
 
 ## [2.0.0-rc.5] — 2026-10-22
 
