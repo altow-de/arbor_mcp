@@ -119,8 +119,10 @@ format semantics and qualification.
 
 Declared params retain existing atom-key convenience and missing-value defaults.
 Before a tool callback runs, its compiled input schema validates the arguments
-and any explicitly declared param defaults. Invalid arguments return JSON-RPC
-invalid params (`-32602`) with the handler state unchanged. Framework `_meta`
+and any explicitly declared param defaults. Invalid arguments return an
+`isError` tool result, `"Input validation error: …"`, that names the failing
+fields and rules without echoing the rejected values, so a model can correct the
+call (SEP-1303). The callback doesn't run and handler state is unchanged. Framework `_meta`
 is passed to the callback separately from schema validation. Literal schema
 `default` annotations do not insert values, and values are never coerced.
 

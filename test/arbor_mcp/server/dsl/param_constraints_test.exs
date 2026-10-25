@@ -90,7 +90,7 @@ defmodule Arbor.MCP.Server.DSL.ParamConstraintsTest do
           %{"count" => 2, "tags" => ["a", "b", "c"]},
           %{"count" => 2, "mode" => "unknown"}
         ] do
-      assert {:error, %Arbor.MCP.Error.ProtocolError{code: -32602}, %{}} =
+      assert {:ok, %{isError: true, content: [%{text: "Input validation error" <> _}]}, %{}} =
                Constrained.handle_call_tool("bounded", invalid, %{})
     end
   end
@@ -113,7 +113,7 @@ defmodule Arbor.MCP.Server.DSL.ParamConstraintsTest do
              Constrained.handle_call_tool("nested", %{"rows" => [%{"name" => "ok"}]}, %{})
 
     for rows <- [[], [%{}], [%{"name" => ""}], [%{"name" => "ok", "extra" => 1}]] do
-      assert {:error, _reason, %{}} =
+      assert {:ok, %{isError: true}, %{}} =
                Constrained.handle_call_tool("nested", %{"rows" => rows}, %{})
     end
   end
@@ -138,14 +138,14 @@ defmodule Arbor.MCP.Server.DSL.ParamConstraintsTest do
 
   test "literal input schemas validate without coercion or schema-default insertion" do
     for invalid <- [%{}, %{"count" => "2"}, %{"count" => 2, "extra" => true}] do
-      assert {:error, %Arbor.MCP.Error.ProtocolError{code: -32602}, %{}} =
+      assert {:ok, %{isError: true, content: [%{text: "Input validation error" <> _}]}, %{}} =
                Constrained.handle_call_tool("literal", invalid, %{})
     end
 
     assert {:ok, %{structuredContent: %{count: 2}}, %{invoked: true}} =
              Constrained.handle_call_tool("literal", %{"count" => 2, "_meta" => %{}}, %{})
 
-    assert {:error, %Arbor.MCP.Error.ProtocolError{code: -32602}, %{}} =
+    assert {:ok, %{isError: true, content: [%{text: "Input validation error" <> _}]}, %{}} =
              Constrained.handle_call_tool("literal", %{:count => 2, "count" => 3}, %{})
   end
 

@@ -252,7 +252,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
         maybe_schedule_request_timeout(id, meta, updated_state)
         pending_requests = Map.put(updated_state.pending_requests, id, {from, :single, method})
         new_state = %{updated_state | pending_requests: pending_requests}
-        {:noreply, new_state}
+        {:noreply, remember_progress_token(request, id, new_state)}
 
       {:error, :not_connected} ->
         {:reply, {:error, :not_connected}, state}
@@ -693,31 +693,8 @@ defmodule Arbor.MCP.Client.RequestHandler do
       {:error, error, id} ->
         handle_single_response({:error, error, id}, state)
 
-      {:notification, "notifications/subscriptions/acknowledged", params} ->
-        route_subscription_acknowledgment(params, state)
-
-      {:notification, method, params}
-      when method in [
-             "notifications/tools/list_changed",
-             "notifications/prompts/list_changed",
-             "notifications/resources/list_changed",
-             "notifications/resources/updated"
-           ] ->
-        route_change_notification(method, params, state)
-
-      {:notification, "notifications/tasks" = method, params} ->
-        route_task_subscription_event(method, params, state)
-
-      {:notification, "notifications/cancelled", params} ->
-        Logger.info("Received notification: notifications/cancelled")
-        handle_cancellation_notification(params, state)
-
-      {:notification, method, _params} ->
-        Logger.info("Received unsupported notification",
-          method_hash: LogSummary.fingerprint(method)
-        )
-
-        {:noreply, state}
+      {:notification, method, params} ->
+        route_notification(method, params, state)
 
       {:request, method, params, id} ->
         handle_server_request(method, params, id, state)
@@ -1070,6 +1047,77 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
     {:noreply, new_state}
   end
+
+  defp route_notification("notifications/subscriptions/acknowledged", params, state),
+    do: route_subscription_acknowledgment(params, state)
+
+  defp route_notification(method, params, state)
+       when method in [
+              "notifications/tools/list_changed",
+              "notifications/prompts/list_changed",
+              "notifications/resources/list_changed",
+              "notifications/resources/updated"
+            ],
+       do: route_change_notification(method, params, state)
+
+  defp route_notification("notifications/tasks" = method, params, state),
+    do: route_task_subscription_event(method, params, state)
+
+  defp route_notification("notifications/cancelled", params, state) do
+    Logger.info("Received notification: notifications/cancelled")
+    handle_cancellation_notification(params, state)
+  end
+
+  defp route_notification("notifications/progress", params, state) when is_map(params),
+    do: route_progress(params, state)
+
+  # A connection-level log message belongs to no request.
+  defp route_notification("notifications/message", params, state) when is_map(params),
+    do: dispatch_request_notification(:handle_log_message, nil, params, state)
+
+  defp route_notification(method, _params, state) do
+    Logger.info("Received unsupported notification",
+      method_hash: LogSummary.fingerprint(method)
+    )
+
+    {:noreply, state}
+  end
+
+  # Over every transport but a modern request stream, progress arrives on the
+  # connection and names its request only by the token that request carried.
+  defp route_progress(params, state) do
+    progress_requests = Map.get(state, :progress_requests) || %{}
+
+    case Map.get(progress_requests, params["progressToken"]) do
+      nil ->
+        Logger.debug("Progress for an unknown token")
+        {:noreply, state}
+
+      request_id ->
+        if Map.has_key?(state.pending_requests, request_id),
+          do: dispatch_request_notification(:handle_progress, request_id, params, state),
+          else: {:noreply, forget_progress_token(state, params["progressToken"])}
+    end
+  end
+
+  defp remember_progress_token(request, id, state) do
+    case get_in(request, ["params", "_meta", "progressToken"]) do
+      token when is_binary(token) or is_integer(token) ->
+        # Settled requests' tokens are dropped here, so the map never holds
+        # more than the pending requests that asked for progress.
+        live =
+          (Map.get(state, :progress_requests) || %{})
+          |> Map.filter(fn {_token, id} -> Map.has_key?(state.pending_requests, id) end)
+
+        Map.put(state, :progress_requests, Map.put(live, token, id))
+
+      _none ->
+        state
+    end
+  end
+
+  defp forget_progress_token(state, token),
+    do: Map.update(state, :progress_requests, %{}, &Map.delete(&1, token))
 
   defp dispatch_request_notification(callback, request_id, params, state) do
     :telemetry.execute(

@@ -16,16 +16,33 @@ defmodule Arbor.MCP.Server.Internal.DSLArguments do
 
     case SchemaPolicy.validate_optional(Map.drop(json, ["_meta"]), input_schema) do
       :ok -> {:ok, Builder.normalize_arguments(arguments, params)}
-      {:error, _diagnostics} -> invalid_tool_arguments()
+      {:error, diagnostics} -> {:error, {:invalid_tool_arguments, List.wrap(diagnostics)}}
     end
   rescue
-    ArgumentError -> invalid_tool_arguments()
+    ArgumentError -> {:error, {:invalid_tool_arguments, []}}
   end
 
-  def prepare_tool_arguments(_arguments, _params, _input_schema), do: invalid_tool_arguments()
+  def prepare_tool_arguments(_arguments, _params, _input_schema),
+    do: {:error, {:invalid_tool_arguments, ["arguments must be an object"]}}
 
-  defp invalid_tool_arguments,
-    do: {:error, Arbor.MCP.Error.protocol_error(-32602, "Invalid tool arguments")}
+  @doc false
+  # Invalid arguments are a tool execution error the model can correct, so
+  # they come back as an `isError` result rather than a protocol error, as
+  # SEP-1303 recommends and the other MCP SDKs do. Schema diagnostics name
+  # the failing location and rule but never the rejected value.
+  def input_error_message({:invalid_tool_arguments, []}), do: "Input validation error"
+
+  def input_error_message({:invalid_tool_arguments, diagnostics}) do
+    details =
+      Enum.map_join(diagnostics, "; ", fn
+        {message, path} when is_binary(message) and path in ["#", "", nil] -> message
+        {message, path} when is_binary(message) and is_binary(path) -> "#{path}: #{message}"
+        message when is_binary(message) -> message
+        _other -> "invalid"
+      end)
+
+    "Input validation error: " <> details
+  end
 
   def validate_tool_response(response, nil), do: {:ok, response}
 

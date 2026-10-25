@@ -813,8 +813,8 @@ defmodule Arbor.MCP.Server.DSL do
               end
           end
 
-        {:error, error} ->
-          {:error, error, state}
+        {:error, reason} ->
+          {:ok, Result.error(DSLArguments.input_error_message(reason)), state}
       end
     end
   end

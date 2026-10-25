@@ -136,7 +136,10 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlow do
   defp run_and_persist_token(as_metadata, client_info, config) do
     with {:ok, token_data} <- select_and_run_grant_flow(as_metadata, client_info, config),
          :ok <- persist_token(token_data, as_metadata, client_info, config) do
-      {:ok, Map.put(token_data, :authorization_server_issuer, as_metadata["issuer"])}
+      {:ok,
+       token_data
+       |> Map.put(:authorization_server_issuer, as_metadata["issuer"])
+       |> Map.put(:refresh_context, refresh_context(token_data, as_metadata, client_info, config))}
     else
       {:error, _reason} = error -> error
     end
@@ -616,6 +619,56 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlow do
     }
 
     CredentialStore.put_token(config.credential_store, token)
+  end
+
+  # What refresh/2 needs to renew this token without the browser: nil when the
+  # authorization server issued no refresh token.
+  defp refresh_context(token_data, as_metadata, client_info, config) do
+    with refresh_token when is_binary(refresh_token) <- token_field(token_data, :refresh_token),
+         token_endpoint when is_binary(token_endpoint) <- as_metadata["token_endpoint"] do
+      %{
+        refresh_token: refresh_token,
+        token_endpoint: token_endpoint,
+        issuer: as_metadata["issuer"],
+        auth_methods:
+          as_metadata["token_endpoint_auth_methods_supported"] || ["client_secret_post"],
+        client_info: client_info,
+        resource: config[:resource] || config[:resource_url]
+      }
+    else
+      _none -> nil
+    end
+  end
+
+  @doc false
+  # Renews an access token with the refresh token from an earlier flow
+  # (RFC 6749 section 6), authenticating the client as the original token
+  # request did. Returns the new token data and the context for the next
+  # refresh; a server that doesn't rotate refresh tokens keeps the old one.
+  @spec refresh(map(), map()) :: {:ok, map(), map()} | {:error, term()}
+  def refresh(%{refresh_token: refresh_token, client_info: client_info} = context, config) do
+    config = Map.merge(config, %{token_endpoint: context.token_endpoint})
+
+    base =
+      [
+        grant_type: "refresh_token",
+        refresh_token: refresh_token,
+        client_id: client_info.client_id,
+        client_secret: client_info[:client_secret],
+        resource: context.resource
+      ]
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+
+    with {:ok, method} <- select_token_auth_method(context.auth_methods, client_info, config),
+         {:ok, body} <-
+           maybe_add_client_assertion(base, client_info, context.token_endpoint, config, method),
+         {:ok, token_data} <-
+           HTTPClient.make_token_request(context.token_endpoint, body, auth_method: method),
+         :ok <-
+           persist_token(token_data, %{"issuer" => context.issuer}, client_info, config) do
+      next = %{context | refresh_token: token_field(token_data, :refresh_token) || refresh_token}
+      {:ok, token_data, next}
+    end
   end
 
   defp credential_context(config),
