@@ -154,7 +154,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget; set `:eof_grace` or `:cleanup_timeout` in the connection spec instead.
 - **BREAKING:** A DSL tool called with invalid arguments returns an `isError`
   tool result, "Input validation error: …" naming the failing fields and rules,
-  instead of a `-32602` protocol error with no details. This follows SEP-1303,
+  instead of a `-32602` protocol error with no details. A path shows only
+  the properties and array indices the schema declares at that position; a
+  key the caller sent, and everything below it, shows as `*`. This follows SEP-1303,
   as the other MCP SDKs do, and lets a model correct the call. Rejected values
   are never included. **Upgrade:** callers that matched the error tuple from
   `Client.call_tool/4` now receive `{:ok, %Arbor.MCP.Response{is_error: true}}`.
@@ -171,14 +173,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BEAM and legacy HTTP. `handle_progress/3` now receives progress on every
   transport, matched to the pending request by its `progressToken`, and
   `handle_log_message/3` receives connection-level log messages with a `nil`
-  request id.
+  request id. A request whose `progressToken` a pending request already
+  carries is refused with a `:not_sent` transport error
+  (`cause: :duplicate_progress_token`), since its progress would be
+  misrouted.
 - The default OAuth provider kept no refresh token, so an expired access token
   started the full authorization flow again, which found the same authorization
   server and failed with `:auth_loop_detected`. It now refreshes the token
   shortly before it expires and when the server rejects it, and runs the full
-  flow only if refreshing fails. A refreshed token is saved to the
-  `:credential_store` when one is configured, and the provider struct no longer
-  shows its tokens in `inspect/1`.
+  flow only if refreshing fails. A refreshed token replaces the stored one in
+  the `:credential_store`, under the resource and scopes of the flow that
+  issued the first, and keeps the refresh token and scopes when the server's
+  response omits them, or under the new scope when it changes. If a token
+  refreshed after a 401 is rejected in turn, the provider runs discovery,
+  which asks nothing of the user, and starts the full flow only if the
+  resource now names a different authorization server; otherwise it
+  refreshes again. Modern HTTP request streams hand their 401 and 403
+  challenges to the client process, which runs one refresh or flow for all of
+  them, so a rotating refresh token isn't used twice; a 403 reuses another
+  stream's newer token only if that token was granted the challenged scopes.
+  Migration is decided from published metadata only, never a guessed issuer,
+  and a failed flow for a new server, or one after a rejection, doesn't
+  start again with each 401: the HTTP transport now keeps the provider's
+  state when authentication fails, where it used to drop it.
+  The provider struct no longer shows its tokens or its auth config, which
+  can hold a client secret, in `inspect/1`.
 - A BEAM or test-transport server sent list changes to a connection that
   hadn't sent `initialize` or a modern request yet. A client establishing
   that connection took the notification for the answer to its

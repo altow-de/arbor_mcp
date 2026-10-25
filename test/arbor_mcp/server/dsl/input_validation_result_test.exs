@@ -21,6 +21,17 @@ defmodule Arbor.MCP.Server.DSL.InputValidationResultTest do
 
       run(fn %{message: message}, state -> {:ok, message, state} end)
     end
+
+    tool "label", "Set labels" do
+      input_schema(%{
+        "type" => "object",
+        "properties" => %{
+          "labels" => %{"type" => "object", "propertyNames" => %{"maxLength" => 3}}
+        }
+      })
+
+      run(fn _args, state -> {:ok, "ok", state} end)
+    end
   end
 
   setup do
@@ -50,6 +61,15 @@ defmodule Arbor.MCP.Server.DSL.InputValidationResultTest do
     assert [%{text: "Input validation error: " <> details}] = response.content
     assert details =~ "times"
     refute details =~ "987"
+  end
+
+  test "an error path names declared properties but not the caller's keys", %{client: client} do
+    assert {:ok, %{is_error: true} = response} =
+             Client.call_tool(client, "label", %{"labels" => %{"sk_live_SECRET" => "x"}})
+
+    assert [%{text: "Input validation error: " <> details}] = response.content
+    assert details =~ "labels"
+    refute details =~ "sk_live"
   end
 
   test "valid arguments still reach the tool", %{client: client} do
