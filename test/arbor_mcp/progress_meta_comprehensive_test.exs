@@ -320,7 +320,9 @@ defmodule Arbor.MCP.ProgressMetaComprehensiveTest do
       {:ok, server} =
         Server.start_link(
           transport: :test,
-          handler: ComprehensiveHandler
+          handler: ComprehensiveHandler,
+          # The handler records what it receives in its state.
+          execution: :stateful
         )
 
       {:ok, client} =
@@ -463,7 +465,9 @@ defmodule Arbor.MCP.ProgressMetaComprehensiveTest do
       {:ok, server} =
         Server.start_link(
           transport: :test,
-          handler: ComprehensiveHandler
+          handler: ComprehensiveHandler,
+          # The handler records what it receives in its state.
+          execution: :stateful
         )
 
       {:ok, client} =
@@ -565,7 +569,9 @@ defmodule Arbor.MCP.ProgressMetaComprehensiveTest do
       {:ok, server} =
         Server.start_link(
           transport: :test,
-          handler: ComprehensiveHandler
+          handler: ComprehensiveHandler,
+          # The handler records what it receives in its state.
+          execution: :stateful
         )
 
       {:ok, client} =
@@ -660,7 +666,9 @@ defmodule Arbor.MCP.ProgressMetaComprehensiveTest do
       {:ok, server} =
         Server.start_link(
           transport: :test,
-          handler: ComprehensiveHandler
+          handler: ComprehensiveHandler,
+          # The handler records what it receives in its state.
+          execution: :stateful
         )
 
       {:ok, client} =

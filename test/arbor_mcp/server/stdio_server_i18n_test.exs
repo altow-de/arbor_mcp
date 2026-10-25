@@ -61,6 +61,9 @@ defmodule Arbor.MCP.Server.StdioServerI18nTest do
               flunk("undecodable line #{inspect(line, binaries: :as_binaries)}\n" <> diagnostics)
           end
         end)
+        # The server handles requests concurrently and answers in completion
+        # order; JSON-RPC matches responses by id.
+        |> Enum.sort_by(& &1["id"])
 
       assert Enum.map(responses, & &1["id"]) == [1, 2, 3, 4], diagnostics
 
