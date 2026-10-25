@@ -109,7 +109,7 @@ The stable 48-hour qualification remains open.
 
 The next candidate, not yet published, makes servers handle the requests on a
 connection concurrently, as the other MCP SDKs do, and lets the caller decide how
-long a request runs. Three changes can break existing code. The
+long a request runs. Five changes can break existing code. The
 [changelog](../../CHANGELOG.md) lists the rest, including the client changes.
 
 ### Request callbacks no longer change handler state by default
@@ -186,6 +186,27 @@ cancels a request when it stops waiting, with `notifications/cancelled`, or over
 modern Streamable HTTP by closing the request's connection. Set
 `request_timeout_ms` to keep a tighter server-side bound. A stdio server's
 default EOF drain is unchanged at 15 s.
+
+### Invalid DSL tool arguments return a tool error
+
+A DSL tool called with arguments that fail its schema used to answer with a
+`-32602` protocol error and no details. It now returns a successful result with
+`isError: true` and text such as `Input validation error: ...` naming the failing
+fields and rules, as SEP-1303 and the other MCP SDKs do, so a model can correct
+its call. Rejected values are never included. Code that matched the error tuple
+from `Client.call_tool/4` now receives
+`{:ok, %Arbor.MCP.Response{is_error: true}}`.
+
+### Resource-template values are percent-decoded
+
+`resource_template "files://{name}"` used to hand its `read` function the
+value as it appeared in the URI, so `files://a%20b` gave `"a%20b"`. Values are
+now percent-decoded (`"a b"`), and a handler that decoded them itself would
+decode twice. Templates also match every RFC 6570 operator now: `{+path}` and
+`{#frag}` span slashes, and `{/a,b}`, `{.ext}`, `{;params}` and `{?query}` work.
+As in Python's MCPServer, a decoded value doesn't match if it contains a NUL
+byte, climbs out of its starting point with `..`, or is an absolute path; the
+read then fails as an unknown resource.
 
 ## Limits to exercise in downstream tests
 
