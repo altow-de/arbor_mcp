@@ -393,10 +393,22 @@ defmodule Arbor.MCP.Transport.HTTP do
           {:ok, t()} | {:ok, t(), term()} | {:error, term()} | {:error, term(), t()}
   def send_authenticated(message, %__MODULE__{} = state) do
     case perform_and_maybe_auth(message, state) do
-      {:ok, response} -> handle_http_response(response, state, message)
-      {:ok, response, new_state} -> handle_http_response(response, new_state, message)
-      {:error, reason, new_state} -> {:error, reason, new_state}
-      {:error, reason} -> {:error, reason}
+      {:ok, response} ->
+        handle_http_response(response, state, message)
+
+      # Authentication changed the state (a refresh may have rotated its
+      # token), so a request that still fails keeps it.
+      {:ok, response, new_state} ->
+        case handle_http_response(response, new_state, message) do
+          {:error, reason} -> {:error, reason, new_state}
+          result -> result
+        end
+
+      {:error, reason, new_state} ->
+        {:error, reason, new_state}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
