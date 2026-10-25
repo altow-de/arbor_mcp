@@ -163,6 +163,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flow only if refreshing fails. A refreshed token is saved to the
   `:credential_store` when one is configured, and the provider struct no longer
   shows its tokens in `inspect/1`.
+- A BEAM or test-transport server sent list changes to a connection that
+  hadn't sent `initialize` or a modern request yet. A client establishing
+  that connection took the notification for the answer to its
+  `server/discover` probe and failed to connect. The connection now gets
+  list changes once its era is set.
 - A modern `tools/call` checked its `Mcp-Param-*` headers against the first
   `tools/list` page only, so a tool on a later page of a paginated list
   skipped the check. The server now follows the cursors until it finds the
