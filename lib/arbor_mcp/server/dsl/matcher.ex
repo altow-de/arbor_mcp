@@ -5,11 +5,15 @@ defmodule Arbor.MCP.Server.DSL.Matcher do
   # the reverse of expansion. Supports every operator (simple, `+`, `#`, `.`,
   # `/`, `;`, `?`, `&`), lists of variables, explode (`*`) and prefixes (`:n`).
   #
-  # Values are percent-decoded. An exploded variable yields a list. Query
-  # expressions (`?`, `&`) are matched by name and in any order, and their
-  # variables are optional, as expansion omits undefined ones. Like Python's
-  # MCPServer, values containing a NUL byte are rejected, and so are `..`
-  # segments in expansions that may contain a slash.
+  # Values are percent-decoded. An exploded variable yields a list. In a
+  # path expression with several variables, the later ones may be omitted,
+  # as expansion does for undefined variables. Query expressions (`?`, `&`)
+  # are matched by name and in any order; their variables are optional and
+  # other query parameters are ignored, as in Python's MCPServer.
+  #
+  # Also like Python's MCPServer, a decoded value (each element of an
+  # exploded one) doesn't match if it contains a NUL byte, climbs above its
+  # start with `..` segments, or is an absolute path, however it was encoded.
 
   @spec match_uri_template(String.t(), String.t()) :: {:ok, map()} | :error
   def match_uri_template(uri, template) when is_binary(uri) and is_binary(template) do
@@ -128,15 +132,14 @@ defmodule Arbor.MCP.Server.DSL.Matcher do
         {pattern, {group, name, op, explode?}}
       end)
 
-    source =
-      case parts do
-        [{only, _group}] ->
-          Regex.escape(prefix) <> only
+    [{first, _group} | rest] = parts
 
-        _many ->
-          Regex.escape(prefix) <>
-            Enum.map_join(parts, Regex.escape(separator), fn {pattern, _group} -> pattern end)
-      end
+    source =
+      Regex.escape(prefix) <>
+        first <>
+        Enum.map_join(rest, fn {pattern, _group} ->
+          "(?:" <> Regex.escape(separator) <> pattern <> ")?"
+        end)
 
     {source, Enum.map(parts, fn {_pattern, group} -> group end)}
   end
@@ -155,11 +158,16 @@ defmodule Arbor.MCP.Server.DSL.Matcher do
 
   defp path_values(captures, groups) do
     Enum.reduce_while(groups, {:ok, %{}}, fn {group, name, op, explode?}, {:ok, acc} ->
-      raw = Map.fetch!(captures, group)
+      # An omitted variable's group captures nothing; values are never empty.
+      case Map.fetch!(captures, group) do
+        "" ->
+          {:cont, {:ok, acc}}
 
-      case decode_value(raw, op, explode?) do
-        {:ok, value} -> {:cont, {:ok, Map.put(acc, name, value)}}
-        :error -> {:halt, :error}
+        raw ->
+          case decode_value(raw, op, explode?) do
+            {:ok, value} -> {:cont, {:ok, Map.put(acc, name, value)}}
+            :error -> {:halt, :error}
+          end
       end
     end)
   end
@@ -183,20 +191,35 @@ defmodule Arbor.MCP.Server.DSL.Matcher do
 
   defp decode_value(raw, op, false), do: decode(raw, op)
 
-  defp decode(raw, op) do
+  defp decode(raw, _op) do
     value = URI.decode(raw)
-
-    cond do
-      String.contains?(value, <<0>>) -> :error
-      op in ["+", "#"] and traversal?(value) -> :error
-      not String.valid?(value) -> :error
-      true -> {:ok, value}
-    end
+    if String.valid?(value) and safe?(value), do: {:ok, value}, else: :error
   rescue
     ArgumentError -> :error
   end
 
-  defp traversal?(value), do: ".." in String.split(value, ["/", "\\"])
+  defp safe?(value),
+    do: not (String.contains?(value, <<0>>) or escapes?(value) or absolute?(value))
+
+  # `a/../b` stays inside its start; `a/../../b` and `..` don't.
+  defp escapes?(value) do
+    value
+    |> String.split(["/", "\\"])
+    |> Enum.reduce_while(0, fn
+      "..", 0 -> {:halt, :escaped}
+      "..", depth -> {:cont, depth - 1}
+      segment, depth when segment in ["", "."] -> {:cont, depth}
+      _segment, depth -> {:cont, depth + 1}
+    end) == :escaped
+  end
+
+  defp absolute?(<<separator, _rest::binary>>) when separator in [?/, ?\\], do: true
+
+  defp absolute?(<<drive, ?:, separator, _rest::binary>>)
+       when (drive in ?a..?z or drive in ?A..?Z) and separator in [?/, ?\\],
+       do: true
+
+  defp absolute?(_value), do: false
 
   # Earlier releases keyed a variable such as `file-name` as `file_name`.
   defp with_legacy_keys(values) do
@@ -218,7 +241,7 @@ defmodule Arbor.MCP.Server.DSL.Matcher do
         found ->
           values = Enum.map(found, fn {_key, value} -> value end)
 
-          if Enum.any?(values, &String.contains?(&1, <<0>>)) do
+          if not Enum.all?(values, &(String.valid?(&1) and safe?(&1))) do
             {:halt, :error}
           else
             value = if explode? or length(values) > 1, do: values, else: hd(values)

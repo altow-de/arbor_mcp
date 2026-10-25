@@ -49,10 +49,35 @@ defmodule Arbor.MCP.Server.DSL.MatcherTest do
     assert :error = match("x://abcd", "x://{code:3}")
   end
 
-  test "NUL bytes and traversal in slash-capable expansions are rejected" do
+  test "decoded values with NUL bytes, escaping .. or absolute paths don't match" do
     assert :error = match("file:///a%00b", "file:///{+path}")
-    assert :error = match("file:///docs/../secrets", "file:///{+path}")
     assert :error = match("x://a%00b", "x://{id}")
+
+    # Like Python's MCPServer, `..` is rejected only where it climbs above the start.
+    assert {:ok, %{"path" => "docs/../readme"}} =
+             match("file:///docs/../readme", "file:///{+path}")
+
+    assert :error = match("file:///docs/../../secrets", "file:///{+path}")
+
+    # However the value was encoded, and in every operator.
+    assert :error = match("file:///public/..%2Fsecret", "file:///public/{name}")
+    assert :error = match("file:///public/..", "file:///public/{name}")
+    assert :error = match("x://root/a/../..", "x://root{/segments*}")
+    assert :error = match("file:///public/%2Fetc%2Fpasswd", "file:///public/{name}")
+    assert :error = match("file:///public/C%3A%5Cwin", "file:///public/{name}")
+    assert :error = match("search://items?q=..%2F..%2Fx", "search://items{?q}")
+    assert {:ok, %{"name" => "1.0..2.0"}} = match("pkg://1.0..2.0", "pkg://{name}")
+  end
+
+  test "later variables of a path expression may be omitted" do
+    assert {:ok, %{"dir" => "a"} = values} = match("x://root/a", "x://root{/dir,file}")
+    refute Map.has_key?(values, "file")
+    assert {:ok, %{"dir" => "a", "file" => "b"}} = match("x://root/a/b", "x://root{/dir,file}")
+    assert :error = match("x://root", "x://root{/dir,file}")
+  end
+
+  test "query parameters the template doesn't name are ignored, as in Python's MCPServer" do
+    assert {:ok, %{"q" => "cats"}} = match("search://items?q=cats&page=2", "search://items{?q}")
   end
 
   test "earlier releases' keys stay available for variables with other characters" do

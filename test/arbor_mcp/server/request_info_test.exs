@@ -39,7 +39,8 @@ defmodule Arbor.MCP.Server.RequestInfoTest do
         "requestId" => Context.request_id(),
         "sessionId" => Context.session_id(),
         "tag" => tag(Context.request_headers()),
-        "auth" => auth && Map.take(auth, [:client_id, :subject, :scopes, :token])
+        "auth" => auth && Map.take(auth, [:client_id, :subject, :scopes, :token]),
+        "inspected" => inspect(Context.current())
       }
 
       {:ok, %{"content" => [], "structuredContent" => info}, state}
@@ -93,6 +94,9 @@ defmodule Arbor.MCP.Server.RequestInfoTest do
 
     assert %{status: 200} =
              conn = post(opts, whoami("call-7"), bearer: "alice", session: session, tag: "t1")
+
+    assert %{"inspected" => inspected} = structured(conn)
+    refute inspected =~ "Bearer"
 
     assert %{
              "requestId" => "call-7",

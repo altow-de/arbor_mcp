@@ -14,6 +14,9 @@ defmodule Arbor.MCP.Server.RequestContext do
   alias Arbor.MCP.Tasks.Extension, as: TasksExtension
   alias Arbor.RPC.JSONRPC
 
+  # The headers include Authorization; read them with
+  # Arbor.MCP.Server.Context.request_headers/0, not from inspect output.
+  @derive {Inspect, except: [:request_headers]}
   @enforce_keys [:method, :request_id, :request?, :era]
   defstruct [
     :method,

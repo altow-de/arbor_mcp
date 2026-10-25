@@ -50,10 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING:** Resource-template variables are percent-decoded, so a handler
   that decoded them itself now decodes twice. Template matching supports every
   RFC 6570 operator (`{+path}` and `{#frag}` span slashes, `{/a,b}`, `{.ext}`,
-  `{;params}`, `{?query}` and `{&more}`), exploded lists and prefixes. Query
-  variables match in any order and may be absent. Values containing a NUL
-  byte, and `..` segments in `{+...}` and `{#...}` values, don't match.
-  Before, every expression matched one path segment as written.
+  `{;params}`, `{?query}` and `{&more}`), exploded lists and prefixes. Later
+  variables of a path expression may be omitted. Query variables match in
+  any order and may be absent, and other query parameters are ignored. As
+  in Python's MCPServer, a decoded value doesn't match if it contains a NUL
+  byte, climbs above its start with `..`, or is an absolute path, however it
+  was encoded. Before, every expression matched one path segment as written.
 - DSL servers advertise `listChanged: true` for tools, resources and prompts,
   as the TypeScript SDK does. Send the notifications with
   `Arbor.MCP.Server.notify_tools_changed/1` and its siblings.

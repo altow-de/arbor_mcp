@@ -29,6 +29,14 @@ defmodule Arbor.MCP.Server.RegistryTest do
     end
   end
 
+  defmodule Failing do
+    @moduledoc false
+    use Arbor.MCP.Server.Handler
+
+    @impl true
+    def handle_list_tools(_cursor, state), do: {:error, "Catalog unavailable", state}
+  end
+
   @schema %{
     "type" => "object",
     "properties" => %{"name" => %{"type" => "string"}},
@@ -109,6 +117,14 @@ defmodule Arbor.MCP.Server.RegistryTest do
 
     assert {:ok, %{"content" => [%{"text" => "static"}]}} =
              Client.call_tool(client, "static", %{}, format: :map)
+  end
+
+  test "a handler's own list error stands when tools are registered" do
+    {server, client} = start(Failing)
+    assert :ok = Server.add_tool(server, %{name: "greet"}, &greet/1)
+
+    assert {:error, %{"message" => message}} = Client.list_tools(client, format: :map)
+    assert message =~ "Catalog unavailable"
   end
 
   test "output schemas are enforced" do

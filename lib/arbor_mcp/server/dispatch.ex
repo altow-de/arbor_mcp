@@ -317,9 +317,7 @@ defmodule Arbor.MCP.Server.Dispatch do
   defp do_dispatch("tools/list", ctx, state) do
     args = [cursor(ctx), state]
 
-    ctx
-    |> paginated(:handle_list_tools, args, "tools", "List tools error", state)
-    |> with_registered(ctx, :tool, "tools")
+    registered_list(ctx, :handle_list_tools, args, "tools", "List tools error", state, :tool)
   end
 
   defp do_dispatch("tools/call", ctx, state) do
@@ -350,23 +348,29 @@ defmodule Arbor.MCP.Server.Dispatch do
   defp do_dispatch("resources/list", ctx, state) do
     args = [cursor(ctx), state]
 
-    ctx
-    |> paginated(:handle_list_resources, args, "resources", "List resources error", state)
-    |> with_registered(ctx, :resource, "resources")
+    registered_list(
+      ctx,
+      :handle_list_resources,
+      args,
+      "resources",
+      "List resources error",
+      state,
+      :resource
+    )
   end
 
   defp do_dispatch("resources/templates/list", ctx, state) do
     args = [cursor(ctx), state]
 
-    ctx
-    |> paginated(
+    registered_list(
+      ctx,
       :handle_list_resource_templates,
       args,
       "resourceTemplates",
       "List resource templates error",
-      state
+      state,
+      :resource_template
     )
-    |> with_registered(ctx, :resource_template, "resourceTemplates")
   end
 
   defp do_dispatch("resources/read", ctx, state) do
@@ -396,9 +400,15 @@ defmodule Arbor.MCP.Server.Dispatch do
   defp do_dispatch("prompts/list", ctx, state) do
     args = [cursor(ctx), state]
 
-    ctx
-    |> paginated(:handle_list_prompts, args, "prompts", "List prompts error", state)
-    |> with_registered(ctx, :prompt, "prompts")
+    registered_list(
+      ctx,
+      :handle_list_prompts,
+      args,
+      "prompts",
+      "List prompts error",
+      state,
+      :prompt
+    )
   end
 
   defp do_dispatch("prompts/get", ctx, state) do
@@ -575,7 +585,7 @@ defmodule Arbor.MCP.Server.Dispatch do
   end
 
   # Invokes a paginated list callback returning {:ok, entries, cursor, state}.
-  defp paginated(ctx, fun, args, key, label, state) do
+  defp paginated(ctx, fun, args, key, label, state, unimplemented \\ nil) do
     if exported?(ctx.module, fun, length(args)) do
       case Context.with_context(ctx.request_context, fn -> apply(ctx.module, fun, args) end) do
         {:ok, entries, next_cursor, new_state} ->
@@ -587,15 +597,31 @@ defmodule Arbor.MCP.Server.Dispatch do
           {:response, JSONRPC.response(ctx.id, result), new_state}
 
         {:error, reason, new_state} ->
-          {:response, error_response(ctx.id, label, reason), new_state}
+          list_error(ctx, label, reason, new_state, unimplemented)
 
         {:error, reason} ->
-          {:response, error_response(ctx.id, label, reason), state}
+          list_error(ctx, label, reason, state, unimplemented)
       end
     else
-      {:response, method_not_found(ctx.id, ctx.method), state}
+      if unimplemented,
+        do: unimplemented.(state),
+        else: {:response, method_not_found(ctx.id, ctx.method), state}
     end
   end
+
+  # The Handler defaults for lists a handler doesn't serve.
+  @unimplemented_lists [
+    "Resources not implemented",
+    "Resource templates not implemented",
+    "Prompts not implemented"
+  ]
+
+  defp list_error(_ctx, _label, reason, state, unimplemented)
+       when is_function(unimplemented, 1) and reason in @unimplemented_lists,
+       do: unimplemented.(state)
+
+  defp list_error(ctx, label, reason, state, _unimplemented),
+    do: {:response, error_response(ctx.id, label, reason), state}
 
   defp cursor(ctx), do: Map.get(ctx.params, "cursor")
 
@@ -722,14 +748,26 @@ defmodule Arbor.MCP.Server.Dispatch do
   # Tools, resources and prompts added with Server.add_tool/3 and its
   # siblings. Their entries come after the handler's, on its last page, and
   # replace handler entries with the same identifier.
-  defp with_registered(result, ctx, kind, key) do
+  defp registered_list(ctx, fun, args, key, label, state, kind) do
     case Registry.entries(Registry.current(), kind) do
-      [] -> result
-      entries -> merge_registered(result, ctx, entries, key)
+      [] ->
+        paginated(ctx, fun, args, key, label, state)
+
+      entries ->
+        # A handler that doesn't serve this list lists only the registered
+        # entries; any other error it returns stands.
+        only = fn state ->
+          result = %{key => Enum.map(entries, & &1.definition)}
+          {:response, JSONRPC.response(ctx.id, result), state}
+        end
+
+        ctx
+        |> paginated(fun, args, key, label, state, only)
+        |> merge_registered(entries, key)
     end
   end
 
-  defp merge_registered({:response, %{"result" => result} = response, state}, _ctx, entries, key) do
+  defp merge_registered({:response, %{"result" => result} = response, state}, entries, key) do
     ids = MapSet.new(entries, & &1.id)
 
     own =
@@ -742,12 +780,7 @@ defmodule Arbor.MCP.Server.Dispatch do
     {:response, %{response | "result" => Map.put(result, key, listed)}, state}
   end
 
-  # A handler without its own list callback answers with an error; the
-  # registered entries are then the whole list.
-  defp merge_registered({:response, %{"error" => _error}, state}, ctx, entries, key),
-    do: {:response, JSONRPC.response(ctx.id, %{key => Enum.map(entries, & &1.definition)}), state}
-
-  defp merge_registered(other, _ctx, _entries, _key), do: other
+  defp merge_registered(other, _entries, _key), do: other
 
   defp registered_id(%{"uriTemplate" => template}), do: template
   defp registered_id(%{"uri" => uri}), do: uri
