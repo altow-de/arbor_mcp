@@ -78,6 +78,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passed to a stdio transport, where it became the server's subprocess shutdown
   budget; set `:eof_grace` or `:cleanup_timeout` in the connection spec instead.
 
+### Fixed
+
+- **Security:** a client's `logging/setLevel` changed the host application's
+  global Logger level, because the default `handle_set_log_level/2` called
+  `Logger.configure/1`; any connected client could silence or flood the host's
+  logs. The level now applies only to that client's connection: the server
+  sends it `notifications/message` at that level or above, as the other MCP SDKs
+  do. Over legacy Streamable HTTP, sessions don't yet apply the level.
+
 ## [2.0.0-rc.5] — 2026-10-22
 
 ### Added

@@ -245,6 +245,11 @@ defmodule Arbor.MCP.Internal.Logging do
   @spec valid_levels() :: [mcp_log_level()]
   def valid_levels, do: @mcp_levels
 
+  @doc false
+  # Whether a message at `level` is as severe as `minimum` (RFC 5424 order).
+  @spec at_least?(mcp_log_level(), mcp_log_level()) :: boolean()
+  def at_least?(level, minimum), do: level_value(level) >= level_value(minimum)
+
   # Private helper functions
 
   # Converts log level to numeric value for comparison

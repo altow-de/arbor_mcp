@@ -1584,6 +1584,11 @@ feature (`logging/setLevel`, per-request log levels, and
 available throughout ArborMCP 1.x. New observability integrations should use
 stderr for stdio diagnostics or OpenTelemetry for structured telemetry.
 
+A client's `logging/setLevel` sets the minimum level for that client's own
+connection: the server then sends it only `notifications/message` at that level
+or above. It never changes the host's Logger configuration. Over legacy
+Streamable HTTP, sessions don't yet apply the level.
+
 For stdio servers, stdout must contain only JSON-RPC messages. ArborMCP 2.0
 preserves the host's Logger levels, handlers, filters and application settings
 during application startup and stdio connection. Configure every host log sink
