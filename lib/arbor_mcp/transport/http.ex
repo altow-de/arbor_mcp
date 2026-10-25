@@ -345,6 +345,9 @@ defmodule Arbor.MCP.Transport.HTTP do
             error
         end
 
+      {:error, reason, _state} ->
+        {:error, reason}
+
       {:error, reason} ->
         {:error, reason}
     end
@@ -359,6 +362,9 @@ defmodule Arbor.MCP.Transport.HTTP do
       {:ok, response, new_state} ->
         handle_http_response(response, new_state, message)
 
+      {:error, reason, _state} ->
+        {:error, reason}
+
       {:error, reason} ->
         {:error, reason}
     end
@@ -369,19 +375,27 @@ defmodule Arbor.MCP.Transport.HTTP do
       do: async_post(message, state)
 
   # SSE mode without active connection (pre-initialization) or fallback
-  def send_message(message, %__MODULE__{} = state), do: send_authenticated(message, state)
+  def send_message(message, %__MODULE__{} = state) do
+    case send_authenticated(message, state) do
+      {:error, reason, _state} -> {:error, reason}
+      result -> result
+    end
+  end
 
   @doc false
   # Sends `message` synchronously from the calling process, running any
   # authentication its response asks for. The client re-sends a request this
   # way when an async POST hands back an auth challenge, so only one
   # authentication runs at a time.
+  # An authentication failure returns the transport state too, so the
+  # provider's record of what it tried is kept.
   @spec send_authenticated(term(), t()) ::
-          {:ok, t()} | {:ok, t(), term()} | {:error, term()}
+          {:ok, t()} | {:ok, t(), term()} | {:error, term()} | {:error, term(), t()}
   def send_authenticated(message, %__MODULE__{} = state) do
     case perform_and_maybe_auth(message, state) do
       {:ok, response} -> handle_http_response(response, state, message)
       {:ok, response, new_state} -> handle_http_response(response, new_state, message)
+      {:error, reason, new_state} -> {:error, reason, new_state}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -523,8 +537,10 @@ defmodule Arbor.MCP.Transport.HTTP do
         new_state = state |> Map.put(:auth_provider_state, new_ps) |> apply_token_to_state(token)
         provider_retry_request(body, new_state)
 
-      {:error, reason, _ps} ->
-        {:error, reason}
+      # The provider's state records what it tried (its loop guards), so it
+      # survives the failure.
+      {:error, reason, ps} ->
+        {:error, reason, %{state | auth_provider_state: ps}}
     end
   end
 

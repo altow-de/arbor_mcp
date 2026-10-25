@@ -170,7 +170,9 @@ defmodule Arbor.MCP.Authorization.ProviderOAuthRefreshTest do
 
   # Discovery for https://mcp.example/mcp names `issuer` as its authorization
   # server. The metadata is served without the network.
-  defp discovery(issuer, prm? \\ true) do
+  # prm: :challenge serves the metadata at the URL the challenge names,
+  # :well_known only at the resource's well-known path, false nowhere.
+  defp discovery(issuer, prm \\ :challenge) do
     test_pid = self()
 
     client = fn uri, _address, _opts ->
@@ -178,7 +180,11 @@ defmodule Arbor.MCP.Authorization.ProviderOAuthRefreshTest do
 
       body =
         case {uri.host, uri.path} do
-          {"mcp.example", "/prm"} when prm? ->
+          {"mcp.example", "/prm"} when prm == :challenge ->
+            %{"authorization_servers" => [issuer]}
+
+          {"mcp.example", "/.well-known/oauth-protected-resource" <> _path}
+          when prm == :well_known ->
             %{"authorization_servers" => [issuer]}
 
           {_host, "/.well-known/" <> _kind} ->
@@ -316,6 +322,39 @@ defmodule Arbor.MCP.Authorization.ProviderOAuthRefreshTest do
     assert_received {:token_request, _first}
     assert_received {:token_request, _second}
     assert_received {:token_request, _third}
+  end
+
+  test "a stale metadata URL in the challenge falls back to the well-known metadata",
+       %{bypass: bypass} = context do
+    expect_refresh(bypass, {200, %{"access_token" => "new-token", "expires_in" => 3600}})
+    config = discovery("https://new-auth.example", :well_known)
+
+    assert {:ok, _token, refreshed} =
+             OAuth.handle_unauthorized(
+               @challenge,
+               [],
+               state(context.token_endpoint, auth_config: config)
+             )
+
+    # The challenge's /prm is gone, but the well-known metadata names a new
+    # server, so the full flow runs there instead of another refresh.
+    assert {:error, {:oauth_failed, _reason}, _state} =
+             OAuth.handle_unauthorized(@challenge, [], refreshed)
+
+    assert_received {:metadata_fetch, "new-auth.example", _path}
+  end
+
+  test "a flow that failed after a rejection isn't started again", context do
+    rejected =
+      state(context.token_endpoint,
+        access_token: nil,
+        auth_completed: false,
+        last_rejected_issuer: "https://auth.example",
+        refresh: nil
+      )
+
+    assert {:error, :auth_loop_detected, _state} =
+             OAuth.handle_unauthorized(@challenge, [], rejected)
   end
 
   test "a refresh that changes the granted scope files later tokens under it",

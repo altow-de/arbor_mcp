@@ -61,9 +61,9 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
     # A fingerprint of the access token a refresh after a 401 returned. Its
     # own rejection means refreshing didn't help.
     :rejection_refreshed,
-    # An authorization server the resource was found to have moved to. Its
-    # flow runs once, so a failed one doesn't start again with every 401.
-    :migration_issuer,
+    # Authorization servers the resource was found to have moved to. Each
+    # one's flow runs once, so failed ones don't start again with every 401.
+    migration_issuers: [],
     granted_scopes: [],
     auth_completed: false
   ]
@@ -102,8 +102,9 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
   def handle_unauthorized(www_authenticate, scopes, %__MODULE__{} = state) do
     with true <- refreshed_token_rejected?(state),
          {:ok, issuer} <- moved_to(www_authenticate, state) do
-      state = %{state | rejection_refreshed: nil, migration_issuer: issuer}
-      authenticate_again(www_authenticate, scopes, state)
+      tried = [issuer | state.migration_issuers]
+      state = %{state | rejection_refreshed: nil, migration_issuers: tried}
+      migrate(www_authenticate, scopes, state)
     else
       _not_moved ->
         case refresh(state) do
@@ -126,16 +127,32 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
   defp moved_to(www_authenticate, %{authorization_server_issuer: current} = state) do
     with {:ok, issuer} <- FullOAuthFlow.discover_issuer(flow_config(www_authenticate, [], state)),
          true <- is_binary(current) and Issuer.compare(issuer, current) != :ok,
-         true <-
-           is_nil(state.migration_issuer) or Issuer.compare(issuer, state.migration_issuer) != :ok do
+         false <- Enum.any?(state.migration_issuers, &(Issuer.compare(issuer, &1) == :ok)) do
       {:ok, issuer}
     end
   end
 
-  defp authenticate_again(www_authenticate, scopes, state) do
+  defp migrate(www_authenticate, scopes, state) do
     if state.auth_completed && state.access_token,
       do: reauthenticate_after_rejection(www_authenticate, scopes, state),
       else: do_authenticate(www_authenticate, scopes, state)
+  end
+
+  # A flow after a rejection that already failed (last_rejected_issuer) isn't
+  # started again on the next 401: that could open a browser every request.
+  # A first sign-in, or a migration to a newly found server, still runs.
+  defp authenticate_again(www_authenticate, scopes, state) do
+    cond do
+      state.auth_completed && state.access_token ->
+        reauthenticate_after_rejection(www_authenticate, scopes, state)
+
+      is_binary(state.last_rejected_issuer) ->
+        Logger.warning("Auth failed after a rejection; not retrying the flow")
+        {:error, :auth_loop_detected, state}
+
+      true ->
+        do_authenticate(www_authenticate, scopes, state)
+    end
   end
 
   defp expiring?(%{expires_at: expires_at, refresh: refresh}),

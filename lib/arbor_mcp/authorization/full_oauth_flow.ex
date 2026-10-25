@@ -89,10 +89,19 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlow do
   def discover_issuer(config) do
     fetch_opts = metadata_fetch_options(config)
 
+    # A stale resource_metadata URL in the challenge falls back to the
+    # resource's well-known metadata, as execute/1 does; never to a guess.
     prm =
       case extract_resource_metadata_url(config[:www_authenticate]) do
-        nil -> discover_prm_with_fallback(config.resource_url, fetch_opts)
-        url -> fetch_prm_directly(url, fetch_opts)
+        nil ->
+          discover_prm_with_fallback(config.resource_url, fetch_opts)
+
+        url ->
+          case fetch_prm_directly(url, fetch_opts) do
+            {:ok, _prm} = ok -> ok
+            {:error, {:metadata_fetch_error, _reason}} = error -> error
+            {:error, _reason} -> discover_prm_with_fallback(config.resource_url, fetch_opts)
+          end
       end
 
     with {:ok, prm} <- prm,

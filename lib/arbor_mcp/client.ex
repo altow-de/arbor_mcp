@@ -2518,6 +2518,10 @@ defmodule Arbor.MCP.Client do
       {:ok, transport} ->
         {:noreply, restore.(transport)}
 
+      {:error, reason, transport} ->
+        Logger.debug("Authenticated resend failed", reason: LogSummary.describe(reason))
+        {:noreply, fail_async_post_request(restore.(transport), request_id, reason, deadline)}
+
       {:error, reason} ->
         Logger.debug("Authenticated resend failed", reason: LogSummary.describe(reason))
         {:noreply, fail_async_post_request(state, request_id, reason, deadline)}
