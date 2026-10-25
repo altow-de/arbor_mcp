@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new `Arbor.MCP.Server.AuthInfo`, which leaves the token out of `inspect/1`. A
   host that authenticates requests in its own plug can attach one with
   `Arbor.MCP.HttpPlug.put_auth_info/2`.
+- Server middleware: the `:middleware` runtime option takes modules
+  implementing the new `Arbor.MCP.Server.Middleware`, which wrap every
+  request and notification dispatched to the handler, on every transport,
+  like Python's `MCPServer(middleware=[...])` and Go's
+  `AddReceivingMiddleware`. A middleware can refuse a request, rewrite its
+  params or change its result, and never sees the handler state.
 
 ### Changed
 

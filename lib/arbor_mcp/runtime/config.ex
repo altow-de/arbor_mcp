@@ -12,6 +12,7 @@ defmodule Arbor.MCP.Server.Runtime.Config do
             dispatcher: Arbor.MCP.Server.Dispatch,
             cancellation_tracker: nil,
             dispatch_opts: [],
+            middleware: [],
             services: nil,
             store_children: [],
             # Concurrent by default, like the other MCP SDKs. :stateful runs one
@@ -51,6 +52,7 @@ defmodule Arbor.MCP.Server.Runtime.Config do
          :ok <- validate_name(Keyword.get(opts, :name)),
          :ok <- validate_legacy_services(opts),
          :ok <- validate_handler(config),
+         {:ok, config} <- put_middleware(config),
          :ok <- validate_execution(config),
          :ok <- validate_limits(config),
          :ok <- validate_timers(config),
@@ -114,6 +116,20 @@ defmodule Arbor.MCP.Server.Runtime.Config do
        do: :ok
 
   defp validate_handler(_config), do: {:error, :handler_required}
+
+  # Dispatch reads the chain from its options, on every transport.
+  defp put_middleware(%{middleware: []} = config), do: {:ok, config}
+
+  defp put_middleware(config) do
+    with {:ok, middleware} <- Arbor.MCP.Server.Middleware.normalize(config.middleware) do
+      {:ok,
+       %{
+         config
+         | middleware: middleware,
+           dispatch_opts: Keyword.put(config.dispatch_opts, :middleware, middleware)
+       }}
+    end
+  end
 
   @default_max_concurrency 64
 

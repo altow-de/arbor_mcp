@@ -28,10 +28,12 @@ defmodule Arbor.MCP.Server.Dispatch do
   `-32601 Method not found`.
   """
 
+  require Logger
+
   alias Arbor.MCP.Error
   alias Arbor.MCP.Internal.MessageValidator
   alias Arbor.MCP.Protocol.{ErrorCodes, Initialize, Methods}
-  alias Arbor.MCP.Server.{Context, Discover, MRTR, RequestContext, ResultNormalizer}
+  alias Arbor.MCP.Server.{Context, Discover, Middleware, MRTR, RequestContext, ResultNormalizer}
   alias Arbor.MCP.Transport.HTTP.ToolHeaders
   alias Arbor.RPC.JSONRPC
 
@@ -105,9 +107,7 @@ defmodule Arbor.MCP.Server.Dispatch do
             dispatch_opts: opts
           }
 
-          method
-          |> do_dispatch(ctx, state)
-          |> normalize_protocol_result(request_context, handler_module)
+          run_middleware(ctx, state, Keyword.get(opts, :middleware, []))
         else
           {:error, reason} ->
             context_error_result(request, reason, state, opts)
@@ -116,6 +116,103 @@ defmodule Arbor.MCP.Server.Dispatch do
       {:error, reason} ->
         context_error_result(request, reason, state, opts)
     end
+  end
+
+  defp handle(ctx, state) do
+    ctx.method
+    |> do_dispatch(ctx, state)
+    |> normalize_protocol_result(ctx.request_context, ctx.module)
+  end
+
+  defp run_middleware(ctx, state, []), do: handle(ctx, state)
+
+  # The chain never sees the handler state: the innermost step threads it
+  # through the process dictionary, and remembers its last answer so a
+  # middleware that passes it through returns the dispatch result unchanged.
+  defp run_middleware(ctx, state, middleware) do
+    key = {Middleware, make_ref()}
+    Process.put(key, {state, nil})
+
+    inner = fn %{params: params} ->
+      {current, _last} = Process.get(key)
+      result = handle_params(ctx, params, current)
+      wire = wire_result(result)
+      Process.put(key, {result_state(result), {wire, result}})
+      wire
+    end
+
+    request = %{method: ctx.method, id: ctx.id, params: ctx.params, context: ctx.request_context}
+
+    try do
+      returned =
+        Context.with_context(ctx.request_context, fn ->
+          Middleware.run(middleware, request, inner)
+        end)
+
+      case Process.get(key) do
+        {_state, {^returned, result}} -> result
+        {current, _last} -> middleware_result(returned, ctx, current)
+      end
+    after
+      Process.delete(key)
+    end
+  end
+
+  defp handle_params(%{params: params} = ctx, params, state), do: handle(ctx, state)
+
+  defp handle_params(ctx, params, state) do
+    request =
+      if ctx.request?,
+        do: %{"id" => ctx.id, "method" => ctx.method},
+        else: %{"method" => ctx.method}
+
+    case MessageValidator.validate_method_params(ctx.method, params) do
+      :ok -> handle(%{ctx | params: params}, state)
+      {:error, error} -> parameter_error_result(request, error, state)
+    end
+  end
+
+  defp wire_result({:response, %{"result" => result}, _state}),
+    do: {:ok, ResultNormalizer.stringify_keys(result)}
+
+  defp wire_result({:response, %{"error" => error}, _state}),
+    do: {:error, ResultNormalizer.stringify_keys(error)}
+
+  defp wire_result({:notification, _state}), do: :noreply
+
+  defp result_state({:response, _response, state}), do: state
+  defp result_state({:notification, state}), do: state
+
+  defp middleware_result(_returned, %{request?: false}, state), do: {:notification, state}
+
+  defp middleware_result({:ok, result}, ctx, state) when is_map(result) do
+    {:response, %{"jsonrpc" => "2.0", "id" => ctx.id, "result" => result}, state}
+    |> normalize_protocol_result(ctx.request_context, ctx.module)
+  end
+
+  defp middleware_result({:error, %Error.ProtocolError{} = error}, ctx, state),
+    do: {:response, JSONRPC.error(ctx.id, Error.to_json_rpc(error)), state}
+
+  defp middleware_result({:error, %{} = error}, ctx, state) do
+    case json_rpc_error(error) do
+      %{"code" => code, "message" => message} = error
+      when is_integer(code) and is_binary(message) ->
+        {:response, JSONRPC.error(ctx.id, error), state}
+
+      _invalid ->
+        invalid_middleware_result(ctx, state)
+    end
+  end
+
+  defp middleware_result(_returned, ctx, state), do: invalid_middleware_result(ctx, state)
+
+  defp invalid_middleware_result(ctx, state) do
+    Logger.error("MCP middleware returned an invalid result", method: ctx.method)
+
+    {:response,
+     JSONRPC.error(ctx.id, ErrorCodes.internal_error(), "Internal error", %{
+       "type" => "invalid_middleware_result"
+     }), state}
   end
 
   defp context_error_result(request, %Error.ProtocolError{} = error, state, _opts) do
