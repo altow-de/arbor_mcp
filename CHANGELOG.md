@@ -13,9 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the TypeScript and Python SDKs do. Once `list_tools/2` has shown a tool
   with one, a successful result must carry `structuredContent` that
   conforms, or the call returns `{:error, %Arbor.MCP.Error.ValidationError{}}`.
-  `isError` results aren't checked, `validate_output: false` turns it off
-  for a call, and a `tools/list_changed` notification forgets the schemas
-  until tools are listed again.
+  Only complete results are checked, not `isError` ones, task handles or MRTR
+  rounds; a `null` `structuredContent` counts as present. `validate_output:
+  false` turns it off for a call. A first-page `tools/list` replaces the
+  recorded schemas, a new connection starts without any, and a
+  `tools/list_changed` notification forgets them until tools are listed
+  again.
 - DSL server options `instructions:`, `capabilities:` and `page_size:`.
   Instructions are returned by `initialize` and `server/discover`, and clients
   read them with the new `Arbor.MCP.Client.instructions/1`. Capabilities are
@@ -161,8 +164,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A notification sent before the answer to `initialize` or
   `server/discover`, such as a log message, was taken for the answer, and
-  the client failed to connect. It now waits for the answer, skipping up to
-  16 notifications within its deadline.
+  the client failed to connect. It now skips notifications until the answer
+  arrives or its deadline passes.
 - The client delivered `notifications/progress` and `notifications/message` to
   its handler only on modern HTTP request streams and dropped them on stdio,
   BEAM and legacy HTTP. `handle_progress/3` now receives progress on every

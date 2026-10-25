@@ -13,9 +13,6 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   alias Arbor.MCP.Reliability.Retry
   alias Arbor.MCP.Testing.MockTransport
 
-  # A notification that arrives before the initialize response, such as a
-  # log message or a list change, isn't the response; keep waiting for it.
-  @max_skipped_notifications 16
   alias Arbor.MCP.Transport.{HTTP, Local, ReliabilityWrapper, Stdio, Test}
   alias Arbor.MCP.Transport.HTTP.LegacySSE
   alias Arbor.RPC.LogSummary
@@ -751,8 +748,7 @@ defmodule Arbor.MCP.Client.ConnectionManager do
         case await_handshake_message(
                transport_mod,
                state_after_send,
-               deadline,
-               @max_skipped_notifications
+               deadline
              ) do
           {:ok, response_data, state_after_receive} ->
             response_data
@@ -815,13 +811,15 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   # mailbox) are called in-process with the timeout; transports with only the
   # blocking receive_message/1 are wrapped in a task that is shut down on
   # expiry. On timeout the connection attempt fails with :handshake_timeout.
-  defp await_handshake_message(transport_mod, transport_state, deadline, skips) do
+  # A server may send notifications, such as a log message or a list
+  # change, before it answers. They aren't the answer and say nothing about
+  # the protocol era, so keep waiting for one until the deadline.
+  defp await_handshake_message(transport_mod, transport_state, deadline) do
     case receive_handshake_message(transport_mod, transport_state, Deadline.remaining(deadline)) do
       {:ok, message, new_state} ->
-        if skips > 0 and
-             match?({:notification, _method, _params}, Protocol.parse_message(message)),
-           do: await_handshake_message(transport_mod, new_state, deadline, skips - 1),
-           else: {:ok, message, new_state}
+        if match?({:notification, _method, _params}, Protocol.parse_message(message)),
+          do: await_handshake_message(transport_mod, new_state, deadline),
+          else: {:ok, message, new_state}
 
       error ->
         error

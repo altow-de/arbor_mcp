@@ -1396,7 +1396,13 @@ defmodule Arbor.MCP.Client do
           %{transport: updated_state.transport_mod}
         )
 
-        final_state = %{updated_state | connection_status: :ready, initialized: true}
+        final_state = %{
+          updated_state
+          | connection_status: :ready,
+            initialized: true,
+            tool_output_schemas: %{}
+        }
+
         {:ok, schedule_next_health_check(final_state)}
 
       {:error, reason} ->
@@ -3262,7 +3268,9 @@ defmodule Arbor.MCP.Client do
               initialized: true,
               reconnect_attempts: 0,
               cleanup_result: :ok,
-              health_check_id: nil
+              health_check_id: nil,
+              # A new connection may be to a changed server.
+              tool_output_schemas: %{}
           })
 
         notify_subscription_processes(reconnected_state, :client_subscription_reconnect)

@@ -137,6 +137,8 @@ defmodule Arbor.MCP.Client.Operations.Tools do
   # client's other responses.
   defp validate_output({:ok, response} = result, client, tool_name, opts) do
     with true <- Keyword.get(opts, :validate_output, true),
+         # A task handle or an MRTR round isn't the tool's result yet.
+         true <- complete_result?(response),
          false <- error_result?(response),
          schema when is_map(schema) <- output_schema(client, tool_name) do
       check_structured(structured_content(response), schema, tool_name, result)
@@ -160,13 +162,31 @@ defmodule Arbor.MCP.Client.Operations.Tools do
     :exit, _reason -> nil
   end
 
+  defp complete_result?(%Response{resultType: type}), do: type in [nil, "complete"]
+  defp complete_result?(%{} = response), do: Map.get(response, "resultType") in [nil, "complete"]
+
   defp error_result?(%Response{is_error: is_error}), do: is_error == true
   defp error_result?(%{} = response), do: Map.get(response, "isError") == true
 
-  defp structured_content(%Response{structuredOutput: content}), do: content
-  defp structured_content(%{} = response), do: Map.get(response, "structuredContent")
+  # Present, even as null, is checked against the schema; absent isn't.
+  defp structured_content(%Response{wire_keys: keys, structuredOutput: content})
+       when is_list(keys) do
+    if "structuredContent" in keys or "structuredOutput" in keys,
+      do: {:ok, content},
+      else: :missing
+  end
 
-  defp check_structured(nil, _schema, tool_name, _result) do
+  defp structured_content(%Response{structuredOutput: nil}), do: :missing
+  defp structured_content(%Response{structuredOutput: content}), do: {:ok, content}
+
+  defp structured_content(%{} = response) do
+    case Map.fetch(response, "structuredContent") do
+      {:ok, content} -> {:ok, content}
+      :error -> :missing
+    end
+  end
+
+  defp check_structured(:missing, _schema, tool_name, _result) do
     {:error,
      Error.validation_error(
        :structured_content,
@@ -175,7 +195,7 @@ defmodule Arbor.MCP.Client.Operations.Tools do
      )}
   end
 
-  defp check_structured(content, schema, tool_name, result) do
+  defp check_structured({:ok, content}, schema, tool_name, result) do
     case SchemaPolicy.validate(content, schema) do
       :ok ->
         result

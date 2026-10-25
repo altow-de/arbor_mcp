@@ -31,7 +31,8 @@ defmodule Arbor.MCP.Client.EstablishNotificationsTest do
         "params" => %{"level" => "info", "data" => "starting"}
       }
 
-      send(self(), {:chatty, Jason.encode!(log)})
+      # More than any fixed limit would allow.
+      for _n <- 1..20, do: send(self(), {:chatty, Jason.encode!(log)})
 
       send(
         self(),

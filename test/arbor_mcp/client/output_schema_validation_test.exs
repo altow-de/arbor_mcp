@@ -34,6 +34,21 @@ defmodule Arbor.MCP.Client.OutputSchemaValidationTest do
     def handle_call_tool(_name, %{"reply" => reply}, state), do: {:ok, reply, state}
   end
 
+  # Lists the tools a test puts in its persistent term, so a listing can change.
+  defmodule ChangingHandler do
+    @moduledoc false
+    use Arbor.MCP.Server.Handler
+
+    @impl true
+    def init(opts), do: {:ok, %{key: Keyword.fetch!(opts, :key)}}
+
+    @impl true
+    def handle_list_tools(_cursor, state), do: {:ok, :persistent_term.get(state.key), nil, state}
+
+    @impl true
+    def handle_call_tool(_name, %{"reply" => reply}, state), do: {:ok, reply, state}
+  end
+
   setup do
     {:ok, server} = Server.start_link(transport: :test, handler: Handler)
 
@@ -88,6 +103,54 @@ defmodule Arbor.MCP.Client.OutputSchemaValidationTest do
 
     assert {:ok, _} =
              Client.call_tool(client, "plain", %{"reply" => @invalid}, format: :map)
+  end
+
+  # Legacy revisions require an object; 2026-07-28 allows any value.
+  test "a present null structuredContent is checked against the schema", %{server: server} do
+    {:ok, client} =
+      Client.start_link(
+        transport: :test,
+        server: server,
+        protocol_mode: :modern_only,
+        health_check_interval: nil
+      )
+
+    assert {:ok, _} = Client.list_tools(client)
+
+    assert {:error, %ValidationError{reason: reason}} =
+             call(client, %{"content" => [], "structuredContent" => nil})
+
+    assert reason =~ "doesn't match"
+  end
+
+  test "a fresh listing replaces the schemas an earlier one recorded" do
+    key = {__MODULE__, make_ref()}
+    schema = %{"type" => "object", "properties" => %{"n" => %{"type" => "integer"}}}
+
+    :persistent_term.put(key, [
+      %{name: "count", inputSchema: %{type: "object"}, outputSchema: schema}
+    ])
+
+    on_exit(fn -> :persistent_term.erase(key) end)
+
+    {:ok, server} =
+      Server.start_link(transport: :test, handler: ChangingHandler, handler_args: [key: key])
+
+    {:ok, client} =
+      Client.start_link(
+        transport: :test,
+        server: server,
+        protocol_mode: :legacy_only,
+        health_check_interval: nil
+      )
+
+    assert {:ok, _} = Client.list_tools(client)
+    assert {:error, %ValidationError{}} = call(client, @invalid)
+
+    # The tool no longer declares an outputSchema.
+    :persistent_term.put(key, [%{name: "count", inputSchema: %{type: "object"}}])
+    assert {:ok, _} = Client.list_tools(client)
+    assert {:ok, _} = call(client, @invalid)
   end
 
   test "a tools list change forgets the schemas until tools are listed again",
