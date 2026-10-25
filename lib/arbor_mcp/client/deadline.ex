@@ -3,8 +3,9 @@ defmodule Arbor.MCP.Client.Deadline do
   # Absolute deadlines in monotonic milliseconds, and the transports that can
   # hold one. `nil` means "no deadline".
 
+  alias Arbor.MCP.Client.ConnectionManager
   alias Arbor.MCP.Testing.MockTransport
-  alias Arbor.MCP.Transport.{HTTP, ReliabilityWrapper}
+  alias Arbor.MCP.Transport.{HTTP, ReliabilityWrapper, Stdio}
   alias Arbor.MCP.Transport.HTTP.LegacySSE
 
   @type t :: integer() | nil
@@ -17,6 +18,32 @@ defmodule Arbor.MCP.Client.Deadline do
 
   @spec cleanup_timeout() :: pos_integer()
   def cleanup_timeout, do: @cleanup_timeout
+
+  @doc """
+  Cleanup budget for a client built from `opts`: `cleanup_timeout/0`, or longer
+  when a stdio server's shutdown (EOF grace, TERM, KILL) needs more.
+  """
+  @spec cleanup_timeout(keyword()) :: pos_integer()
+  def cleanup_timeout(opts) do
+    case ConnectionManager.prepare_transport_config(opts) do
+      {:ok, config} ->
+        config
+        |> Keyword.get(:transports, [])
+        |> Enum.map(&close_budget/1)
+        |> Enum.max(fn -> 0 end)
+        |> max(@cleanup_timeout)
+
+      _error ->
+        @cleanup_timeout
+    end
+  rescue
+    _error in [ArgumentError, FunctionClauseError, Protocol.UndefinedError] -> @cleanup_timeout
+  end
+
+  defp close_budget({Stdio, transport_opts}) when is_list(transport_opts),
+    do: Stdio.close_budget(transport_opts) || 0
+
+  defp close_budget(_transport), do: 0
 
   @doc "`transport_state` capped for cleanup: see `cleanup_timeout/0`."
   @spec for_cleanup(module() | nil, term()) :: term()

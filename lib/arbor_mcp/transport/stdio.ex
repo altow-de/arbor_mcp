@@ -22,6 +22,12 @@ defmodule Arbor.MCP.Transport.Stdio do
   - `:process_group` - when `true`, stopping the server signals its whole
     process group rather than the one process the port started (default:
     `false`). See "Process groups" below.
+  - `:eof_grace` - milliseconds a server gets to exit after its stdin closes
+    before it is sent SIGTERM (default: 2_000, as in the MCP reference SDKs)
+  - `:term_grace` - milliseconds between SIGTERM and SIGKILL (default: 100)
+  - `:cleanup_timeout` - the whole shutdown budget (default:
+    `eof_grace + term_grace + 400`). When only this is set, `:eof_grace`
+    shrinks to fit it. The client's close limit grows to cover it.
 
   The command is resolved against the `PATH` the child will see (an explicit
   `PATH` in `:env`, else the inherited one), not the VM's own. When the VM
@@ -31,8 +37,12 @@ defmodule Arbor.MCP.Transport.Stdio do
 
   ## Process groups
 
+  `close/1` follows the MCP stdio shutdown order: it closes the server's stdin,
+  waits up to `:eof_grace` for it to exit, then sends SIGTERM and, after
+  `:term_grace`, SIGKILL. A server that exits on EOF is never signalled.
+
   Shared cleanup verifies that the owned child leads its process group. By
-  default `close/1` sends SIGTERM, then SIGKILL, to that one process. Processes
+  default those signals go to that one process. Processes
   the server started (a launcher's or shell script's children) can outlive
   the connection when group cleanup is disabled.
   With `process_group: true`, `close/1` signals the whole group instead, and
@@ -59,6 +69,10 @@ defmodule Arbor.MCP.Transport.Stdio do
   alias Arbor.RPC.{FramedStream, LogSummary, PortEnvironment, StdioFraming, Subprocess}
 
   @default_max_frame_bytes 1_048_576
+  # The MCP reference SDKs give a server about 2 s to exit after stdin closes.
+  @eof_grace 2_000
+  @term_grace 100
+  @shutdown_slack 400
   defstruct [
     :subprocess,
     :os_pid,
@@ -79,6 +93,7 @@ defmodule Arbor.MCP.Transport.Stdio do
 
       child_opts =
         opts
+        |> shutdown_options()
         |> Keyword.put(:max_frame_bytes, limit)
         |> Keyword.put_new(:max_write_bytes, limit + 1)
 
@@ -105,6 +120,42 @@ defmodule Arbor.MCP.Transport.Stdio do
         {:error, reason} ->
           Error.connection_error(reason)
       end
+    end
+  end
+
+  @doc false
+  # Subprocess shutdown options for an MCP server. Explicit values win; a
+  # caller-chosen budget keeps whatever EOF grace still fits inside it.
+  def shutdown_options(opts) do
+    term_grace = Keyword.get(opts, :term_grace, @term_grace)
+
+    case {Keyword.fetch(opts, :eof_grace), Keyword.fetch(opts, :cleanup_timeout)} do
+      _ when not is_integer(term_grace) ->
+        opts
+
+      {:error, :error} ->
+        opts
+        |> Keyword.put(:eof_grace, @eof_grace)
+        |> Keyword.put(:cleanup_timeout, @eof_grace + term_grace + @shutdown_slack)
+
+      {{:ok, eof_grace}, :error} when is_integer(eof_grace) ->
+        Keyword.put(opts, :cleanup_timeout, eof_grace + term_grace + @shutdown_slack)
+
+      {:error, {:ok, budget}} when is_integer(budget) ->
+        Keyword.put(opts, :eof_grace, min(@eof_grace, max(0, budget - term_grace - 50)))
+
+      _explicit_or_invalid ->
+        opts
+    end
+  end
+
+  @doc false
+  # How long the client must allow `close/1`: the subprocess budget plus the
+  # helper's reply allowance.
+  def close_budget(opts) do
+    case Keyword.get(shutdown_options(opts), :cleanup_timeout) do
+      budget when is_integer(budget) and budget > 0 -> budget + 500
+      _invalid -> nil
     end
   end
 

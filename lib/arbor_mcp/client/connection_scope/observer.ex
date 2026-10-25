@@ -65,20 +65,20 @@ defmodule Arbor.MCP.Client.ConnectionScope.Observer do
     monitor = Process.monitor(observer)
     result = ClientConnection.start_scoped(opts, scope, deadline)
     send(observer, {:native_result, self(), result})
-    guardian_loop(observer, monitor, result)
+    guardian_loop(observer, monitor, result, Ref.cleanup_ms(scope))
   end
 
-  defp guardian_loop(observer, monitor, result) do
+  defp guardian_loop(observer, monitor, result, cleanup_ms) do
     receive do
       {:cleanup, deadline} ->
         cleanup = cleanup_client(result, deadline)
         send(observer, {:cleanup_result, self(), cleanup})
 
       {:DOWN, ^monitor, :process, ^observer, _reason} ->
-        cleanup_client(result, Deadline.after_ms(1_000))
+        cleanup_client(result, Deadline.after_ms(cleanup_ms))
 
       {:EXIT, _pid, _reason} ->
-        guardian_loop(observer, monitor, result)
+        guardian_loop(observer, monitor, result, cleanup_ms)
     end
   end
 
