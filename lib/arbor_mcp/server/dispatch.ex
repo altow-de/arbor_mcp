@@ -703,6 +703,11 @@ defmodule Arbor.MCP.Server.Dispatch do
 
   defp validate_http_initialize(_ctx, result, _state), do: result
 
+  # The tool's x-mcp-header annotations may be on any page of tools/list, so
+  # follow the cursors until it turns up. A list that runs past the bound
+  # fails closed rather than skipping the header check.
+  @max_tool_pages 100
+
   defp validate_tool_headers(
          %{request_context: %{era: :modern}, dispatch_opts: opts},
          name,
@@ -723,19 +728,11 @@ defmodule Arbor.MCP.Server.Dispatch do
          :error
        ) do
     if Keyword.has_key?(opts, :request_headers) do
-      tools =
-        Context.with_context(ctx.request_context, fn ->
-          ctx.module.handle_list_tools(nil, state)
-        end)
+      case listed_tool(ctx, name, nil, state, @max_tool_pages) do
+        {:ok, tools, next_state} ->
+          validate_tool_header_entries(tools, name, arguments, opts, next_state)
 
-      case tools do
-        {:ok, entries, _cursor, next_state} when is_list(entries) ->
-          validate_tool_header_entries(entries, name, arguments, opts, next_state)
-
-        {:ok, entries, next_state} when is_list(entries) ->
-          validate_tool_header_entries(entries, name, arguments, opts, next_state)
-
-        _unavailable ->
+        :unavailable ->
           {:error, "Tool schema unavailable"}
       end
     else
@@ -744,6 +741,31 @@ defmodule Arbor.MCP.Server.Dispatch do
   end
 
   defp validate_tool_headers(_ctx, _name, _arguments, state, _registered), do: {:ok, state}
+
+  defp listed_tool(_ctx, _name, _cursor, _state, 0), do: :unavailable
+
+  defp listed_tool(ctx, name, cursor, state, pages) do
+    page =
+      Context.with_context(ctx.request_context, fn ->
+        ctx.module.handle_list_tools(cursor, state)
+      end)
+
+    case page do
+      {:ok, entries, next, next_state} when is_list(entries) ->
+        if is_binary(next) and not listed?(entries, name),
+          do: listed_tool(ctx, name, next, next_state, pages - 1),
+          else: {:ok, entries, next_state}
+
+      {:ok, entries, next_state} when is_list(entries) ->
+        {:ok, entries, next_state}
+
+      _unavailable ->
+        :unavailable
+    end
+  end
+
+  defp listed?(entries, name),
+    do: Enum.any?(ResultNormalizer.stringify_keys(entries), &(&1["name"] == name))
 
   # Tools, resources and prompts added with Server.add_tool/3 and its
   # siblings. Their entries come after the handler's, on its last page, and

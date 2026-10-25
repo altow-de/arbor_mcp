@@ -206,7 +206,9 @@ end
 `Context.request_id/0`, `Context.session_id/0`, `Context.auth_info/0` and
 `Context.request_headers/0` describe the request itself, like the `extra`
 argument of TypeScript SDK handlers. `session_id/0` is the legacy
-`Mcp-Session-Id` and `nil` for stateless modern requests. With
+`Mcp-Session-Id` and `nil` for stateless modern requests. The headers come
+as received, `authorization` and `cookie` included, so don't log them whole;
+`inspect(Context.current())` leaves them out. With
 `oauth_enabled: true`, `auth_info/0` is the validated bearer token as an
 `Arbor.MCP.Server.AuthInfo` (client id, subject, scopes, expiry, audience and
 claims). If your pipeline authenticates requests itself, attach the result in

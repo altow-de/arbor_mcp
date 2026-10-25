@@ -130,6 +130,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A modern `tools/call` checked its `Mcp-Param-*` headers against the first
+  `tools/list` page only, so a tool on a later page of a paginated list
+  skipped the check. The server now follows the cursors until it finds the
+  tool, for up to 100 pages, and fails the request closed past that.
 - `Server.notify_tools_changed/1` and the other change notifications,
   `Server.call/3` and `Server.cast/2` crashed an HTTP runtime when called
   outside a request: with no edge process to send through, they messaged the

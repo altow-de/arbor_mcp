@@ -121,6 +121,10 @@ defmodule Arbor.MCP.Server.Context do
   @doc """
   Returns the HTTP request headers as `{lowercase_name, value}` pairs, as in
   `Plug.Conn.req_headers`, or `nil` for stdio and BEAM requests.
+
+  They are the headers as received, including `authorization` and `cookie`,
+  so don't log them whole. `inspect(Context.current())` leaves them out; use
+  `auth_info/0` for the validated token.
   """
   @spec request_headers() :: [{String.t(), String.t()}] | nil
   def request_headers, do: field(:request_headers)
