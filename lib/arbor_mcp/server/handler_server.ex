@@ -52,7 +52,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
 
   alias Arbor.MCP.Error.ProtocolError
   alias Arbor.MCP.Internal.{MessageValidator, VersionRegistry}
-  alias Arbor.MCP.Protocol.ErrorCodes
+  alias Arbor.MCP.Protocol.{ErrorCodes, Methods}
   alias Arbor.RPC.{JSONRPC, LogSummary}
 
   alias Arbor.MCP.Server.{
@@ -328,6 +328,8 @@ defmodule Arbor.MCP.Server.HandlerServer do
           require_replay_protection: Keyword.get(opts, :require_replay_protection, false),
           pending_requests: %{},
           pending_timers: %{},
+          # Monitors of the callbacks waiting on server-to-client requests.
+          reverse_monitors: %{},
           max_reverse_requests: Keyword.get(opts, :max_control_queue, 32),
           invocations: %{},
           ingress: %{},
@@ -420,6 +422,21 @@ defmodule Arbor.MCP.Server.HandlerServer do
       _ ->
         RuntimeIngress.discard_ingress(state.runtime, token)
         {:noreply, %{state | ingress: Map.delete(state.ingress, token)}}
+    end
+  end
+
+  def handle_info({:DOWN, monitor, :process, _worker, _reason}, state)
+      when is_map_key(:erlang.map_get(:reverse_monitors, state), monitor) do
+    {id, monitors} = Map.pop(state.reverse_monitors, monitor)
+    state = %{state | reverse_monitors: monitors}
+
+    case Map.get(state.pending_requests, id) do
+      {from, :server_request} ->
+        GenServer.reply(from, {:error, :request_cancelled})
+        {:noreply, drop_reverse(id, state)}
+
+      _settled ->
+        {:noreply, state}
     end
   end
 
@@ -768,6 +785,41 @@ defmodule Arbor.MCP.Server.HandlerServer do
           false
       end
   end
+
+  defp legacy_control("elicitation/create", params, timeout), do: {:elicit, params, timeout}
+
+  defp legacy_control("sampling/createMessage", params, timeout),
+    do: {:create_message, params, timeout}
+
+  defp legacy_control("roots/list", _params, timeout), do: {:list_roots, timeout}
+
+  @input_capabilities %{
+    "elicitation/create" => "elicitation",
+    "sampling/createMessage" => "sampling",
+    "roots/list" => "roots"
+  }
+
+  # Unknown when the client never sent initialize capabilities.
+  defp client_capable?(_method, nil), do: true
+
+  defp client_capable?(method, capabilities) when is_map(capabilities),
+    do: Map.has_key?(capabilities, Map.fetch!(@input_capabilities, method))
+
+  # A callback cancelled while it waits for the client leaves nobody to
+  # answer, so its request is dropped then, not when its timeout ends.
+  defp watch_requester({_edge, {:runtime_edge_reply, token}}, id, state) do
+    # The edge-control request was submitted by the callback's own worker.
+    case Admission.current(Ref.table(state.runtime), token) do
+      {:ok, %{caller: worker}} when is_pid(worker) and worker != self() ->
+        monitors = Map.put(Map.get(state, :reverse_monitors, %{}), Process.monitor(worker), id)
+        Map.put(state, :reverse_monitors, monitors)
+
+      _untracked ->
+        state
+    end
+  end
+
+  defp watch_requester(_from, _id, state), do: state
 
   defp drop_reverse(id, state) do
     if timer = state.pending_timers[id], do: Process.cancel_timer(timer)
@@ -1336,6 +1388,20 @@ defmodule Arbor.MCP.Server.HandlerServer do
   def handle_call({:create_message, params}, from, state),
     do: reverse_request("sampling/createMessage", params, 5_000, from, state)
 
+  # A handler's MRTR input request, sent to a legacy client (see Dispatch).
+  def handle_call({:legacy_input, method, params, timeout}, from, state) do
+    cond do
+      is_binary(state.protocol_version) and not Methods.available?(method, state.protocol_version) ->
+        {:reply, {:error, {:method_unavailable, method, state.protocol_version}}, state}
+
+      not client_capable?(method, Map.get(state, :client_capabilities)) ->
+        {:reply, {:error, {:client_capability_missing, method}}, state}
+
+      true ->
+        handle_call(legacy_control(method, params, timeout), from, state)
+    end
+  end
+
   def handle_call({:create_message, params, timeout}, from, state)
       when is_integer(timeout) and timeout > 0 and timeout <= 4_294_967_295,
       do: reverse_request("sampling/createMessage", params, timeout, from, state)
@@ -1483,12 +1549,13 @@ defmodule Arbor.MCP.Server.HandlerServer do
         {:ok, state} ->
           timer = Process.send_after(self(), {:request_timeout, id}, timeout)
 
-          {:noreply,
-           %{
-             state
-             | pending_requests: Map.put(state.pending_requests, id, {from, :server_request}),
-               pending_timers: Map.put(state.pending_timers, id, timer)
-           }}
+          state = %{
+            state
+            | pending_requests: Map.put(state.pending_requests, id, {from, :server_request}),
+              pending_timers: Map.put(state.pending_timers, id, timer)
+          }
+
+          {:noreply, watch_requester(from, id, state)}
 
         {:error, reason} ->
           {:reply, {:error, reason}, state}
@@ -1695,7 +1762,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
   # Runs the shared dispatcher against the handler module and folds the new
   # handler state back into the server state.
   defp dispatch(request, state) do
-    state = maybe_pin_connection_era(request, state)
+    state = request |> maybe_pin_connection_era(state) |> remember_client_capabilities(request)
 
     dispatch_opts = [
       protocol_mode: effective_protocol_mode(state),
@@ -1751,6 +1818,16 @@ defmodule Arbor.MCP.Server.HandlerServer do
   end
 
   defp maybe_pin_connection_era(_request, state), do: state
+
+  defp remember_client_capabilities(state, %{"method" => "initialize", "params" => params})
+       when is_map(params) do
+    case Map.get(params, "capabilities") do
+      %{} = capabilities -> Map.put(state, :client_capabilities, capabilities)
+      _none -> state
+    end
+  end
+
+  defp remember_client_capabilities(state, _request), do: state
 
   defp pin_candidate(%RequestContext{era: :modern}), do: :modern
   defp pin_candidate(%RequestContext{era: :legacy, method: "initialize"}), do: :legacy

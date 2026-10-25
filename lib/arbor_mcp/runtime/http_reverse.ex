@@ -248,6 +248,15 @@ defmodule Arbor.MCP.Server.Runtime.HTTPReverse do
   defp request({:create_message, params, _timeout}, _deadline) when is_map(params),
     do: {:ok, "sampling/createMessage", params}
 
+  defp request({:legacy_input, "elicitation/create", params, timeout}, deadline),
+    do: request({:elicit, params, timeout}, deadline)
+
+  defp request({:legacy_input, "sampling/createMessage", params, timeout}, deadline),
+    do: request({:create_message, params, timeout}, deadline)
+
+  defp request({:legacy_input, "roots/list", _params, timeout}, deadline),
+    do: request({:list_roots, timeout}, deadline)
+
   defp request({:elicit, params, _timeout}, deadline) do
     with {:ok, normalized} <- Arbor.MCP.Protocol.Elicitation.validate(params, deadline),
          do: {:ok, "elicitation/create", normalized}

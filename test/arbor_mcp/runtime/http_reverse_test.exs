@@ -117,6 +117,28 @@ defmodule Arbor.MCP.Server.Runtime.HTTPReverseTest do
       {:ok, %{"content" => []}, %{state | calls: state.calls + 1}}
     end
 
+    # An MRTR handler: a legacy HTTP client gets its input request as a
+    # server-to-client request on the session stream.
+    def handle_call_tool("bridge", _args, state) do
+      case Arbor.MCP.Server.Context.input_responses() do
+        nil ->
+          request = %{
+            "method" => "elicitation/create",
+            "params" => %{
+              "message" => "Choose",
+              "requestedSchema" => %{"type" => "object", "properties" => %{}}
+            }
+          }
+
+          send(state.observer, {:reverse_worker, self()})
+          {:input_required, %{"pick" => request}, state}
+
+        responses ->
+          send(state.observer, {:bridge_answer, responses})
+          {:ok, %{"content" => []}, state}
+      end
+    end
+
     def handle_call_tool("reverse", %{"control" => control} = args, state) do
       send(state.observer, {:reverse_worker, self()})
 
@@ -576,6 +598,19 @@ defmodule Arbor.MCP.Server.Runtime.HTTPReverseTest do
       assert %{status: 200} = Task.await(caller)
       eventually(fn -> if Runtime.stats!(runtime).reserved == 0, do: :ok end)
     end
+  end
+
+  test "an MRTR input request reaches a legacy HTTP client on its session stream" do
+    {runtime, opts} = host()
+    {id, sessions, lease} = initialize(runtime, opts)
+    live_get(runtime, lease)
+
+    caller = Task.async(fn -> post(opts, id, tool(2, "bridge")) end)
+    assert_receive {:reverse_worker, _worker}
+    request = reverse_request(sessions, lease, "elicitation/create")
+    assert %{status: 202} = post(opts, id, response(request["id"], %{"action" => "accept"}))
+    assert_receive {:bridge_answer, %{"pick" => %{"action" => "accept"}}}
+    assert %{status: 200} = Task.await(caller)
   end
 
   test "invalid elicitation schema and timeout never append a reverse effect" do

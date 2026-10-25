@@ -16,7 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sampling or roots), then calls the callback again with the answers in
   `Server.Context.input_responses/0` and its state in
   `Context.request_state/0`, as the TypeScript, Go and C# SDKs do. A callback
-  may ask up to 10 times.
+  may ask up to 10 times. A request the connection's negotiated revision
+  doesn't define, or that the client didn't declare the capability for, fails
+  the call instead of being sent, and a cancelled call's pending request is
+  dropped. A stateless callback must return its snapshot every round.
 - DSL server options `instructions:`, `capabilities:` and `page_size:`.
   Instructions are returned by `initialize` and `server/discover`, and clients
   read them with the new `Arbor.MCP.Client.instructions/1`. Capabilities are
@@ -158,6 +161,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The client sent `"capabilities": {}` in a legacy `initialize`, whatever its
+  `:capabilities` option said, so a server that respects declared
+  capabilities never sent it elicitation, sampling or roots requests. It now
+  sends the configured capabilities, as a modern client does with each
+  request.
 - The client delivered `notifications/progress` and `notifications/message` to
   its handler only on modern HTTP request streams and dropped them on stdio,
   BEAM and legacy HTTP. `handle_progress/3` now receives progress on every

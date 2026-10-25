@@ -53,6 +53,7 @@ defmodule Arbor.MCP.Server.Runtime.Config do
          :ok <- validate_legacy_services(opts),
          :ok <- validate_handler(config),
          {:ok, config} <- put_middleware(config),
+         config = put_execution(config),
          :ok <- validate_execution(config),
          :ok <- validate_limits(config),
          :ok <- validate_timers(config),
@@ -116,6 +117,11 @@ defmodule Arbor.MCP.Server.Runtime.Config do
        do: :ok
 
   defp validate_handler(_config), do: {:error, :handler_required}
+
+  # The legacy input bridge runs a callback several times and must hold a
+  # stateless one to its snapshot between runs.
+  defp put_execution(config),
+    do: %{config | dispatch_opts: Keyword.put(config.dispatch_opts, :execution, config.execution)}
 
   # Dispatch reads the chain from its options, on every transport.
   defp put_middleware(%{middleware: []} = config), do: {:ok, config}

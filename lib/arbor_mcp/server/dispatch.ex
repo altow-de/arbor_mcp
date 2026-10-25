@@ -119,7 +119,8 @@ defmodule Arbor.MCP.Server.Dispatch do
             request?: Map.has_key?(request, "id"),
             request_context: request_context,
             module: handler_module,
-            dispatch_opts: opts
+            dispatch_opts: opts,
+            snapshot: state
           }
 
           run_middleware(ctx, state, Keyword.get(opts, :middleware, []))
@@ -643,9 +644,13 @@ defmodule Arbor.MCP.Server.Dispatch do
     round = (request_context.mrtr_round || 0) + 1
 
     with :ok <- legacy_round(round),
+         :ok <- snapshot_kept(ctx, state),
          {:ok, requests} <-
            MRTR.legacy_input_requests(request_context, input_requests, ctx.dispatch_opts),
-         {:ok, responses} <- legacy_inputs(requests) do
+         # Sent from inside the request's context: over legacy HTTP it names
+         # the session stream the requests go out on.
+         {:ok, responses} <-
+           Context.with_context(request_context, fn -> legacy_inputs(requests, ctx) end) do
       request_context = %{
         request_context
         | input_responses: responses,
@@ -655,6 +660,12 @@ defmodule Arbor.MCP.Server.Dispatch do
 
       do_dispatch(ctx.method, %{ctx | request_context: request_context}, state)
     else
+      {:error, :invalid_handler_state} ->
+        {:response,
+         JSONRPC.error(ctx.id, ErrorCodes.internal_error(), "Internal error", %{
+           "type" => "invalid_handler_state"
+         }), ctx.snapshot}
+
       {:error, reason} ->
         {:response, error_response(ctx.id, "Input request error", reason), state}
     end
@@ -673,6 +684,16 @@ defmodule Arbor.MCP.Server.Dispatch do
     end
   end
 
+  # A stateless callback must return its snapshot every time, not only after
+  # its last round; a changed state would otherwise reach the next round.
+  defp snapshot_kept(%{dispatch_opts: opts, snapshot: snapshot}, state) do
+    if Keyword.get(opts, :execution) == :stateless and state !== snapshot,
+      do: {:error, :invalid_handler_state},
+      else: :ok
+  end
+
+  defp snapshot_kept(_ctx, _state), do: :ok
+
   defp legacy_round(round) when round <= @max_legacy_input_rounds, do: :ok
 
   defp legacy_round(_round),
@@ -684,17 +705,32 @@ defmodule Arbor.MCP.Server.Dispatch do
        )}
 
   # In order, each under what is left of the request's deadline.
-  defp legacy_inputs(requests) do
+  defp legacy_inputs(requests, ctx) do
+    # Over HTTP the session's negotiated revision must define the method;
+    # BEAM and stdio connections check that, and the client's capabilities,
+    # at the edge.
+    version = Keyword.get(ctx.dispatch_opts, :http_expected_protocol_version)
+
     requests
     |> Enum.sort_by(fn {id, _request} -> id end)
     |> Enum.reduce_while({:ok, %{}}, fn {id, %{"method" => method, "params" => params}},
                                         {:ok, responses} ->
-      case Arbor.MCP.Server.legacy_input(method, params, input_timeout()) do
-        {:ok, result} -> {:cont, {:ok, Map.put(responses, id, result)}}
+      with :ok <- available_input(method, version),
+           {:ok, result} <- Arbor.MCP.Server.legacy_input(method, params, input_timeout()) do
+        {:cont, {:ok, Map.put(responses, id, result)}}
+      else
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
   end
+
+  defp available_input(method, version) when is_binary(version) do
+    if Methods.available?(method, version),
+      do: :ok,
+      else: {:error, {:method_unavailable, method, version}}
+  end
+
+  defp available_input(_method, _version), do: :ok
 
   defp input_timeout do
     remaining =

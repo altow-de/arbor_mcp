@@ -40,8 +40,11 @@ or `roots/list`), then calls the callback again with the answers in
 `Context.request_state/0`, as the TypeScript, Go and C# SDKs do. Each request
 waits under what remains of the original request's deadline, a client error
 fails the call, and a callback that asks for input more than 10 times fails
-with `-32603`. Over legacy HTTP the requests go out on the session's stream,
-so the client must have one open.
+with `-32603`. A request is sent only if the connection's negotiated
+revision defines it and the client declared the capability (`elicitation`,
+`sampling` or `roots`) in `initialize`, so pass `capabilities:` to the client.
+Over legacy HTTP the requests go out on the session's stream, so the client
+must have one open.
 
 ### Form mode
 
