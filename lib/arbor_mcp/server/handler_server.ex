@@ -1336,6 +1336,10 @@ defmodule Arbor.MCP.Server.HandlerServer do
   def handle_call({:create_message, params}, from, state),
     do: reverse_request("sampling/createMessage", params, 5_000, from, state)
 
+  def handle_call({:create_message, params, timeout}, from, state)
+      when is_integer(timeout) and timeout > 0 and timeout <= 4_294_967_295,
+      do: reverse_request("sampling/createMessage", params, timeout, from, state)
+
   def handle_call({:elicit, params, timeout}, from, state) do
     cond do
       not is_integer(timeout) or timeout <= 0 or timeout > 4_294_967_295 ->

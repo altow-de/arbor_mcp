@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- One handler serves both protocol eras when it asks for input. A callback
+  that returns an MRTR `input_required` result to a legacy client no longer
+  fails with "input_required requires MCP 2026-07-28": the server sends each
+  input request as the server-to-client request it stands for (elicitation,
+  sampling or roots), then calls the callback again with the answers in
+  `Server.Context.input_responses/0` and its state in
+  `Context.request_state/0`, as the TypeScript, Go and C# SDKs do. A callback
+  may ask up to 10 times.
 - DSL server options `instructions:`, `capabilities:` and `page_size:`.
   Instructions are returned by `initialize` and `server/discover`, and clients
   read them with the new `Arbor.MCP.Client.instructions/1`. Capabilities are
