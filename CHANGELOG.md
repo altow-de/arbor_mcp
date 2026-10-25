@@ -7,8 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- DSL server options `instructions:`, `capabilities:` and `page_size:`.
+  Instructions are returned by `initialize` and `server/discover`, and clients
+  read them with the new `Arbor.MCP.Client.instructions/1`. Capabilities are
+  merged into the generated ones. A page size paginates the four list methods
+  with an opaque cursor; an invalid cursor fails with `-32602`.
+- DSL completion: prompt arguments and resource-template variables take
+  `complete:` with a list of strings, a local function name or an external
+  capture of arity 2. The generated server advertises `completions` and
+  answers `completion/complete` for them, passing the request's `context`
+  (already-filled arguments) to functions. Other arguments still reach
+  `handle_complete/3`.
+- `Handler.handle_complete/4` receives the completion `context` (MCP
+  2025-06-18), and `Client.complete/4` sends one with `context:`.
+
 ### Changed
 
+- **BREAKING:** Resource-template variables are percent-decoded, so a handler
+  that decoded them itself now decodes twice. Template matching supports every
+  RFC 6570 operator (`{+path}` and `{#frag}` span slashes, `{/a,b}`, `{.ext}`,
+  `{;params}`, `{?query}` and `{&more}`), exploded lists and prefixes. Query
+  variables match in any order and may be absent. Values containing a NUL
+  byte, and `..` segments in `{+...}` and `{#...}` values, don't match.
+  Before, every expression matched one path segment as written.
+- DSL servers advertise `listChanged: true` for tools, resources and prompts,
+  as the TypeScript SDK does. Send the notifications with
+  `Arbor.MCP.Server.notify_tools_changed/1` and its siblings.
 - **BREAKING:** Servers handle the requests on a connection concurrently by
   default, like the other MCP SDKs. The runtime default is now
   `execution: :stateless, max_concurrency: 64` (was `execution: :stateful,

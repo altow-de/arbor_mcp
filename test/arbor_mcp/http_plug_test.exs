@@ -1081,7 +1081,7 @@ defmodule Arbor.MCP.HttpPlugTest do
       result = Jason.decode!(conn.resp_body)["result"]
       assert result["resultType"] == "complete"
       assert result["supportedVersions"] == ["2026-07-28"]
-      assert result["capabilities"]["tools"] == %{}
+      assert result["capabilities"]["tools"] == %{"listChanged" => true}
       assert result["ttlMs"] >= 0
       assert result["cacheScope"] in ["public", "private"]
     end

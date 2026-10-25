@@ -191,7 +191,8 @@ defmodule Arbor.MCP.Server.Dispatch do
       Discover.build(handler_server_info(ctx.module) || %{}, handler_capabilities(ctx.module),
         protocol_mode: Keyword.get(ctx.dispatch_opts, :protocol_mode) || protocol_mode(state),
         instructions:
-          Keyword.get(ctx.dispatch_opts, :instructions) || state_value(state, :instructions)
+          Keyword.get(ctx.dispatch_opts, :instructions) || state_value(state, :instructions) ||
+            handler_instructions(ctx.module)
       )
 
     {:response, JSONRPC.response(ctx.id, result), state}
@@ -269,10 +270,18 @@ defmodule Arbor.MCP.Server.Dispatch do
     call(ctx, :handle_get_prompt, [name, arguments, state], "Get prompt error", state)
   end
 
+  # handle_complete/4 also receives the request's context (the values of the
+  # other arguments, since 2025-06-18); handlers with only /3 keep working.
   defp do_dispatch("completion/complete", ctx, state) do
     ref = Map.get(ctx.params, "ref")
     argument = Map.get(ctx.params, "argument")
-    call(ctx, :handle_complete, [ref, argument, state], "Completion error", state)
+
+    if exported?(ctx.module, :handle_complete, 4) do
+      context = Map.get(ctx.params, "context") || %{}
+      call(ctx, :handle_complete, [ref, argument, context, state], "Completion error", state)
+    else
+      call(ctx, :handle_complete, [ref, argument, state], "Completion error", state)
+    end
   end
 
   defp do_dispatch("logging/setLevel", ctx, state) do
@@ -568,6 +577,11 @@ defmodule Arbor.MCP.Server.Dispatch do
     if exported?(handler_module, :__server_info__, 0),
       do: handler_module.__server_info__(),
       else: nil
+  end
+
+  defp handler_instructions(handler_module) do
+    if exported?(handler_module, :__server_instructions__, 0),
+      do: handler_module.__server_instructions__()
   end
 
   defp handler_capabilities(handler_module) do

@@ -121,6 +121,7 @@ defmodule Arbor.MCP.Client.ConnectionManager do
         |> Map.put(:server_capabilities, result["capabilities"])
         |> Map.put(:protocol_version, result["protocolVersion"])
         |> Map.put(:server_info, result["serverInfo"])
+        |> Map.put(:server_instructions, result["instructions"])
 
       ConnectionScope.established()
       {:ok, new_state}
@@ -359,7 +360,8 @@ defmodule Arbor.MCP.Client.ConnectionManager do
     %{
       "protocolVersion" => discovery.protocol_version,
       "capabilities" => discovery.server_capabilities,
-      "serverInfo" => discovery.server_info
+      "serverInfo" => discovery.server_info,
+      "instructions" => Map.get(discovery, :instructions)
     }
   end
 
