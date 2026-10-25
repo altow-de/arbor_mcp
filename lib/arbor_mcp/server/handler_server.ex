@@ -462,7 +462,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
 
     {:noreply,
      %{
-       state
+       forget_requesters(state)
        | stdio_eof: deadline,
          pending_requests: %{},
          pending_timers: %{},
@@ -821,8 +821,30 @@ defmodule Arbor.MCP.Server.HandlerServer do
 
   defp watch_requester(_from, _id, state), do: state
 
+  defp forget_requesters(state) do
+    for {monitor, _id} <- Map.get(state, :reverse_monitors, %{}),
+        do: Process.demonitor(monitor, [:flush])
+
+    Map.put(state, :reverse_monitors, %{})
+  end
+
+  # A settled request needs its callback watched no longer.
+  defp unwatch_requester(id, state) do
+    monitors = Map.get(state, :reverse_monitors, %{})
+
+    case Enum.find(monitors, fn {_monitor, request_id} -> request_id == id end) do
+      {monitor, _id} ->
+        Process.demonitor(monitor, [:flush])
+        Map.put(state, :reverse_monitors, Map.delete(monitors, monitor))
+
+      nil ->
+        state
+    end
+  end
+
   defp drop_reverse(id, state) do
     if timer = state.pending_timers[id], do: Process.cancel_timer(timer)
+    state = unwatch_requester(id, state)
 
     %{
       state
@@ -1267,7 +1289,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
       end
 
     %{
-      state
+      forget_requesters(state)
       | transport_state: transport_state,
         connection: connection,
         peer_monitor: if(peer, do: Process.monitor(peer), else: nil),
@@ -1821,9 +1843,17 @@ defmodule Arbor.MCP.Server.HandlerServer do
 
   defp remember_client_capabilities(state, %{"method" => "initialize", "params" => params})
        when is_map(params) do
-    case Map.get(params, "capabilities") do
-      %{} = capabilities -> Map.put(state, :client_capabilities, capabilities)
-      _none -> state
+    # An in-process client may send them with atom keys.
+    case Map.get(params, "capabilities") || Map.get(params, :capabilities) do
+      %{} = capabilities ->
+        Map.put(
+          state,
+          :client_capabilities,
+          Map.new(capabilities, fn {k, v} -> {to_string(k), v} end)
+        )
+
+      _none ->
+        state
     end
   end
 

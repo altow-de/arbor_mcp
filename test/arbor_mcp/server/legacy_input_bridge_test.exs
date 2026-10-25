@@ -9,7 +9,7 @@ defmodule Arbor.MCP.Server.LegacyInputBridgeTest do
   use ExUnit.Case, async: true
 
   alias Arbor.MCP.Client
-  alias Arbor.MCP.Server.{Context, HandlerServer}
+  alias Arbor.MCP.Server.{Context, HandlerServer, Runtime}
 
   @key :binary.copy(<<64>>, 32)
 
@@ -186,6 +186,21 @@ defmodule Arbor.MCP.Server.LegacyInputBridgeTest do
     assert_receive :sampled
   end
 
+  test "a completed bridged request leaves no monitor behind" do
+    client = connect(:legacy_only)
+    assert {:ok, _} = Client.call_tool(client, "onboard", %{}, format: :map)
+
+    {:ok, edge} = Runtime.edge(Process.get(:bridge_server))
+    assert :sys.get_state(edge).reverse_monitors == %{}
+  end
+
+  test "capabilities declared with atom keys count" do
+    client = connect(:legacy_only, capabilities: %{sampling: %{}})
+
+    assert {:ok, %{"content" => [%{"text" => "Short."}]}} =
+             Client.call_tool(client, "summarize", %{}, format: :map)
+  end
+
   test "a stateless handler that changes its state between rounds fails" do
     client = connect(:legacy_only)
 
@@ -201,7 +216,7 @@ defmodule Arbor.MCP.Server.LegacyInputBridgeTest do
     assert {:error, _timeout} = Client.call_tool(client, "onboard", %{}, timeout: 200)
     assert_received :elicitation_waiting
 
-    {:ok, edge} = Arbor.MCP.Server.Runtime.edge(Process.get(:bridge_server))
+    {:ok, edge} = Runtime.edge(Process.get(:bridge_server))
 
     :ok =
       Arbor.MCP.TestHelpers.wait_until(fn -> :sys.get_state(edge).pending_requests == %{} end,
