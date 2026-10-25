@@ -2014,8 +2014,17 @@ defmodule Arbor.MCP.Client do
 
   def handle_info({:async_post_task, ref, pid, request_id}, state)
       when is_reference(ref) and is_pid(pid) do
-    tasks = Map.put(state.async_post_tasks || %{}, ref, {pid, request_id})
-    {:noreply, %{state | async_post_tasks: tasks}}
+    if Process.alive?(pid) or down_queued?(ref) do
+      tasks = Map.put(state.async_post_tasks || %{}, ref, {pid, request_id})
+      {:noreply, %{state | async_post_tasks: tasks}}
+    else
+      # A task starts its POST only after this registration was queued, so
+      # its result and :DOWN come later. One already gone, with no :DOWN
+      # left to come, was refused a worker before it could send anything;
+      # that :DOWN came first and found nothing registered.
+      error = RequestHandler.not_sent_error(:client_worker_unavailable, state)
+      {:noreply, fail_unsent_post(state, request_id, error)}
+    end
   end
 
   def handle_info({:async_post_task, ref, request_id}, state) when is_reference(ref) do
@@ -2438,6 +2447,7 @@ defmodule Arbor.MCP.Client do
   end
 
   defp handle_async_post_result({:ok, _new_ts, response_data}, meta, state) do
+    state = cache_tool_list(state, Map.get(meta, :tool_list), response_data)
     RequestHandler.handle_post_response(response_data, Map.get(meta, :request_id), state)
   end
 
@@ -2448,29 +2458,15 @@ defmodule Arbor.MCP.Client do
 
   # The server asked the task's POST to authenticate. Re-sending from this
   # process runs at most one authentication at a time, and later challenges
-  # reuse the credentials it obtained.
+  # reuse the credentials it obtained. A POST that carried no request (a
+  # notification, a batch, a reply to a server request) is re-sent too; a
+  # request whose caller has given up is not.
   defp handle_async_post_result({:error, {:reauthenticate, message}}, meta, state) do
     request_id = Map.get(meta, :request_id)
-    deadline = Map.get(meta, :deadline)
 
-    if Map.has_key?(state.pending_requests, request_id || make_ref()) do
-      previous = Deadline.on_transport(HTTP, state.transport_state)
-      transport = Deadline.put_on_transport(HTTP, state.transport_state, deadline)
-      restore = &%{state | transport_state: Deadline.put_on_transport(HTTP, &1, previous)}
-
-      case HTTP.send_authenticated(message, transport) do
-        {:ok, transport, response_data} ->
-          RequestHandler.handle_post_response(response_data, request_id, restore.(transport))
-
-        {:ok, transport} ->
-          {:noreply, restore.(transport)}
-
-        {:error, reason} ->
-          {:noreply, fail_async_post_request(state, request_id, reason, deadline)}
-      end
-    else
-      {:noreply, state}
-    end
+    if is_nil(request_id) or Map.has_key?(state.pending_requests, request_id),
+      do: resend_authenticated(message, meta, state),
+      else: {:noreply, state}
   end
 
   # The caller receives the failure, as from a synchronous send, so it is not
@@ -2481,6 +2477,36 @@ defmodule Arbor.MCP.Client do
     {:noreply,
      fail_async_post_request(state, Map.get(meta, :request_id), reason, Map.get(meta, :deadline))}
   end
+
+  defp resend_authenticated(message, meta, state) do
+    request_id = Map.get(meta, :request_id)
+    deadline = Map.get(meta, :deadline)
+    previous = Deadline.on_transport(HTTP, state.transport_state)
+    transport = Deadline.put_on_transport(HTTP, state.transport_state, deadline)
+    restore = &%{state | transport_state: Deadline.put_on_transport(HTTP, &1, previous)}
+
+    case HTTP.send_authenticated(message, transport) do
+      {:ok, transport, response_data} ->
+        RequestHandler.handle_post_response(response_data, request_id, restore.(transport))
+
+      {:ok, transport} ->
+        {:noreply, restore.(transport)}
+
+      {:error, reason} ->
+        Logger.debug("Authenticated resend failed", reason: LogSummary.describe(reason))
+        {:noreply, fail_async_post_request(state, request_id, reason, deadline)}
+    end
+  end
+
+  defp cache_tool_list(
+         %{transport_mod: HTTP, transport_state: %HTTP{} = transport} = state,
+         kind,
+         data
+       )
+       when kind in [:first, :cursor],
+       do: %{state | transport_state: HTTP.cache_tool_list(transport, kind, data)}
+
+  defp cache_tool_list(state, _kind, _data), do: state
 
   # Merge the durable transport-state changes computed by an async POST task
   # (session id rotation, OAuth token/auth state, SSE retry metadata) into the
@@ -2574,10 +2600,9 @@ defmodule Arbor.MCP.Client do
         notified_state
 
       _other ->
-        {:noreply, notified_state} =
-          RequestHandler.handle_cast_notification(method, params, state)
-
-        notified_state
+        # Over legacy HTTP this POSTs from its own task, so a cancellation the
+        # server is slow to accept cannot hold the client.
+        RequestHandler.send_notification_async(method, params, state)
     end
   end
 
@@ -2596,6 +2621,21 @@ defmodule Arbor.MCP.Client do
   # A POST that failed at or after its caller's deadline is the caller's
   # timeout, answered as a synchronous send was, and is cancelled on the
   # server: the client's own timeout timer finds nothing left to cancel.
+  defp down_queued?(ref) do
+    {:messages, messages} = Process.info(self(), :messages)
+    Enum.any?(messages, &match?({:DOWN, ^ref, :process, _pid, _reason}, &1))
+  end
+
+  defp fail_unsent_post(state, request_id, error) do
+    case request_id && Map.get(state.pending_requests, request_id) do
+      {from, :single, _method} -> GenServer.reply(from, {:error, error})
+      {from, :single} -> GenServer.reply(from, {:error, error})
+      _other -> :ok
+    end
+
+    %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+  end
+
   defp fail_async_post_request(state, request_id, reason, deadline \\ nil) do
     timed_out? =
       reason != :deadline_expired and is_integer(deadline) and Deadline.expired?(deadline)

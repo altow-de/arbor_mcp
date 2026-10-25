@@ -34,6 +34,35 @@ defmodule Arbor.MCP.Client.AsyncPostResultTest do
 
       assert new_state.async_post_tasks == %{ref => 42}
     end
+
+    test "a task refused a worker before registering fails its request as not sent" do
+      # Its :DOWN came first and found nothing registered.
+      {pid, monitor} = spawn_monitor(fn -> :ok end)
+      assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
+      reply_tag = make_ref()
+      state = client_state(pending_requests: %{42 => {{self(), reply_tag}, :single}})
+
+      assert {:noreply, new_state} =
+               Client.handle_info({:async_post_task, make_ref(), pid, 42}, state)
+
+      assert_receive {^reply_tag, {:error, %Arbor.MCP.Error.TransportError{reason: :not_sent}}}
+
+      assert new_state.pending_requests == %{}
+      assert new_state.async_post_tasks == %{}
+    end
+
+    test "a finished task whose :DOWN is still queued is registered for that :DOWN" do
+      {pid, monitor} = spawn_monitor(fn -> :ok end)
+      assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
+      ref = make_ref()
+      send(self(), {:DOWN, ref, :process, pid, :normal})
+      state = client_state(pending_requests: %{42 => {{self(), make_ref()}, :single}})
+
+      assert {:noreply, new_state} = Client.handle_info({:async_post_task, ref, pid, 42}, state)
+      assert new_state.async_post_tasks == %{ref => {pid, 42}}
+      assert Map.has_key?(new_state.pending_requests, 42)
+      assert_received {:DOWN, ^ref, :process, ^pid, :normal}
+    end
   end
 
   describe "async POST task exits ({:DOWN, ...})" do

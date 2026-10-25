@@ -59,6 +59,80 @@ defmodule Arbor.MCP.Client.HTTPAsyncPostTest do
     refute_received :authenticated
   end
 
+  test "a POST that answers after its request settled is dropped, not given to another" do
+    client = start_client()
+
+    late = Task.async(fn -> Client.call_tool(client, "late", %{}, timeout: 5_000) end)
+    assert_receive {:tool_call_started, "late", late_handler, late_id}
+    other = Task.async(fn -> Client.call_tool(client, "other", %{}, timeout: 5_000) end)
+    assert_receive {:tool_call_started, "other", other_handler, other_id}
+
+    :ok = Client.send_cancelled(client, late_id, "user")
+    assert {:error, :cancelled} = Task.await(late)
+    assert_receive {:notification, "notifications/cancelled", %{"requestId" => ^late_id}}
+
+    # The cancelled request's POST answers with the other request's id.
+    send(late_handler, {:respond_with_id, other_id})
+    assert_receive {:responded, ^late_handler}
+    send(other_handler, :release)
+
+    assert {:ok, response} = Task.await(other)
+    assert [%{text: "other"}] = response.content
+  end
+
+  test "concurrent tools/list pages each reach the header cache" do
+    client = start_client()
+
+    pages =
+      for cursor <- ["p1", "p2"],
+          do: Task.async(fn -> Client.list_tools(client, cursor: cursor, timeout: 5_000) end)
+
+    handlers = for _ <- 1..2, do: receive_list_started()
+    Enum.each(handlers, &send(&1, :release))
+    assert Enum.all?(Task.await_many(pages, 5_000), &match?({:ok, _}, &1))
+
+    _ = :sys.get_state(client)
+    cache = :sys.get_state(client).transport_state.tool_headers
+    assert Map.has_key?(cache, "tool_p1") and Map.has_key?(cache, "tool_p2")
+  end
+
+  test "a cancellation the server is slow to accept does not hold other requests" do
+    client = start_client()
+
+    cancel = Task.async(fn -> Client.send_cancelled(client, "unknown-request", "stall") end)
+    assert_receive {:cancel_started, cancel_handler}, 2_000
+
+    # Well inside the stalled cancellation's 2 s.
+    assert {:ok, _} = Client.call_tool(client, "quick", %{}, timeout: 500)
+    send(cancel_handler, :release)
+    assert :ok = Task.await(cancel)
+  end
+
+  test "an auth challenge on a notification re-sends it after authenticating" do
+    client = start_client(auth_provider: {Provider, test_pid: self()})
+
+    :ok = Client.send_cancelled(client, "unknown-request", "auth")
+    assert_receive :authenticated, 2_000
+    assert_receive {:authenticated_notification, "notifications/cancelled"}, 2_000
+  end
+
+  test "a request refused a client worker fails at once" do
+    client = start_client(max_client_workers: 1)
+
+    held = Task.async(fn -> Client.call_tool(client, "hang", %{}, timeout: 5_000) end)
+    assert_receive {:tool_call_started, "hang", handler}
+
+    assert {:error, _not_sent} = Client.call_tool(client, "quick", %{}, timeout: 2_000)
+
+    send(handler, :release)
+    assert {:ok, _} = Task.await(held)
+  end
+
+  defp receive_list_started do
+    assert_receive {:list_started, _cursor, handler}, 2_000
+    handler
+  end
+
   defp start_client(opts \\ []) do
     bypass = Bypass.open()
     test_pid = self()
@@ -96,11 +170,48 @@ defmodule Arbor.MCP.Client.HTTPAsyncPostTest do
     })
   end
 
+  defp respond(conn, %{"method" => "tools/list", "id" => id, "params" => params}, test_pid) do
+    cursor = params["cursor"]
+    send(test_pid, {:list_started, cursor, self()})
+
+    receive do
+      :release -> :ok
+    after
+      2_000 -> :ok
+    end
+
+    tools = [%{"name" => "tool_#{cursor}", "inputSchema" => %{"type" => "object"}}]
+    json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => %{"tools" => tools}})
+  end
+
+  defp respond(
+         conn,
+         %{"method" => "tools/call", "id" => id, "params" => %{"name" => name}},
+         test_pid
+       )
+       when name in ["late", "other"] do
+    send(test_pid, {:tool_call_started, name, self(), id})
+
+    receive do
+      {:respond_with_id, other_id} ->
+        send(test_pid, {:responded, self()})
+        text_result(conn, other_id, name)
+
+      :release ->
+        text_result(conn, id, name)
+    after
+      2_000 -> text_result(conn, id, name)
+    end
+  end
+
   defp respond(conn, %{"method" => "tools/call", "id" => id, "params" => params}, test_pid) do
     name = params["name"]
     send(test_pid, {:tool_call_started, name, self()})
 
     case name do
+      "quick" ->
+        text_result(conn, id, name)
+
       "null_id" ->
         json(conn, %{
           "jsonrpc" => "2.0",
@@ -136,9 +247,50 @@ defmodule Arbor.MCP.Client.HTTPAsyncPostTest do
     end
   end
 
+  defp respond(conn, %{"method" => "notifications/cancelled" = method} = message, test_pid) do
+    params = Map.get(message, "params", %{})
+    send(test_pid, {:notification, method, params})
+
+    case params["reason"] do
+      "stall" ->
+        send(test_pid, {:cancel_started, self()})
+        Process.flag(:trap_exit, true)
+
+        receive do
+          :release -> :ok
+          {:EXIT, _from, _reason} -> :ok
+        after
+          2_000 -> :ok
+        end
+
+        Plug.Conn.resp(conn, 202, "")
+
+      "auth" ->
+        if Plug.Conn.get_req_header(conn, "authorization") == ["Bearer fresh"] do
+          send(test_pid, {:authenticated_notification, method})
+          Plug.Conn.resp(conn, 202, "")
+        else
+          conn
+          |> Plug.Conn.put_resp_header("www-authenticate", ~s(Bearer realm="mcp"))
+          |> Plug.Conn.resp(401, "")
+        end
+
+      _other ->
+        Plug.Conn.resp(conn, 202, "")
+    end
+  end
+
   defp respond(conn, %{"method" => method} = message, test_pid) do
     send(test_pid, {:notification, method, Map.get(message, "params", %{})})
     Plug.Conn.resp(conn, 202, "")
+  end
+
+  defp text_result(conn, id, text) do
+    json(conn, %{
+      "jsonrpc" => "2.0",
+      "id" => id,
+      "result" => %{"content" => [%{"type" => "text", "text" => text}]}
+    })
   end
 
   defp json(conn, body) do

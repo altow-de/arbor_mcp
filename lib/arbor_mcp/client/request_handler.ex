@@ -876,15 +876,22 @@ defmodule Arbor.MCP.Client.RequestHandler do
   @doc false
   # An HTTP POST's response answers the request that POST carried, whatever
   # id its body echoes (a server may answer an invalid request with a null
-  # id), as when the POST was synchronous. Anything else it carries, such as
-  # a batch, a notification or a server request, is routed as usual.
+  # id), as when the POST was synchronous, and is dropped once that request
+  # has settled (timed out or cancelled), never routed to another one.
+  # Anything else, such as a batch, a notification or a server request, or
+  # the response to a POST that carried no request, is routed as usual.
+  def handle_post_response(response_data, nil, state),
+    do: parse_transport_message(response_data, state)
+
   def handle_post_response(response_data, request_id, state) do
-    with true <- pending_single?(state.pending_requests, request_id),
-         {kind, payload, _echoed_id} when kind in [:result, :error] <-
-           Protocol.parse_message(response_data) do
-      handle_single_response({kind, payload, request_id}, state)
-    else
-      _other -> parse_transport_message(response_data, state)
+    case Protocol.parse_message(response_data) do
+      {kind, payload, _echoed_id} when kind in [:result, :error] ->
+        if pending_single?(state.pending_requests, request_id),
+          do: handle_single_response({kind, payload, request_id}, state),
+          else: {:noreply, state}
+
+      _other ->
+        parse_transport_message(response_data, state)
     end
   end
 
@@ -1154,6 +1161,24 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
         state
     end
+  end
+
+  @doc false
+  # Sends a notification over HTTP from its own POST task, so a slow server
+  # cannot hold the client; other transports send it as usual.
+  def send_notification_async(method, params, %{transport_mod: HTTP} = state) do
+    with %HTTP{} <- state.transport_state,
+         {:ok, notification} <- build_request(method, params, nil, state),
+         {:ok, state} <- send_http_request(notification, state) do
+      state
+    else
+      _not_sent -> state
+    end
+  end
+
+  def send_notification_async(method, params, state) do
+    {:noreply, state} = handle_cast_notification(method, params, state)
+    state
   end
 
   @doc """
