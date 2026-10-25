@@ -9,6 +9,7 @@ defmodule Arbor.MCP.Client.Operations.Tools do
   alias Arbor.MCP.Client.Internal.Request, as: ClientRequest
 
   alias Arbor.MCP.Client.Types
+  alias Arbor.MCP.Content.SchemaPolicy
   alias Arbor.MCP.Error
   alias Arbor.MCP.Internal.RequestParams
   alias Arbor.MCP.Response
@@ -66,6 +67,12 @@ defmodule Arbor.MCP.Client.Operations.Tools do
   - `:idempotency_key_path` - String or list path for the injected key
     (default: `["idempotencyKey"]`). If the path already contains a different
     value, the call fails instead of silently changing it.
+  - `:validate_output` - Check the result against the tool's `outputSchema`
+    (default: `true`). As in the TypeScript and Python SDKs, once
+    `list_tools/2` has shown a tool with an `outputSchema`, a successful
+    result must carry `structuredContent` that conforms to it, or the call
+    returns `{:error, %Arbor.MCP.Error.ValidationError{field: :structured_content}}`.
+    `isError` results aren't checked.
 
   ## Examples
 
@@ -121,13 +128,72 @@ defmodule Arbor.MCP.Client.Operations.Tools do
 
     deadline = started_at + Keyword.get(opts, :timeout, 30_000)
 
-    maybe_retry_header_mismatch(
-      result,
-      client,
-      params,
-      enhanced_opts,
-      deadline
-    )
+    result
+    |> maybe_retry_header_mismatch(client, params, enhanced_opts, deadline)
+    |> validate_output(client, tool_name, opts)
+  end
+
+  # Checked in the caller's process, so a large result doesn't hold up the
+  # client's other responses.
+  defp validate_output({:ok, response} = result, client, tool_name, opts) do
+    with true <- Keyword.get(opts, :validate_output, true),
+         false <- error_result?(response),
+         schema when is_map(schema) <- output_schema(client, tool_name) do
+      check_structured(structured_content(response), schema, tool_name, result)
+    else
+      _unchecked -> result
+    end
+  end
+
+  defp validate_output(result, _client, _tool_name, _opts), do: result
+
+  defp output_schema(client, tool_name) do
+    GenServer.call(client, {:tool_output_schema, tool_name}, 5_000)
+  catch
+    :exit, _reason -> nil
+  end
+
+  defp error_result?(%Response{is_error: is_error}), do: is_error == true
+  defp error_result?(%{} = response), do: Map.get(response, "isError") == true
+
+  defp structured_content(%Response{structuredOutput: content}), do: content
+  defp structured_content(%{} = response), do: Map.get(response, "structuredContent")
+
+  defp check_structured(nil, _schema, tool_name, _result) do
+    {:error,
+     Error.validation_error(
+       :structured_content,
+       nil,
+       "tool #{inspect(tool_name)} has an outputSchema but returned no structuredContent"
+     )}
+  end
+
+  defp check_structured(content, schema, tool_name, result) do
+    case SchemaPolicy.validate(content, schema) do
+      :ok ->
+        result
+
+      {:error, diagnostics} when is_list(diagnostics) ->
+        {:error,
+         Error.validation_error(
+           :structured_content,
+           nil,
+           "tool #{inspect(tool_name)} returned structuredContent that doesn't match " <>
+             "its outputSchema: " <> describe(diagnostics)
+         )}
+
+      # The schema itself couldn't be used; the result can't be judged by it.
+      {:error, _schema_problem} ->
+        result
+    end
+  end
+
+  defp describe(diagnostics) do
+    Enum.map_join(diagnostics, "; ", fn
+      {message, path} when is_binary(message) and is_binary(path) -> "#{path}: #{message}"
+      message when is_binary(message) -> message
+      _other -> "invalid"
+    end)
   end
 
   defp inject_idempotency_key(arguments, opts) do

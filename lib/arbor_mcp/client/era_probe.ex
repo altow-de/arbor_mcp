@@ -15,6 +15,11 @@ defmodule Arbor.MCP.Client.EraProbe do
   alias Arbor.MCP.Transport.Local
   alias Arbor.RPC.JSONRPC
 
+  # A server may send a notification, such as a log message or a list
+  # change, before it answers. That isn't the answer, and says nothing about
+  # the protocol era, so the probe keeps waiting for one, within its deadline.
+  @max_skipped_notifications 16
+
   @default_timeout 2_000
 
   @type failure ::
@@ -248,12 +253,25 @@ defmodule Arbor.MCP.Client.EraProbe do
         {:ok, response, updated_state}
 
       {:ok, updated_state} ->
-        receive_response(transport_mod, updated_state, Deadline.remaining(deadline))
+        await_response(transport_mod, updated_state, deadline, @max_skipped_notifications)
 
       {:error, reason} ->
         if Deadline.expired?(deadline),
           do: {:error, {:probe_timeout, reason}},
           else: {:error, reason}
+    end
+  end
+
+  defp await_response(transport_mod, transport_state, deadline, skips) do
+    case receive_response(transport_mod, transport_state, Deadline.remaining(deadline)) do
+      {:ok, response, updated_state} ->
+        if skips > 0 and
+             match?({:notification, _method, _params}, Protocol.parse_message(response)),
+           do: await_response(transport_mod, updated_state, deadline, skips - 1),
+           else: {:ok, response, updated_state}
+
+      error ->
+        error
     end
   end
 

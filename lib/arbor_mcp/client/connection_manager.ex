@@ -12,6 +12,10 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   alias Arbor.MCP.Internal.{Protocol, VersionInfo, VersionRegistry}
   alias Arbor.MCP.Reliability.Retry
   alias Arbor.MCP.Testing.MockTransport
+
+  # A notification that arrives before the initialize response, such as a
+  # log message or a list change, isn't the response; keep waiting for it.
+  @max_skipped_notifications 16
   alias Arbor.MCP.Transport.{HTTP, Local, ReliabilityWrapper, Stdio, Test}
   alias Arbor.MCP.Transport.HTTP.LegacySSE
   alias Arbor.RPC.LogSummary
@@ -744,10 +748,11 @@ defmodule Arbor.MCP.Client.ConnectionManager do
 
       {:ok, state_after_send} ->
         # SSE mode or other transports - need to receive separately
-        case receive_handshake_message(
+        case await_handshake_message(
                transport_mod,
                state_after_send,
-               Deadline.remaining(deadline)
+               deadline,
+               @max_skipped_notifications
              ) do
           {:ok, response_data, state_after_receive} ->
             response_data
@@ -810,6 +815,19 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   # mailbox) are called in-process with the timeout; transports with only the
   # blocking receive_message/1 are wrapped in a task that is shut down on
   # expiry. On timeout the connection attempt fails with :handshake_timeout.
+  defp await_handshake_message(transport_mod, transport_state, deadline, skips) do
+    case receive_handshake_message(transport_mod, transport_state, Deadline.remaining(deadline)) do
+      {:ok, message, new_state} ->
+        if skips > 0 and
+             match?({:notification, _method, _params}, Protocol.parse_message(message)),
+           do: await_handshake_message(transport_mod, new_state, deadline, skips - 1),
+           else: {:ok, message, new_state}
+
+      error ->
+        error
+    end
+  end
+
   defp receive_handshake_message(transport_mod, transport_state, timeout) do
     result =
       if function_exported?(transport_mod, :receive_message, 2) do

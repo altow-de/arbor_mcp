@@ -296,6 +296,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
           %{method: method, request_id: id}
         )
 
+        updated_state = remember_tool_schemas(updated_state, method, response_data)
         {:reply, validate_result(result, updated_state, method), updated_state}
 
       {:error, error_data, _id} ->
@@ -1021,7 +1022,9 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
           GenServer.reply(from, response_data)
           new_pending_requests = Map.delete(pending_requests, response_id)
+
           %{state | pending_requests: new_pending_requests}
+          |> remember_tool_schemas(method, response_data)
 
         {:ok, {from, :single}} ->
           :telemetry.execute(
@@ -1058,7 +1061,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
               "notifications/resources/list_changed",
               "notifications/resources/updated"
             ],
-       do: route_change_notification(method, params, state)
+       do: route_change_notification(method, params, forget_tool_schemas(state, method))
 
   defp route_notification("notifications/tasks" = method, params, state),
     do: route_task_subscription_event(method, params, state)
@@ -1115,6 +1118,48 @@ defmodule Arbor.MCP.Client.RequestHandler do
         state
     end
   end
+
+  # Each tools/list page records its tools' output schemas; a tool listed
+  # without one has none to check.
+  defp remember_tool_schemas(state, "tools/list", response_data) do
+    with %{} = result <- list_result(response_data),
+         tools when is_list(tools) <- field(result, "tools") do
+      schemas =
+        Enum.reduce(tools, Map.get(state, :tool_output_schemas) || %{}, fn tool, acc ->
+          case {field(tool, "name"), field(tool, "outputSchema")} do
+            {name, schema} when is_binary(name) and is_map(schema) -> Map.put(acc, name, schema)
+            {name, _none} when is_binary(name) -> Map.delete(acc, name)
+            _other -> acc
+          end
+        end)
+
+      Map.put(state, :tool_output_schemas, schemas)
+    else
+      _other -> state
+    end
+  end
+
+  defp remember_tool_schemas(state, _method, _response_data), do: state
+
+  # A pending request's response arrives parsed; an inline one doesn't.
+  defp list_result({:ok, %{} = result}), do: result
+
+  defp list_result(response_data) do
+    case Protocol.parse_message(response_data) do
+      {:result, %{} = result, _id} -> result
+      _other -> nil
+    end
+  end
+
+  # In-process transports deliver maps that may still have atom keys.
+  defp field(%{} = map, key), do: Map.get(map, key) || Map.get(map, String.to_existing_atom(key))
+  defp field(_other, _key), do: nil
+
+  # A changed tool list may change a schema; validate again once relisted.
+  defp forget_tool_schemas(state, "notifications/tools/list_changed"),
+    do: Map.put(state, :tool_output_schemas, %{})
+
+  defp forget_tool_schemas(state, _method), do: state
 
   defp forget_progress_token(state, token),
     do: Map.update(state, :progress_requests, %{}, &Map.delete(&1, token))
