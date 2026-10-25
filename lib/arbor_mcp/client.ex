@@ -112,6 +112,9 @@ defmodule Arbor.MCP.Client do
     # Monitor refs of in-flight async POST tasks (Streamable HTTP transport),
     # mapped to the request id each task serves.
     async_post_tasks: %{},
+    # Progress tokens of pending requests, mapped to their request ids, so a
+    # connection-level notifications/progress reaches the request it reports on.
+    progress_requests: %{},
     # Linked processes of a transport (or receiver) this client has since
     # dropped, and that were still alive when it did. Their exit signals are
     # expected and are ignored rather than read as a foreign link's exit.

@@ -77,6 +77,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_connection/3`'s `:cleanup_timeout` bounds the scope only. It was also
   passed to a stdio transport, where it became the server's subprocess shutdown
   budget; set `:eof_grace` or `:cleanup_timeout` in the connection spec instead.
+- **BREAKING:** A DSL tool called with invalid arguments returns an `isError`
+  tool result, "Input validation error: …" naming the failing fields and rules,
+  instead of a `-32602` protocol error with no details. This follows SEP-1303,
+  as the other MCP SDKs do, and lets a model correct the call. Rejected values
+  are never included. **Upgrade:** callers that matched the error tuple from
+  `Client.call_tool/4` now receive `{:ok, %Arbor.MCP.Response{is_error: true}}`.
+
+### Fixed
+
+- The client delivered `notifications/progress` and `notifications/message` to
+  its handler only on modern HTTP request streams and dropped them on stdio,
+  BEAM and legacy HTTP. `handle_progress/3` now receives progress on every
+  transport, matched to the pending request by its `progressToken`, and
+  `handle_log_message/3` receives connection-level log messages with a `nil`
+  request id.
+- The default OAuth provider kept no refresh token, so an expired access token
+  started the full authorization flow again, which found the same authorization
+  server and failed with `:auth_loop_detected`. It now refreshes the token
+  shortly before it expires and when the server rejects it, and runs the full
+  flow only if refreshing fails. A refreshed token is saved to the
+  `:credential_store` when one is configured, and the provider struct no longer
+  shows its tokens in `inspect/1`.
 
 ## [2.0.0-rc.5] — 2026-10-22
 

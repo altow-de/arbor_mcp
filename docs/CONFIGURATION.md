@@ -309,6 +309,11 @@ subject or client identity, and normalized granted scopes. Access and refresh
 tokens never appear in a storage key, and the credential structs redact secret
 fields from `Inspect`. ArborMCP intentionally provides no plaintext file adapter.
 
+The default OAuth provider renews an access token with its refresh token,
+shortly before the token expires and when the server rejects it, and runs the
+full authorization flow only if refreshing fails. A refreshed token is saved
+to the configured `:credential_store`.
+
 Old records without an issuer fail with
 `{:credential_migration_required, :registration | :token}`. After verifying
 the original authorization server out of band, migrate them explicitly with
@@ -1583,6 +1588,9 @@ feature (`logging/setLevel`, per-request log levels, and
 `notifications/message`) is deprecated as of MCP 2026-07-28 but remains
 available throughout ArborMCP 1.x. New observability integrations should use
 stderr for stdio diagnostics or OpenTelemetry for structured telemetry.
+
+On the client, `handle_progress/3` and `handle_log_message/3` receive progress
+and log notifications on every transport.
 
 For stdio servers, stdout must contain only JSON-RPC messages. ArborMCP 2.0
 preserves the host's Logger levels, handlers, filters and application settings

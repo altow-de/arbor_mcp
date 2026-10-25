@@ -6,8 +6,11 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
   It handles the complete lifecycle:
 
   1. On 401 — discovers PRM and AS metadata, selects configured client registration, runs PKCE
-  2. On 403 with insufficient_scope — re-authorizes with broader scopes
-  3. Prevents auth loops via `auth_completed` flag
+  2. Before the access token expires, and on a 401 once it has one — renews it
+     with the refresh token, without the browser, and runs the full flow only
+     if that fails
+  3. On 403 with insufficient_scope — re-authorizes with broader scopes
+  4. Prevents auth loops via `auth_completed` flag
 
   ## Configuration
 
@@ -39,6 +42,10 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
 
   alias Arbor.MCP.Authorization.{FullOAuthFlow, LogSanitizer}
 
+  # Renew this many seconds before the access token's expiry.
+  @refresh_skew 30
+
+  @derive {Inspect, except: [:access_token, :refresh]}
   defstruct [
     :access_token,
     :resource_url,
@@ -46,6 +53,10 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
     :auth_config,
     :authorization_server_issuer,
     :last_rejected_issuer,
+    # When the access token expires (system seconds), if the server said.
+    :expires_at,
+    # FullOAuthFlow's refresh context, or nil without a refresh token.
+    :refresh,
     granted_scopes: [],
     auth_completed: false
   ]
@@ -65,15 +76,71 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
 
   @impl true
   def get_token(%__MODULE__{access_token: token} = state) do
-    {:ok, token, state}
+    if expiring?(state) do
+      case refresh(state) do
+        {:ok, token, state} -> {:ok, token, state}
+        # Send the old token; a 401 then decides whether to authenticate again.
+        {:error, _reason} -> {:ok, token, state}
+      end
+    else
+      {:ok, token, state}
+    end
   end
 
   @impl true
   def handle_unauthorized(www_authenticate, scopes, %__MODULE__{} = state) do
-    if state.auth_completed && state.access_token do
-      reauthenticate_after_rejection(www_authenticate, scopes, state)
-    else
-      do_authenticate(www_authenticate, scopes, state)
+    case refresh(state) do
+      {:ok, _token, _state} = refreshed -> refreshed
+      {:error, _reason} -> authenticate_again(www_authenticate, scopes, state)
+    end
+  end
+
+  defp authenticate_again(www_authenticate, scopes, state) do
+    if state.auth_completed && state.access_token,
+      do: reauthenticate_after_rejection(www_authenticate, scopes, state),
+      else: do_authenticate(www_authenticate, scopes, state)
+  end
+
+  defp expiring?(%{expires_at: expires_at, refresh: refresh}),
+    do:
+      is_integer(expires_at) and not is_nil(refresh) and
+        System.system_time(:second) >= expires_at - @refresh_skew
+
+  defp refresh(%{refresh: nil}), do: {:error, :no_refresh_token}
+
+  defp refresh(state) do
+    case FullOAuthFlow.refresh(state.refresh, state.auth_config || %{}) do
+      {:ok, token_data, next} ->
+        Logger.info("OAuth token refreshed")
+
+        :telemetry.execute(
+          [:arbor_mcp, :auth, :provider, :token_refreshed],
+          %{system_time: System.system_time()},
+          %{}
+        )
+
+        token = token_data[:access_token]
+
+        {:ok, token,
+         %{
+           state
+           | access_token: token,
+             refresh: next,
+             expires_at: expires_at(token_data),
+             granted_scopes: token_scopes(token_data, state.granted_scopes),
+             last_rejected_issuer: nil
+         }}
+
+      {:error, reason} ->
+        Logger.info("OAuth token refresh failed: #{LogSanitizer.format(reason)}")
+        {:error, reason}
+    end
+  end
+
+  defp expires_at(token_data) do
+    case token_data[:expires_in] || token_data["expires_in"] do
+      seconds when is_integer(seconds) and seconds >= 0 -> System.system_time(:second) + seconds
+      _unknown -> nil
     end
   end
 
@@ -122,7 +189,9 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
           | access_token: access_token,
             auth_completed: true,
             authorization_server_issuer: issuer,
-            granted_scopes: granted_scopes
+            granted_scopes: granted_scopes,
+            expires_at: expires_at(token_result),
+            refresh: token_result[:refresh_context]
         }
 
         {:ok, access_token, new_state}
