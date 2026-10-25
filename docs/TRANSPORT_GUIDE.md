@@ -126,7 +126,9 @@ Supported client options include:
 - `:protocol_version` - requested legacy revision, or a modern probe revision
   when the selected mode enables it.
 - `:timeout` - connect timeout.
-- `:request_timeout` - single request timeout.
+- `:request_timeout` - single request timeout for sends that carry no caller
+  deadline. A request's own `:timeout` decides how long the client waits for
+  its response.
 - `:stream_handshake_timeout` - wait for SSE stream startup.
 - `:stream_idle_timeout` - allowed SSE idle time.
 - `:dns_timeout_ms` - DNS-resolution deadline, defaults to one second.

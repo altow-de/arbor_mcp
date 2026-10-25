@@ -33,6 +33,7 @@ defmodule Arbor.MCP.Server.Runtime.HTTPGatewayDeadlineTest do
   end
 
   test "one fixed charged timeout error may use the entry failure tail without reviving success" do
+    # The handler counts in its state, one callback at a time.
     root =
       start_supervised!(
         {Runtime,
@@ -40,7 +41,8 @@ defmodule Arbor.MCP.Server.Runtime.HTTPGatewayDeadlineTest do
          dispatcher: Handler,
          handler_args: [test: self()],
          request_timeout_ms: 2000,
-         max_queue: 4}
+         max_queue: 4,
+         execution: :stateful}
       )
 
     {:ok, runtime} = Runtime.ref(root)

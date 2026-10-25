@@ -14,8 +14,10 @@ defmodule Arbor.MCP.Server.Runtime.Config do
             dispatch_opts: [],
             services: nil,
             store_children: [],
-            execution: :stateful,
-            max_concurrency: 1,
+            # Concurrent by default, like the other MCP SDKs. :stateful runs one
+            # callback at a time so each can return the next handler state.
+            execution: :stateless,
+            max_concurrency: nil,
             # Data permits include every batch member, retained until settlement.
             max_queue: 128,
             max_request_bytes: 1_000_000,
@@ -33,7 +35,9 @@ defmodule Arbor.MCP.Server.Runtime.Config do
             max_http_io_bytes: 4_194_304,
             max_http_io_frame_bytes: 1_048_576,
             output_timeout_ms: 5_000,
-            request_timeout_ms: 10_000,
+            # A safety net, not the normal limit: callers end work with their
+            # own timeout and notifications/cancelled.
+            request_timeout_ms: 3_600_000,
             cancel_grace_ms: 100,
             init_timeout_ms: 10_000,
             shutdown_timeout_ms: 5_000
@@ -41,7 +45,7 @@ defmodule Arbor.MCP.Server.Runtime.Config do
   def new(opts) when is_list(opts) do
     opts = http_service_defaults(opts)
     keys = Map.keys(Map.from_struct(%__MODULE__{}))
-    config = struct(__MODULE__, Keyword.take(opts, keys))
+    config = opts |> Keyword.take(keys) |> then(&struct(__MODULE__, &1)) |> put_concurrency()
 
     with {:ok, http} <- http_config(opts),
          :ok <- validate_name(Keyword.get(opts, :name)),
@@ -110,6 +114,16 @@ defmodule Arbor.MCP.Server.Runtime.Config do
        do: :ok
 
   defp validate_handler(_config), do: {:error, :handler_required}
+
+  @default_max_concurrency 64
+
+  defp put_concurrency(%{max_concurrency: nil, execution: :stateful} = config),
+    do: %{config | max_concurrency: 1}
+
+  defp put_concurrency(%{max_concurrency: nil} = config),
+    do: %{config | max_concurrency: @default_max_concurrency}
+
+  defp put_concurrency(config), do: config
 
   defp validate_execution(%{execution: :stateful, max_concurrency: 1}), do: :ok
 

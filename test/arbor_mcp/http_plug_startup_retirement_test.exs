@@ -63,6 +63,7 @@ defmodule Arbor.MCP.HttpPlugStartupRetirementTest do
   end
 
   test "the retained forwarded Plug shares named runtime state across requests" do
+    # The test asserts shared handler state across requests.
     root =
       start_supervised!(
         {Runtime,
@@ -70,7 +71,8 @@ defmodule Arbor.MCP.HttpPlugStartupRetirementTest do
          handler_args: [test: self()],
          name: __MODULE__.Runtime,
          transport: :mounted_http,
-         protocol_mode: :modern_only}
+         protocol_mode: :modern_only,
+         execution: :stateful}
       )
 
     assert_receive :retained_plug_initialized, 1_000

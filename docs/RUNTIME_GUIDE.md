@@ -44,27 +44,40 @@ For multiple servers, give each supervised child a distinct `:id` and any
 registered server a distinct `:name`. Configuration and runtime-owned state
 are scoped to that server.
 
-## Stateful and stateless callbacks
+## Concurrent and stateful callbacks
 
-The default is `execution: :stateful, max_concurrency: 1`. Callbacks execute
-serially in supervised workers and return the next handler state. A callback's
-`self()` is a worker PID, not the server handle; pass explicit server/context
-references to work that needs them.
+Servers handle the requests on a connection concurrently by default, as the
+other MCP SDKs do: a slow tool call doesn't hold up other calls, `ping` or
+`notifications/cancelled`. The default is `execution: :stateless,
+max_concurrency: 64`. `init/1` and `handle_initialize/2` may set up handler
+state; initializations commit one at a time. Every other callback runs in its
+own supervised worker against a snapshot of that state and must return the
+snapshot unchanged. Keep counters, caches and other mutable data where
+concurrent processes can share them: a GenServer, an Agent, an ETS table or
+your database. A callback that returns a changed state fails its request with
+`invalid_handler_state`, and the runtime logs a warning naming the handler the
+first time.
 
-Opt into concurrency only when callbacks do not update initialized state:
+Handlers that thread state through their callbacks, the way a GenServer does,
+opt into one-at-a-time execution:
 
 ```elixir
 {Arbor.MCP.Server.Runtime,
- handler: MyApp.ReadOnlyMCPServer,
+ handler: MyApp.CountingMCPServer,
  transport: :mounted_http,
- execution: :stateless,
- max_concurrency: 4,
- max_queue: 32}
+ execution: :stateful}
 ```
 
-Stateless callbacks must return unchanged handler state. External effects are
-still the application's responsibility; concurrency does not make those effects
-transactional or safe to retry.
+Stateful callbacks run one at a time, in arrival order, and each commits the
+state it returns. `max_concurrency` must stay 1. The runtime still answers
+`ping` while a stateful callback runs, because answering it needs no handler
+state. On stdio, a stateful server also waits until each response is written
+before it starts the next callback.
+
+Either way, a callback's `self()` is a worker PID, not the server handle; pass
+explicit server/context references to work that needs them. External effects
+are still the application's responsibility; concurrency does not make those
+effects transactional or safe to retry.
 
 ## Bound admission and waiting
 
@@ -73,7 +86,8 @@ These are separate settings, not interchangeable timeouts:
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `init_timeout_ms` | 10,000 ms | One budget for Runtime startup and handler initialization |
-| `request_timeout_ms` | 10,000 ms | Server work deadline |
+| `request_timeout_ms` | 3,600,000 ms (1 hour) | Server work deadline: a safety net, since callers end work with their own timeout |
+| `max_concurrency` | 64 (1 with `execution: :stateful`) | Callbacks running at once |
 | `max_queue` | 128 | Queued data work beyond active callback capacity |
 | `max_request_bytes` | 1,000,000 | Per-request retained input limit |
 | `max_pending_bytes` | 8,000,000 | Aggregate admitted input/context/options budget |

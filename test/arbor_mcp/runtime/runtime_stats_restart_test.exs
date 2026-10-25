@@ -137,7 +137,9 @@ defmodule Arbor.MCP.Server.RuntimeStatsRestartTest do
         handler: Handler,
         dispatcher: Handler,
         init_timeout_ms: 1_000,
-        shutdown_timeout_ms: 500
+        shutdown_timeout_ms: 500,
+        # The handler counts in its state.
+        execution: :stateful
       )
 
     Process.unlink(root)

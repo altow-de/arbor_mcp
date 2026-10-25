@@ -176,7 +176,7 @@ defmodule WeatherServiceRunner do
     IO.puts("Resources: weather://favorites, weather://current/{location}")
     IO.puts("Prompt: weather_assistant")
 
-    {:ok, _server} = WeatherService.start_link(transport: :stdio)
+    {:ok, _server} = WeatherService.start_link(transport: :stdio, execution: :stateful)
     Process.sleep(:infinity)
   end
 end

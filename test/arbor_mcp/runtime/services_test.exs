@@ -726,8 +726,15 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
     runtime
   end
 
+  # The handler and cancellation tracker commit state, one callback at a time.
   defp base_opts(parent \\ self()),
-    do: [id: make_ref(), handler: Handler, dispatcher: Handler, handler_args: parent]
+    do: [
+      id: make_ref(),
+      handler: Handler,
+      dispatcher: Handler,
+      handler_args: parent,
+      execution: :stateful
+    ]
 
   defp request(id, method), do: %{"jsonrpc" => "2.0", "id" => id, "method" => method}
 

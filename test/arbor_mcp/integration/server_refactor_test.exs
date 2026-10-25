@@ -97,7 +97,9 @@ defmodule Arbor.MCP.Integration.ServerRefactorTest do
       assert Enum.any?(prompts, &(&1.name == "test_prompt"))
     end
 
-    test "initialization stores negotiated protocol version in returned state" do
+    # The version is per connection, not handler state, so the DSL's
+    # handle_initialize leaves state unchanged (valid under stateless execution).
+    test "initialization negotiates the protocol version without changing handler state" do
       request = %{
         "jsonrpc" => "2.0",
         "method" => "initialize",
@@ -105,10 +107,11 @@ defmodule Arbor.MCP.Integration.ServerRefactorTest do
         "params" => %{"protocolVersion" => "2025-06-18"}
       }
 
-      {:response, response, new_state} = RequestProcessor.process(request, state())
+      state = state()
+      {:response, response, new_state} = RequestProcessor.process(request, state)
 
       assert response["result"]["protocolVersion"] == "2025-06-18"
-      assert new_state.protocol_version == "2025-06-18"
+      assert new_state == state
     end
   end
 

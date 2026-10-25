@@ -30,7 +30,9 @@ defmodule Arbor.MCP.CancellationComprehensiveTest do
           :ok
       end
 
-      # Track active requests for proper cancellation
+      # Track active requests for proper cancellation. The default
+      # CancellationTracker records cancellations in this state, so the
+      # servers below run with execution: :stateful.
       {:ok, %{active_requests: %{}, cancelled_requests: MapSet.new()}}
     end
 
@@ -280,7 +282,8 @@ defmodule Arbor.MCP.CancellationComprehensiveTest do
       {:ok, server} =
         Server.start_link(
           transport: :test,
-          handler: SlowHandler
+          handler: SlowHandler,
+          execution: :stateful
         )
 
       {:ok, client} =
@@ -384,7 +387,8 @@ defmodule Arbor.MCP.CancellationComprehensiveTest do
       {:ok, server} =
         Server.start_link(
           transport: :test,
-          handler: SlowHandler
+          handler: SlowHandler,
+          execution: :stateful
         )
 
       {:ok, client} =
@@ -478,7 +482,8 @@ defmodule Arbor.MCP.CancellationComprehensiveTest do
       {:ok, server} =
         Server.start_link(
           transport: :test,
-          handler: SlowHandler
+          handler: SlowHandler,
+          execution: :stateful
         )
 
       {:ok, client} =
@@ -546,7 +551,8 @@ defmodule Arbor.MCP.CancellationComprehensiveTest do
       {:ok, server} =
         Server.start_link(
           transport: :test,
-          handler: SlowHandler
+          handler: SlowHandler,
+          execution: :stateful
         )
 
       {:ok, client} =
@@ -594,7 +600,8 @@ defmodule Arbor.MCP.CancellationComprehensiveTest do
       {:ok, server} =
         Server.start_link(
           transport: :test,
-          handler: SlowHandler
+          handler: SlowHandler,
+          execution: :stateful
         )
 
       {:ok, client} =
@@ -661,7 +668,8 @@ defmodule Arbor.MCP.CancellationComprehensiveTest do
       {:ok, server} =
         Server.start_link(
           transport: :test,
-          handler: SlowHandler
+          handler: SlowHandler,
+          execution: :stateful
         )
 
       {:ok, client} =

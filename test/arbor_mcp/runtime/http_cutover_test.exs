@@ -463,6 +463,7 @@ defmodule Arbor.MCP.Server.Runtime.HTTPCutoverTest do
   defp runtime(options \\ []) do
     services = [subscriptions: [options: Keyword.merge([max_lifetime_ms: 250], options)]]
 
+    # The handler counts in its state, one callback at a time.
     root =
       start_supervised!(
         {Runtime,
@@ -470,6 +471,7 @@ defmodule Arbor.MCP.Server.Runtime.HTTPCutoverTest do
          handler_args: [observer: self()],
          transport: :mounted_http,
          request_timeout_ms: 2_000,
+         execution: :stateful,
          services: services},
         id: make_ref()
       )

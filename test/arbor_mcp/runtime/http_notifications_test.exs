@@ -650,7 +650,9 @@ defmodule Arbor.MCP.Server.Runtime.HTTPNotificationsTest do
         handler: Handler,
         handler_args: [observer: self()],
         request_timeout_ms: 2_000,
-        services: services(options)
+        services: services(options),
+        # The handler changes its state, one callback at a time.
+        execution: :stateful
       )
 
     {:ok, runtime} = Runtime.ref(root)

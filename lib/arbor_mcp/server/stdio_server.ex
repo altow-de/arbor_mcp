@@ -21,8 +21,9 @@ defmodule Arbor.MCP.Server.StdioServer do
 
   EOF fences new input, drains accepted work under its original deadlines
   and `:stdio_eof_timeout_ms`, then stops the owned runtime. The default EOF
-  budget is request timeout plus output timeout, capped at the largest finite
-  OTP timer. The cutoff is established once and never renewed.
+  budget is the request timeout, at most 10 s, plus the output timeout, so the
+  one-hour default request deadline doesn't keep a server alive for an hour
+  after its peer has gone. The cutoff is established once and never renewed.
 
   The reader retains at most one `:max_request_bytes` frame outside admission,
   reading bounded units before a newline arrives. OS and borrowed IO-device
@@ -115,7 +116,7 @@ defmodule Arbor.MCP.Server.StdioServer do
       Keyword.get(
         opts,
         :stdio_eof_timeout_ms,
-        min(@timer_limit, config.request_timeout_ms + config.output_timeout_ms)
+        min(@timer_limit, min(config.request_timeout_ms, 10_000) + config.output_timeout_ms)
       )
 
     cond do

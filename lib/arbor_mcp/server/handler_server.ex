@@ -4,9 +4,10 @@ defmodule Arbor.MCP.Server.HandlerServer do
 
   `start_link/1` returns an owned runtime supervisor. Its protocol edge handles
   validation, reverse requests and subscriptions; the runtime alone initializes,
-  executes and terminates the handler. Stateful callbacks run serially in
-  supervised tasks. Pass the supervisor or `Runtime.ref/1` reference to clients
-  and public `Arbor.MCP.Server` helpers.
+  executes and terminates the handler. Callbacks run in supervised tasks,
+  concurrently by default or one at a time with `execution: :stateful`. Pass
+  the supervisor or `Runtime.ref/1` reference to clients and public
+  `Arbor.MCP.Server` helpers.
 
   Custom callbacks use `Arbor.MCP.Server.call/3` and `Arbor.MCP.Server.cast/2`.
   Direct `GenServer` callers must explicitly resolve `Runtime.edge/1`; direct
@@ -69,7 +70,8 @@ defmodule Arbor.MCP.Server.HandlerServer do
     Initialization,
     OutputController,
     Ref,
-    ShutdownGuard
+    ShutdownGuard,
+    WorkClass
   }
 
   alias Arbor.MCP.Server.Subscriptions.Origin
@@ -237,6 +239,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
                    wire_ids: wire_ids(message),
                    uncancellable_ids: uncancellable_ids(message),
                    batch?: is_list(message),
+                   snapshot: WorkClass.snapshot?(message),
                    timeout: ingress_timeout(runtime, opts),
                    admission_deadline: Keyword.get(opts, :admission_deadline, :infinity)
                  ) do
@@ -668,7 +671,8 @@ defmodule Arbor.MCP.Server.HandlerServer do
       reservation.terminal ->
         fail_published(token, reservation, state)
 
-      (state.batch_active || state.initializing || state.stdio_active) &&
+      (state.batch_active || state.initializing ||
+         (state.stdio_active && not Map.get(reservation, :snapshot, false))) &&
           reservation.kind not in [:edge_control, :edge_response] ->
         state
 
@@ -868,7 +872,12 @@ defmodule Arbor.MCP.Server.HandlerServer do
     }
 
     state = put_in(state.ingress[token], ingress)
-    state = if stdio?(state), do: %{state | stdio_active: token}, else: state
+
+    state =
+      if hold_stdio?(state, requests, batch?),
+        do: %{state | stdio_active: token},
+        else: state
+
     state = if batch?, do: %{state | batch_active: token}, else: state
 
     if state.initializing do
@@ -1778,6 +1787,14 @@ defmodule Arbor.MCP.Server.HandlerServer do
   defp protocol_version_from_result(_result), do: nil
 
   defp stdio?(state), do: state.transport == Arbor.MCP.Server.Stdio.Writer
+
+  # A stateful runtime holds each stdio request until its response is written,
+  # so no later state change can follow an output whose delivery is uncertain.
+  # Stateless runtimes and snapshot work (ping) have no state to protect.
+  defp hold_stdio?(state, requests, batch?) do
+    stdio?(state) and not (not batch? and WorkClass.snapshot?(hd(requests))) and
+      match?({:ok, %{config: %{execution: :stateful}}}, Admission.route(Ref.table(state.runtime)))
+  end
 
   defp stdio_drained?(state) do
     table = Ref.table(state.runtime)

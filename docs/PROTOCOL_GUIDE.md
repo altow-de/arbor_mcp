@@ -203,7 +203,7 @@ use `Arbor.MCP.Client.notify/3` with the `elicitationId` from
     "elicitationId" => elicitation_id
   })
 
-# Server
+# Server, started with execution: :stateful so callbacks can update state
 @impl true
 def handle_elicitation_complete(elicitation_id, state) do
   {:ok, Map.put(state, :last_elicitation, elicitation_id)}

@@ -282,7 +282,13 @@ defmodule Arbor.MCP.Server.DynamicToolsMigrationTest do
   defp start_catalog(opts \\ []) do
     options =
       Keyword.merge(
-        [handler: DynamicTools, transport: :test, handler_args: [test_pid: self()]],
+        [
+          handler: DynamicTools,
+          transport: :test,
+          handler_args: [test_pid: self()],
+          # The tool catalog lives in handler state and commits one callback at a time.
+          execution: :stateful
+        ],
         opts
       )
 

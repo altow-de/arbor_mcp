@@ -365,13 +365,45 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   def send_message(message, %__MODULE__{use_sse: true, sse_pid: sse_pid} = state)
-      when is_pid(sse_pid) do
-    # SSE mode with active connection — use async POST so the GenServer
-    # can process SSE events (elicitation, sampling) while waiting for
-    # the POST response. The response arrives as {:async_post_result, result, meta}.
+      when is_pid(sse_pid),
+      do: async_post(message, state)
+
+  # SSE mode without active connection (pre-initialization) or fallback
+  def send_message(message, %__MODULE__{} = state), do: send_authenticated(message, state)
+
+  @doc false
+  # Sends `message` synchronously from the calling process, running any
+  # authentication its response asks for. The client re-sends a request this
+  # way when an async POST hands back an auth challenge, so only one
+  # authentication runs at a time.
+  @spec send_authenticated(term(), t()) ::
+          {:ok, t()} | {:ok, t(), term()} | {:error, term()}
+  def send_authenticated(message, %__MODULE__{} = state) do
+    case perform_and_maybe_auth(message, state) do
+      {:ok, response} -> handle_http_response(response, state, message)
+      {:ok, response, new_state} -> handle_http_response(response, new_state, message)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc false
+  # POSTs `message` from its own monitored task and returns at once, so the
+  # client process can send further requests and handle server messages while
+  # this one runs. The response arrives as {:async_post_result, result, meta},
+  # where meta carries the request id and the deadline the POST ran under.
+  # Used for every request sent after establishment, and for all messages
+  # once a legacy SSE stream is open.
+  @spec send_async(binary(), t()) :: {:ok, t()}
+  def send_async(message, %__MODULE__{} = state) when is_binary(message),
+    do: state |> maybe_start_deferred_sse(message) |> then(&async_post(message, &1))
+
+  defp async_post(message, state) do
     parent = self()
     request_id = extract_request_id(message)
     nonce = make_ref()
+    # Resolved here, in the client process, so tasks never refresh (and
+    # possibly rotate) a provider's token concurrently.
+    request_state = apply_provider_token(state)
 
     # spawn_monitor rather than Task.start: the parent (the Arbor.MCP.Client
     # GenServer) owns the monitor, so a crashed POST task produces a
@@ -386,20 +418,17 @@ defmodule Arbor.MCP.Transport.HTTP do
           1_000 -> exit(:client_generation_retired)
         end
 
-        result =
-          case perform_and_maybe_auth(message, state) do
-            {:ok, response} -> handle_http_response(response, state, message)
-            {:ok, response, new_state} -> handle_http_response(response, new_state, message)
-            {:error, reason} -> {:error, reason}
-          end
+        result = perform_async(message, request_state)
 
         # Report the durable transport-state fields this POST changed
-        # (session rotation, OAuth token refresh) so the client can merge
-        # them into its copy of the transport state instead of discarding.
+        # (session rotation, SSE metadata) so the client can merge them into
+        # its copy of the transport state instead of discarding.
         meta = %{
           request_id: request_id,
           task_pid: self(),
-          state_changes: result_state_changes(state, result)
+          deadline: request_state.deadline,
+          tool_list: tool_list_page(message),
+          state_changes: result_state_changes(request_state, result)
         }
 
         Lifetime.deliver(parent, {:async_post_result, result, meta})
@@ -411,15 +440,21 @@ defmodule Arbor.MCP.Transport.HTTP do
 
     # Return without response data — it will arrive via :async_post_result
     # or via the GET SSE stream (for SSE-formatted POST responses)
-    {:ok, state}
+    {:ok, %{state | auth_provider_state: request_state.auth_provider_state}}
   end
 
-  def send_message(message, %__MODULE__{} = state) do
-    # SSE mode without active connection (pre-initialization) or fallback
-    case perform_and_maybe_auth(message, state) do
-      {:ok, response} -> handle_http_response(response, state, message)
-      {:ok, response, new_state} -> handle_http_response(response, new_state, message)
-      {:error, reason} -> {:error, reason}
+  # A POST task does not authenticate: with several in flight, each would run
+  # the OAuth flow. It hands an auth challenge back to the client process,
+  # which re-sends that request with send_authenticated/2.
+  defp perform_async(message, state) do
+    case perform_http_request(message, state) do
+      {:ok, response} ->
+        if extract_auth_status(response) == :ok,
+          do: handle_http_response(response, state, message),
+          else: {:error, {:reauthenticate, message}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -751,7 +786,7 @@ defmodule Arbor.MCP.Transport.HTTP do
       BoundedClient.request(:post, url, headers, "application/json", body,
         deadline: state.deadline,
         connect_timeout: state.timeouts.connect,
-        request_timeout: state.timeouts.request,
+        request_timeout: response_timeout(state),
         max_request_bytes: state.max_request_bytes,
         max_response_bytes: state.max_response_bytes,
         transport_opts: transport_opts,
@@ -761,6 +796,14 @@ defmodule Arbor.MCP.Transport.HTTP do
       )
     end
   end
+
+  # A caller's own deadline decides how long it waits for its response, as
+  # in the other MCP SDKs; the transport's :request_timeout covers sends
+  # that carry none.
+  defp response_timeout(%{deadline: deadline}) when is_integer(deadline),
+    do: max(deadline - System.monotonic_time(:millisecond), 1)
+
+  defp response_timeout(state), do: state.timeouts.request
 
   @doc false
   # Builds the `http_options` list handed to `:httpc.request/4,5`.
@@ -795,17 +838,48 @@ defmodule Arbor.MCP.Transport.HTTP do
 
   # Transport-state fields an async POST may durably change. Everything else
   # is either transient (:last_response) or owned by the connection lifecycle
-  # (:sse_pid, :sse_deferred_attempted) and must never be reported back.
+  # (:sse_pid, :sse_deferred_attempted) and must never be reported back. The
+  # client updates :tool_headers itself from each tools/list result (see
+  # cache_tool_list/3), so concurrent pages cannot overwrite one another.
   @async_merge_fields [
     :session_id,
     :access_token,
     :auth_completed,
     :auth_provider_state,
     :headers,
-    :tool_headers,
     :retry_delay,
     :last_event_id
   ]
+
+  @doc false
+  # Applies a tools/list response from an async POST to the client's own
+  # transport state: a first page replaces the header cache, a cursor page
+  # adds to it, as cache_tool_headers/3 does for a synchronous send.
+  @spec cache_tool_list(t(), :first | :cursor, term()) :: t()
+  def cache_tool_list(%__MODULE__{} = state, kind, response_data) do
+    case Jason.decode(response_data) do
+      {:ok, %{"result" => %{"tools" => tools}}} when is_list(tools) and kind == :first ->
+        %{state | tool_headers: ToolHeaders.cache(tools)}
+
+      {:ok, %{"result" => %{"tools" => tools}}} when is_list(tools) ->
+        %{state | tool_headers: Map.merge(state.tool_headers || %{}, ToolHeaders.cache(tools))}
+
+      _other ->
+        state
+    end
+  rescue
+    _invalid -> state
+  end
+
+  defp tool_list_page(message) do
+    case Jason.decode(message) do
+      {:ok, %{"method" => "tools/list"} = request} ->
+        if get_in(request, ["params", "cursor"]), do: :cursor, else: :first
+
+      _other ->
+        nil
+    end
+  end
 
   defp result_state_changes(snapshot, {:ok, new_state}) do
     async_state_changes(snapshot, new_state)

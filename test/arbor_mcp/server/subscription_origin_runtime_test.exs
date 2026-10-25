@@ -253,7 +253,10 @@ defmodule Arbor.MCP.Server.SubscriptionOriginRuntimeTest do
       request_timeout_ms: 2_000,
       output_timeout_ms: 1_000,
       stdio_eof_timeout_ms: 3_000,
-      shutdown_timeout_ms: 100
+      shutdown_timeout_ms: 100,
+      # The handler counts in its state, and these tests rely on the stateful
+      # stdio edge holding each request until its response is written.
+      execution: :stateful
     ]
 
     filter = Keyword.get(opts, :subscription_filter, %{"toolsListChanged" => true})

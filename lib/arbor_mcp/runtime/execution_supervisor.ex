@@ -54,8 +54,10 @@ defmodule Arbor.MCP.Server.Runtime.ExecutionSupervisor do
   @doc false
   def start_tasks(table, config) do
     with {:ok, _context} <- Initialization.begin(table, config, :execution) do
+      # The Scheduler caps ordered callbacks at max_concurrency; snapshot work
+      # (ping) runs beside them, within the admitted data capacity.
       case Task.Supervisor.start_link(
-             max_children: config.max_concurrency,
+             max_children: config.max_concurrency + config.max_queue,
              timeout: Initialization.remaining(table)
            ) do
         {:ok, supervisor} = result ->

@@ -294,18 +294,18 @@ defmodule Arbor.MCP.Server.Runtime.HTTPReverseWireTest do
 
   defp host do
     root =
-      start_supervised!(
-        {Runtime,
-         [
-           name: HTTPReverseWireTest.Root,
-           handler: Handler,
-           handler_args: [observer: self()],
-           request_timeout_ms: 2_000,
-           max_concurrency: 1,
-           max_queue: 0,
-           services: [sessions: [options: [session_ttl_ms: 10_000]]]
-         ]}
-      )
+      start_supervised!({Runtime,
+       [
+         name: HTTPReverseWireTest.Root,
+         handler: Handler,
+         handler_args: [observer: self()],
+         request_timeout_ms: 2_000,
+         # The handler counts calls in its state, one callback at a time.
+         execution: :stateful,
+         max_concurrency: 1,
+         max_queue: 0,
+         services: [sessions: [options: [session_ttl_ms: 10_000]]]
+       ]})
 
     {:ok, runtime} = Runtime.ref(root)
     ref = make_ref()

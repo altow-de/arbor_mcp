@@ -316,6 +316,8 @@ defmodule Arbor.MCP.Server.Runtime.HTTPProtocolHeaderCompatibilityTest do
              handler: Handler,
              handler_args: [observer: self()],
              request_timeout_ms: 2_000,
+             # The handler stores its initialization and counts in its state.
+             execution: :stateful,
              max_concurrency: 1,
              max_queue: 1,
              max_http_io_frames: 2,

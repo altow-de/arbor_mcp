@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING:** Servers handle the requests on a connection concurrently by
+  default, like the other MCP SDKs. The runtime default is now
+  `execution: :stateless, max_concurrency: 64` (was `execution: :stateful,
+  max_concurrency: 1`). `init/1` and `handle_initialize/2` may still set up
+  handler state, and initializations commit one at a time. Every other callback
+  must return its snapshot of the state unchanged; one that returns a changed
+  state fails its request with `invalid_handler_state` (over HTTP too, where it
+  was reported as `output_failed`), and the runtime logs a warning naming the
+  handler the first time. A stateless callback was compared with the latest
+  committed state rather than its own snapshot, so a commit made while it ran
+  (an initialization, a cancellation tracker) failed it; it is now compared
+  with its snapshot. Keep mutable data in a process or ETS table, or start the server
+  with `execution: :stateful` to run callbacks one at a time and commit their
+  state as before. `execution: :stateful` now implies `max_concurrency: 1`.
+- **BREAKING:** The server's `request_timeout_ms` defaults to one hour (was
+  10 s). Tools that ran longer than 10 s used to fail with `handler_timeout`
+  while the client was still waiting. The caller's timeout now decides, and a
+  timed-out request is cancelled on the server (see below).
+- **BREAKING:** DSL servers' generated `handle_initialize/2` no longer stores the
+  negotiated `:protocol_version` in handler state. The version belongs to a
+  connection, and one runtime can serve several.
+- A stateful server answers `ping` while a callback runs instead of queueing it
+  behind that callback, so peers can tell a busy server from a dead one.
+- The stdio server runs requests concurrently when its runtime is stateless. It
+  held each request until the previous response was written whatever the
+  execution mode; a stateful stdio server still does.
+- The HTTP client sends each request after establishment from its own task, so
+  concurrent calls on one client no longer wait for each other. Before, only a
+  legacy client with an open SSE stream did; a modern-era client sent one POST
+  at a time. A client holds at most `:max_client_workers` (256) requests in
+  flight. When a server asks a request to authenticate, the client re-sends it
+  from its own process, so concurrent challenges run one token refresh or OAuth
+  flow; POST tasks, including the legacy SSE ones, no longer authenticate on
+  their own. A POST's response answers the request it carried even when the
+  body echoes a null or different id.
+- The HTTP client waits as long as the caller's own timeout for a response. The
+  transport's `:request_timeout` (30 s) applied even when a caller asked for
+  longer; it now covers only sends that carry no caller deadline.
+- When a request times out, the client cancels it on the server, as the MCP
+  spec asks: it sends `notifications/cancelled`, or over modern Streamable HTTP
+  closes the request's connection. It used to stop waiting without telling the
+  server.
+- A stdio server's default EOF drain stays at the request timeout, at most 10 s,
+  plus the output timeout (15 s with the defaults), rather than following the
+  new one-hour request deadline.
 - Locked `plug_crypto` 2.2.1 and `cowlib` 2.21.0. plug_crypto 2.2.1 fixes
   CVE-2026-105963 (the secret key base or compared secret landing in
   `FunctionClauseError` stack frames); Arbor.MCP only calls

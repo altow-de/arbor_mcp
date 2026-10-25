@@ -254,7 +254,9 @@ defmodule Arbor.MCP.CompletionComplianceTest do
     {:ok, server} =
       Server.start_link(
         transport: :test,
-        handler: TestCompletionServer
+        handler: TestCompletionServer,
+        # The handler records completion requests for rate limiting.
+        execution: :stateful
       )
 
     # Start client

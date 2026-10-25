@@ -1048,6 +1048,8 @@ defmodule Arbor.MCP.Server.Runtime.Admission do
             wire_ids: Keyword.get(opts, :wire_ids, []),
             uncancellable_ids: Keyword.get(opts, :uncancellable_ids, []),
             batch?: Keyword.get(opts, :batch?, false),
+            # Ping may pass a stateful stdio edge's envelope barrier.
+            snapshot: Keyword.get(opts, :snapshot, false) == true,
             # One immutable outcome cell per retained invocation (including
             # a batch's current member); copied source proofs add explicit
             # control bytes. Failed candidates allocate no native cells.

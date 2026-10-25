@@ -682,7 +682,10 @@ defmodule Arbor.MCP.Server.Runtime.HTTPCancellationTest do
                dispatcher: Handler,
                handler_args: [test: self()],
                request_timeout_ms: 2_000,
-               services: [sessions: [adapter: EpochStore]]
+               services: [sessions: [adapter: EpochStore]],
+               # The handler commits state, and these tests queue work behind
+               # one running callback.
+               execution: :stateful
              ],
              opts
            )},

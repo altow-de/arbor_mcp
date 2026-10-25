@@ -500,7 +500,12 @@ defmodule Arbor.MCP.Server.DSL.ComponentsTest do
   end
 
   defp start_host(transport) do
-    root = start_supervised!({Host, transport: transport, handler_args: [test_pid: self()]})
+    # Host and component callbacks count in the shared handler state.
+    root =
+      start_supervised!(
+        {Host, transport: transport, handler_args: [test_pid: self()], execution: :stateful}
+      )
+
     module = if transport == :beam, do: Local, else: Test
     {:ok, connection} = module.connect(server: root)
     {root, connection}

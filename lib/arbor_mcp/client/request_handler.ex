@@ -433,6 +433,14 @@ defmodule Arbor.MCP.Client.RequestHandler do
     if byte_size(encoded) <= limit, do: :ok, else: {:error, :request_too_large}
   end
 
+  @doc false
+  # The caller's error for a send that failed after it was handed to the
+  # transport, including one made from an async HTTP task: the same shape
+  # whether the send was synchronous or not.
+  def send_error(:deadline_expired, state), do: not_sent_error(:deadline_expired, state)
+  def send_error(:caller_gone, state), do: not_sent_error(:caller_gone, state)
+  def send_error(reason, state), do: send_failure(reason, state)
+
   # The transport's reason is kept as a term, so a caller can tell a request
   # that never left (see Arbor.MCP.Client.delivery_outcome/1) from one that may
   # have; `message` is kept for callers that read the text.
@@ -490,11 +498,23 @@ defmodule Arbor.MCP.Client.RequestHandler do
     if stream_requested? do
       open_request_stream(request, state, transport_state)
     else
-      send_message(request, state)
+      send_http_request(request, state)
     end
   end
 
+  defp send_request_message(request, %{transport_mod: HTTP, transport_state: %HTTP{}} = state),
+    do: send_http_request(request, state)
+
   defp send_request_message(request, state), do: send_message(request, state)
+
+  # Each request POSTs from its own task, so one slow request does not hold
+  # the client: other requests and server messages proceed meanwhile.
+  defp send_http_request(request, state) do
+    with {:ok, encoded} <- encode_for_transport(HTTP, request),
+         {:ok, transport_state} <- HTTP.send_async(encoded, state.transport_state) do
+      {:ok, %{state | transport_state: transport_state}}
+    end
+  end
 
   defp open_request_stream(request, state, transport_state) do
     with {:ok, encoded} <- encode_for_transport(HTTP, request),
@@ -778,7 +798,24 @@ defmodule Arbor.MCP.Client.RequestHandler do
           transport_state: %HTTP{protocol_era: :modern} = transport_state
         } = state
       ) do
-    %{state | transport_state: HTTP.close_stream(transport_state, request_id)}
+    # Closing the connection is how modern HTTP cancels a request, whether
+    # its response is a stream or a pending POST. The POST task is forgotten
+    # first, so neither its exit nor a late result reaches the client.
+    {posts, tasks} =
+      Map.split_with(state.async_post_tasks || %{}, fn {_monitor, entry} ->
+        match?({_pid, ^request_id}, entry)
+      end)
+
+    for {monitor, {pid, _id}} <- posts do
+      Process.demonitor(monitor, [:flush])
+      Process.exit(pid, :kill)
+    end
+
+    %{
+      state
+      | async_post_tasks: tasks,
+        transport_state: HTTP.close_stream(transport_state, request_id)
+    }
   end
 
   def close_request_stream(request_id, %{transport_mod: LegacySSE} = state) do
@@ -834,6 +871,33 @@ defmodule Arbor.MCP.Client.RequestHandler do
     Enum.reduce(responses, {:noreply, state}, fn response, {:noreply, current_state} ->
       handle_single_response(response, current_state)
     end)
+  end
+
+  @doc false
+  # An HTTP POST's response answers the request that POST carried, whatever
+  # id its body echoes (a server may answer an invalid request with a null
+  # id), as when the POST was synchronous, and is dropped once that request
+  # has settled (timed out or cancelled), never routed to another one.
+  # Anything else, such as a batch, a notification or a server request, or
+  # the response to a POST that carried no request, is routed as usual.
+  def handle_post_response(response_data, nil, state),
+    do: parse_transport_message(response_data, state)
+
+  def handle_post_response(response_data, request_id, state) do
+    case Protocol.parse_message(response_data) do
+      {kind, payload, _echoed_id} when kind in [:result, :error] ->
+        if pending_single?(state.pending_requests, request_id),
+          do: handle_single_response({kind, payload, request_id}, state),
+          else: {:noreply, state}
+
+      _other ->
+        parse_transport_message(response_data, state)
+    end
+  end
+
+  defp pending_single?(pending, request_id) do
+    match?({_from, :single, _method}, Map.get(pending, request_id)) or
+      match?({_from, :single}, Map.get(pending, request_id))
   end
 
   @doc """
@@ -1097,6 +1161,24 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
         state
     end
+  end
+
+  @doc false
+  # Sends a notification over HTTP from its own POST task, so a slow server
+  # cannot hold the client; other transports send it as usual.
+  def send_notification_async(method, params, %{transport_mod: HTTP} = state) do
+    with %HTTP{} <- state.transport_state,
+         {:ok, notification} <- build_request(method, params, nil, state),
+         {:ok, state} <- send_http_request(notification, state) do
+      state
+    else
+      _not_sent -> state
+    end
+  end
+
+  def send_notification_async(method, params, state) do
+    {:noreply, state} = handle_cast_notification(method, params, state)
+    state
   end
 
   @doc """
