@@ -45,10 +45,35 @@ own private helpers, defaults and compiled validators. Including a component
 initializes only the host handler and starts one Runtime. Component callbacks
 must accept the host's state shape.
 
+## Server options
+
+```elixir
+use Arbor.MCP.Server.DSL,
+  name: "repo-tools",
+  version: "1.0.0",
+  instructions: "Call list_repos before reading a repository.",
+  capabilities: [resources: [subscribe: true]],
+  page_size: 50
+```
+
+- `instructions:` is returned by `initialize` and `server/discover`. Clients
+  read it with `Arbor.MCP.Client.instructions/1`, as with the `instructions`
+  option of the TypeScript and Python servers.
+- `capabilities:` is merged into the generated capabilities. The DSL
+  advertises `tools`, `resources` and `prompts` with `listChanged: true`, and
+  `completions` when a declaration has a completer. Send the notifications with
+  `Arbor.MCP.Server.notify_tools_changed/1` and its resource and prompt siblings.
+- `page_size:` paginates `tools/list`, `resources/list`,
+  `resources/templates/list` and `prompts/list`. Each page carries an opaque
+  `nextCursor`, and an invalid cursor fails with `-32602`. Without it every
+  list is one page, and any cursor is ignored. `Arbor.MCP.Client.all_tools/2`
+  and the other `all_*` helpers follow the cursors.
+
 ## Declaration validation
 
-`use Arbor.MCP.Server.DSL` accepts `:name`, `:version`, `:server_info` and
-`:components`; unknown or repeated options fail compilation. Nested instructions
+`use Arbor.MCP.Server.DSL` accepts `:name`, `:version`, `:server_info`,
+`:components`, `:instructions`, `:capabilities` and `:page_size`; unknown or
+repeated options fail compilation. Nested instructions
 must appear inside a primitive block. Parameter and prompt-argument names must
 be unique within that primitive, and scalar instructions such as `title`,
 `annotations` or `input_schema` may appear only once. Errors identify the source
@@ -343,6 +368,72 @@ end
 {:ok, prompt} = Arbor.MCP.Client.get_prompt(client, "review_screenshot")
 {:ok, prompt} = Arbor.MCP.Client.get_prompt(client, "code_review", %{"code" => "def add(a, b), do: a + b"})
 ```
+
+## Completion
+
+Prompt arguments and resource-template variables take `complete:`, which
+answers `completion/complete` for them:
+
+```elixir
+prompt "scaffold", "Scaffold a project" do
+  arg :language, complete: ["elixir", "erlang", "gleam"]
+  arg :framework, complete: &MyApp.Frameworks.complete/2
+  arg :name, complete: :suggest_names
+  render fn args, state -> {:ok, "Scaffold #{args.name}", state} end
+end
+
+resource_template "repo://{owner}/{name}", "A repository" do
+  param :owner, :string, complete: :suggest_owners
+  param :name, :string
+  read fn %{owner: owner, name: name}, state -> {:ok, "#{owner}/#{name}", state} end
+end
+
+def suggest_names(value, _context), do: ["#{value}-app", "#{value}-service"]
+
+def suggest_owners(value, _context),
+  do: Enum.filter(["anthropics", "trust-arbor"], &String.starts_with?(&1, value))
+```
+
+- A list of strings is filtered by case-insensitive prefix.
+- A function name, or an external capture of arity 2, is called with the typed
+  value and the request's `context`. The context holds the arguments the user
+  has already filled in, under `"arguments"`, so one argument can depend on
+  another. A named function must be public in the module that declares it, and
+  is checked at compilation. Anonymous functions are rejected: they can't be
+  stored at compile time.
+- The response lists the first 100 values, with `total` and `hasMore`, which
+  is the spec's limit.
+
+Arguments without `complete:` fall through to your `handle_complete/3`, so a
+hand-written callback can still cover the rest. Clients pass the context with
+`Arbor.MCP.Client.complete(client, ref, argument, context: %{"arguments" => ...})`.
+
+## Adding tools at runtime
+
+DSL declarations are fixed at compile time. To change what a running server
+offers, register definitions with a function that serves them:
+
+```elixir
+{:ok, server} = MyServer.start_link(transport: :http, port: 4000)
+
+:ok =
+  Arbor.MCP.Server.add_tool(
+    server,
+    %{name: "lookup", inputSchema: %{type: "object", properties: %{id: %{type: "string"}}}},
+    fn %{"id" => id} -> Arbor.MCP.Server.Result.text(MyApp.Catalog.describe(id)) end
+  )
+
+:ok = Arbor.MCP.Server.remove_tool(server, "lookup")
+```
+
+`add_resource/3`, `add_resource_template/3` and `add_prompt/3` work the same
+way. Each change sends the matching `list_changed` notification. Registered
+entries follow the DSL's in lists and take precedence over a DSL entry with
+the same name. A server whose only tools are registered at runtime should
+declare `capabilities: [tools: [listChanged: true]]` so clients that connect
+first know to ask for them. Over HTTP, a change made outside a request
+reaches clients listening with `subscriptions/listen`; legacy HTTP sessions
+see it the next time they list.
 
 ## Metadata
 

@@ -79,6 +79,30 @@ explicit server/context references to work that needs them. External effects
 are still the application's responsibility; concurrency does not make those
 effects transactional or safe to retry.
 
+## Middleware
+
+`:middleware` wraps every request and notification dispatched to the handler,
+like Python's `MCPServer(middleware=[...])` and Go's `AddReceivingMiddleware`.
+List modules that implement `Arbor.MCP.Server.Middleware`, or `{module, opts}`
+pairs, outermost first:
+
+```elixir
+{Arbor.MCP.Server.Runtime,
+ handler: MyApp.MCPServer,
+ transport: :mounted_http,
+ middleware: [MyApp.MCPAudit, {MyApp.MCPRateLimit, per_minute: 60}]}
+```
+
+Each gets the request (`:method`, `:id`, `:params`, `:context`) and a `next`
+function, and returns what `next` returned or its own `{:ok, result}` or
+`{:error, %{"code" => code, "message" => message}}`. It can refuse a request
+by not calling `next`, change the params it passes on (they are validated
+again), or change the result. It runs in the callback worker, inside
+`Arbor.MCP.Server.Context`, so `Context.auth_info/0` is available, and it
+never sees the handler state. The chain also sees `initialize`,
+`server/discover`, `ping` and notifications; it doesn't see
+`notifications/cancelled` or messages rejected before dispatch.
+
 ## Bound admission and waiting
 
 These are separate settings, not interchangeable timeouts:

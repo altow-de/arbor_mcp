@@ -49,7 +49,15 @@ defmodule Arbor.MCP.Server.DSL do
   # is loading. Give their worker enough scheduler headroom during parallel
   # builds without relaxing the tighter runtime policy default.
   @compile_time_schema_timeout_ms 5_000
-  @use_options [:name, :version, :server_info, :components]
+  @use_options [
+    :name,
+    :version,
+    :server_info,
+    :components,
+    :instructions,
+    :capabilities,
+    :page_size
+  ]
 
   defmacro __using__(opts) do
     assert_use_options!(opts, __CALLER__)
@@ -62,6 +70,7 @@ defmodule Arbor.MCP.Server.DSL do
       alias Arbor.MCP.Server.Result, as: ToolResult
 
       @ex_mcp_dsl_opts unquote(Macro.escape(opts))
+      @ex_mcp_dsl_page_size unquote(Keyword.get(opts, :page_size))
       @ex_mcp_dsl_component_source unquote(Macro.escape(source))
       Module.register_attribute(__MODULE__, :ex_mcp_dsl_tools, accumulate: true)
       Module.register_attribute(__MODULE__, :ex_mcp_dsl_resources, accumulate: true)
@@ -125,6 +134,8 @@ defmodule Arbor.MCP.Server.DSL do
     assert_unique_ids!(env, resources, :resource, & &1.uri)
     assert_unique_ids!(env, resource_templates, :resource_template, & &1.uriTemplate)
     assert_unique_ids!(env, prompts, :prompt, & &1.name)
+    assert_local_completers!(env, resource_templates, :resource_templates, locations)
+    assert_local_completers!(env, prompts, :prompts, locations)
 
     quote do
       @doc false
@@ -143,6 +154,8 @@ defmodule Arbor.MCP.Server.DSL do
 
       unquote_splicing(generate_prompt_handlers(prompts))
       unquote(generate_prompt_callbacks(prompts))
+
+      unquote(generate_completion_callback(env.module, resource_templates, prompts))
     end
   end
 
@@ -639,7 +652,34 @@ defmodule Arbor.MCP.Server.DSL do
   defp literal_value!(value, _env, _context, _meta) when is_integer(value), do: value
   defp literal_value!(value, _env, _context, _meta) when is_float(value), do: value
 
-  defp literal_value!(other, env, context, meta) do
+  # External captures such as &MyApp.Names.complete/2, used by complete:
+  defp literal_value!(
+         {:&, _, [{:/, _, [{{:., _, [module, function]}, _, []}, arity]}]} = capture,
+         env,
+         context,
+         meta
+       )
+       when is_atom(function) and is_integer(arity) do
+    case Macro.expand(module, env) do
+      module when is_atom(module) -> Function.capture(module, function, arity)
+      _other -> literal_error!(capture, env, context, meta)
+    end
+  end
+
+  defp literal_value!(other, env, context, meta), do: literal_error!(other, env, context, meta)
+
+  @spec literal_error!(Macro.t(), Macro.Env.t(), String.t(), keyword() | nil) :: no_return()
+  defp literal_error!({:fn, _, _} = function, env, context, meta) do
+    compile_error!(
+      env,
+      meta,
+      "Anonymous functions can't be stored at compile time (#{context}, got: " <>
+        "#{Macro.to_string(function)}). For complete:, pass a local function name " <>
+        "such as :suggest or an external capture such as &MyApp.Names.complete/2."
+    )
+  end
+
+  defp literal_error!(other, env, context, meta) do
     compile_error!(
       env,
       meta,
@@ -695,9 +735,26 @@ defmodule Arbor.MCP.Server.DSL do
             "Repeated Arbor.MCP.Server.DSL option #{inspect(key)}; declare it only once."
           )
 
+      assert_use_option_value!(key, Keyword.fetch!(opts, key), env)
       [key | seen]
     end)
   end
+
+  defp assert_use_option_value!(:page_size, size, env)
+       when not (is_integer(size) and size > 0) and not is_nil(size),
+       do:
+         compile_error!(
+           env,
+           [],
+           "page_size: must be a positive integer, got: #{Macro.to_string(size)}"
+         )
+
+  defp assert_use_option_value!(:instructions, text, env)
+       when not is_binary(text) and not is_nil(text),
+       do:
+         compile_error!(env, [], "instructions: must be a string, got: #{Macro.to_string(text)}")
+
+  defp assert_use_option_value!(_key, _value, _env), do: :ok
 
   defp line_from(meta) when is_list(meta), do: Keyword.get(meta, :line)
   defp line_from(_), do: nil
@@ -723,9 +780,15 @@ defmodule Arbor.MCP.Server.DSL do
 
   defp generate_server_callbacks(module, opts, tools, resources, resource_templates, prompts) do
     server_info = server_info(module, opts)
-    capabilities = capabilities(tools, resources, resource_templates, prompts)
+    instructions = instructions!(opts)
+
+    capabilities =
+      tools
+      |> capabilities(resources, resource_templates, prompts)
+      |> deep_merge(stringify_capabilities(Keyword.get(opts, :capabilities, %{})))
+
     start_link_callback = generate_start_link_callback(server_info)
-    initialize_callback = generate_initialize_callback(server_info, capabilities)
+    initialize_callback = generate_initialize_callback(server_info, capabilities, instructions)
 
     quote do
       unquote(start_link_callback)
@@ -736,6 +799,9 @@ defmodule Arbor.MCP.Server.DSL do
 
       @doc false
       def __server_capabilities__, do: unquote(Macro.escape(capabilities))
+
+      @doc false
+      def __server_instructions__, do: unquote(instructions)
     end
   end
 
@@ -750,7 +816,7 @@ defmodule Arbor.MCP.Server.DSL do
     end
   end
 
-  defp generate_initialize_callback(server_info, capabilities) do
+  defp generate_initialize_callback(server_info, capabilities, instructions) do
     quote do
       alias Arbor.MCP.Internal.VersionRegistry
       alias Arbor.MCP.Protocol.Initialize
@@ -772,11 +838,18 @@ defmodule Arbor.MCP.Server.DSL do
           end
 
         result =
-          Initialize.build_initialize_result(params, %{
-            "protocolVersion" => protocol_version,
-            "serverInfo" => unquote(Macro.escape(server_info)),
-            "capabilities" => unquote(Macro.escape(capabilities))
-          })
+          Initialize.build_initialize_result(
+            params,
+            Arbor.MCP.Internal.Maps.put_present(
+              %{
+                "protocolVersion" => protocol_version,
+                "serverInfo" => unquote(Macro.escape(server_info)),
+                "capabilities" => unquote(Macro.escape(capabilities))
+              },
+              "instructions",
+              unquote(instructions)
+            )
+          )
 
         # handle_initialize may update state even on a stateless runtime.
         {:ok, result, Map.put(state, :protocol_version, protocol_version)}
@@ -847,8 +920,13 @@ defmodule Arbor.MCP.Server.DSL do
       alias Arbor.MCP.Server.Result
 
       @impl Arbor.MCP.Server.Handler
-      def handle_list_tools(_cursor, state) do
-        {:ok, unquote(Macro.escape(definitions)), nil, state}
+      def handle_list_tools(cursor, state) do
+        Builder.list_page(
+          unquote(Macro.escape(definitions)),
+          cursor,
+          @ex_mcp_dsl_page_size,
+          state
+        )
       end
 
       @impl Arbor.MCP.Server.Handler
@@ -1014,8 +1092,13 @@ defmodule Arbor.MCP.Server.DSL do
   defp generate_list_resources(resource_definitions) do
     quote do
       @impl Arbor.MCP.Server.Handler
-      def handle_list_resources(_cursor, state) do
-        {:ok, unquote(Macro.escape(resource_definitions)), nil, state}
+      def handle_list_resources(cursor, state) do
+        Builder.list_page(
+          unquote(Macro.escape(resource_definitions)),
+          cursor,
+          @ex_mcp_dsl_page_size,
+          state
+        )
       end
     end
   end
@@ -1025,8 +1108,13 @@ defmodule Arbor.MCP.Server.DSL do
   defp generate_list_resource_templates(template_definitions) do
     quote do
       @impl Arbor.MCP.Server.Handler
-      def handle_list_resource_templates(_cursor, state) do
-        {:ok, unquote(Macro.escape(template_definitions)), nil, state}
+      def handle_list_resource_templates(cursor, state) do
+        Builder.list_page(
+          unquote(Macro.escape(template_definitions)),
+          cursor,
+          @ex_mcp_dsl_page_size,
+          state
+        )
       end
     end
   end
@@ -1092,8 +1180,13 @@ defmodule Arbor.MCP.Server.DSL do
       defoverridable handle_list_prompts: 2, handle_get_prompt: 3
 
       @impl Arbor.MCP.Server.Handler
-      def handle_list_prompts(_cursor, state) do
-        {:ok, unquote(Macro.escape(definitions)), nil, state}
+      def handle_list_prompts(cursor, state) do
+        Builder.list_page(
+          unquote(Macro.escape(definitions)),
+          cursor,
+          @ex_mcp_dsl_page_size,
+          state
+        )
       end
 
       @impl Arbor.MCP.Server.Handler
@@ -1151,11 +1244,130 @@ defmodule Arbor.MCP.Server.DSL do
     end
   end
 
+  # Lists can change at runtime, so each declared kind advertises listChanged,
+  # as the TypeScript and Go SDKs do. Completions appear when any prompt
+  # argument or template variable declares `complete:`. The `capabilities:`
+  # option is merged over this, for example to add `resources.subscribe`.
   defp capabilities(tools, resources, resource_templates, prompts) do
     %{}
-    |> maybe_put_capability(tools != [], "tools", %{})
-    |> maybe_put_capability(resources != [] or resource_templates != [], "resources", %{})
-    |> maybe_put_capability(prompts != [], "prompts", %{})
+    |> maybe_put_capability(tools != [], "tools", %{"listChanged" => true})
+    |> maybe_put_capability(
+      resources != [] or resource_templates != [],
+      "resources",
+      %{"listChanged" => true}
+    )
+    |> maybe_put_capability(prompts != [], "prompts", %{"listChanged" => true})
+    |> maybe_put_capability(
+      completers(resource_templates, prompts) != %{},
+      "completions",
+      %{}
+    )
+  end
+
+  # %{{"ref/prompt", name} | {"ref/resource", uri_template} =>
+  #   %{argument_name => {completer, declaring_module}}}
+  defp completers(module, resource_templates, prompts) do
+    entries =
+      Enum.map(prompts, fn {definition, handler, args} ->
+        {{"ref/prompt", definition.name}, args, declaring_module(handler, module)}
+      end) ++
+        Enum.map(resource_templates, fn {definition, handler, params} ->
+          {{"ref/resource", definition.uriTemplate}, params, declaring_module(handler, module)}
+        end)
+
+    for {key, params, owner} <- entries,
+        completers = param_completers(params, owner),
+        completers != %{},
+        into: %{},
+        do: {key, completers}
+  end
+
+  defp completers(resource_templates, prompts), do: completers(nil, resource_templates, prompts)
+
+  defp param_completers(params, owner) do
+    for %{complete: completer, name: name} <- params, completer != nil, into: %{} do
+      {Atom.to_string(name), {completer, owner}}
+    end
+  end
+
+  # A complete: :name completer is called as owner.name(value, context), so it
+  # must be public. Imported component entries were checked in their own module.
+  defp assert_local_completers!(env, entries, kind, locations) do
+    for {_definition, handler, params} = entry <- entries,
+        not match?({:component, _module, _id, _source}, handler),
+        %{complete: {:local, function}, name: name} <- params,
+        not Module.defines?(env.module, {function, 2}, :def) do
+      line = locations |> Map.get({kind, entry}, %{}) |> Map.get(:line)
+
+      compile_error!(
+        env,
+        [line: line],
+        "complete: #{inspect(function)} for #{inspect(name)} needs a public " <>
+          "#{function}/2 in #{inspect(env.module)} that takes (value, context)"
+      )
+    end
+  end
+
+  defp declaring_module({:component, module, _id, _source}, _host), do: module
+  defp declaring_module(_handler, host), do: host
+
+  defp generate_completion_callback(module, resource_templates, prompts) do
+    completers = completers(module, resource_templates, prompts)
+
+    if completers == %{} do
+      nil
+    else
+      quote do
+        @doc false
+        def __ex_mcp_dsl_completers__, do: unquote(Macro.escape(completers))
+
+        @impl Arbor.MCP.Server.Handler
+        def handle_complete(ref, argument, context, state) do
+          key =
+            case ref do
+              %{"type" => "ref/prompt", "name" => name} -> {"ref/prompt", name}
+              %{"type" => "ref/resource", "uri" => uri} -> {"ref/resource", uri}
+              _other -> nil
+            end
+
+          name = is_map(argument) && argument["name"]
+
+          case __ex_mcp_dsl_completers__() |> Map.get(key, %{}) |> Map.get(name) do
+            {completer, owner} ->
+              value = argument["value"]
+
+              {:ok, Builder.complete(completer, owner, value, context || %{}), state}
+
+            nil ->
+              handle_complete(ref, argument, state)
+          end
+        end
+      end
+    end
+  end
+
+  defp stringify_capabilities(value) when is_map(value) or is_list(value) do
+    if is_list(value) and not Keyword.keyword?(value),
+      do: value,
+      else:
+        Map.new(value, fn {key, nested} -> {to_string(key), stringify_capabilities(nested)} end)
+  end
+
+  defp stringify_capabilities(value), do: value
+
+  defp deep_merge(left, right) do
+    Map.merge(left, right, fn
+      _key, %{} = l, %{} = r -> deep_merge(l, r)
+      _key, _l, r -> r
+    end)
+  end
+
+  defp instructions!(opts) do
+    case Keyword.get(opts, :instructions) do
+      nil -> nil
+      text when is_binary(text) -> text
+      other -> raise ArgumentError, "instructions: must be a string, got: #{inspect(other)}"
+    end
   end
 
   defp maybe_put_capability(capabilities, true, key, value),

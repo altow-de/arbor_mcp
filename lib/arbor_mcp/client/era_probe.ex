@@ -31,6 +31,7 @@ defmodule Arbor.MCP.Client.EraProbe do
           protocol_version: String.t(),
           server_info: map() | nil,
           server_capabilities: map(),
+          instructions: String.t() | nil,
           discovery: map()
         }
 
@@ -189,6 +190,7 @@ defmodule Arbor.MCP.Client.EraProbe do
              protocol_version: selected_version,
              server_info: discovery.server_info,
              server_capabilities: discovery.capabilities,
+             instructions: discovery.instructions,
              discovery: result
            }, transport_state}
         else

@@ -2020,23 +2020,31 @@ defmodule Arbor.MCP.Server.HandlerServer do
   defp to_string_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
   defp to_string_reason(_reason), do: "invalid_subscription"
 
+  # A connection whose era isn't pinned yet hasn't finished `initialize` or
+  # its first modern request, and a client still establishing it would take a
+  # list change for the answer it's waiting for. It lists afresh once ready.
   defp publish_or_send(method, params, state) do
-    if modern_connection?(state) do
-      _counts =
-        Subscriptions.publish(
-          method,
-          params,
-          subscription_publication_options(state)
-        )
+    cond do
+      modern_connection?(state) ->
+        _counts =
+          Subscriptions.publish(
+            method,
+            params,
+            subscription_publication_options(state)
+          )
 
-      {:noreply, state}
-    else
-      notification = %{"jsonrpc" => "2.0", "method" => method, "params" => params}
+        {:noreply, state}
 
-      case send_message(notification, state) do
-        {:ok, new_state} -> {:noreply, new_state}
-        {:error, _reason} -> {:noreply, state}
-      end
+      state.connection_era == :legacy ->
+        notification = %{"jsonrpc" => "2.0", "method" => method, "params" => params}
+
+        case send_message(notification, state) do
+          {:ok, new_state} -> {:noreply, new_state}
+          {:error, _reason} -> {:noreply, state}
+        end
+
+      true ->
+        {:noreply, state}
     end
   end
 

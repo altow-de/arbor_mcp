@@ -12,7 +12,12 @@ defmodule Arbor.MCP.Server.DSL.ComponentsTest do
 
   defmodule Leaf do
     use Arbor.MCP.Server.Handler
-    use Arbor.MCP.Server.DSL, name: "leaf", version: "99"
+
+    use Arbor.MCP.Server.DSL,
+      name: "leaf",
+      version: "99",
+      instructions: "leaf only",
+      capabilities: [logging: %{}]
 
     alias Arbor.MCP.Server.DSL.ComponentsTest.Formatting, as: LocalFormatting
 
@@ -261,15 +266,19 @@ defmodule Arbor.MCP.Server.DSL.ComponentsTest do
   test "host initialization info and capabilities do not inherit component server options" do
     assert Host.__server_info__() == %{"name" => "host", "version" => "2"}
 
-    assert Host.__server_capabilities__() == %{
-             "tools" => %{},
-             "resources" => %{},
-             "prompts" => %{}
-           }
+    capabilities = %{
+      "tools" => %{"listChanged" => true},
+      "resources" => %{"listChanged" => true},
+      "prompts" => %{"listChanged" => true}
+    }
+
+    assert Host.__server_capabilities__() == capabilities
+    assert Host.__server_instructions__() == nil
 
     assert {:ok, result, state} = Host.handle_initialize(%{}, %{count: 0})
     assert result["serverInfo"] == %{"name" => "host", "version" => "2"}
-    assert result["capabilities"] == %{"tools" => %{}, "resources" => %{}, "prompts" => %{}}
+    assert result["capabilities"] == capabilities
+    refute Map.has_key?(result, "instructions")
     assert state.count == 0
   end
 

@@ -162,7 +162,7 @@ defmodule Arbor.MCP.HttpPlug do
   alias Arbor.MCP.Internal.{MessageValidator, VersionRegistry}
   alias Arbor.MCP.Plugs.ProtectedResourceMetadata
   alias Arbor.MCP.Protocol.{ErrorCodes, Methods}
-  alias Arbor.MCP.Server.{RequestContext, Subscriptions}
+  alias Arbor.MCP.Server.{AuthInfo, RequestContext, Subscriptions}
 
   alias Arbor.MCP.Server.Runtime.{
     HTTPGateway,
@@ -310,6 +310,18 @@ defmodule Arbor.MCP.HttpPlug do
       end
     end
   end
+
+  @doc """
+  Attaches the auth info of a request a host plug authenticated, for handlers
+  to read with `Arbor.MCP.Server.Context.auth_info/0`.
+
+  Call it in a plug that runs before this one. With `oauth_enabled: true`, the
+  token this plug validates is used instead. It doesn't change which principal
+  a session or MRTR state belongs to; set `:principal_id` for that.
+  """
+  @spec put_auth_info(Plug.Conn.t(), AuthInfo.t()) :: Plug.Conn.t()
+  def put_auth_info(%Plug.Conn{} = conn, %AuthInfo{} = auth_info),
+    do: put_private(conn, :arbor_mcp_auth_info, auth_info)
 
   @doc """
   Processes HTTP connections for MCP protocol.
@@ -1443,7 +1455,10 @@ defmodule Arbor.MCP.HttpPlug do
            HTTPGateway.submit(runtime, binding, request,
              format: format,
              dispatch_opts:
-               runtime_dispatch_opts(Map.put(resolved, :runtime_format, format), conn)
+               resolved
+               |> Map.put(:runtime_format, format)
+               |> Map.put(:session_id, RuntimeSession.id(session))
+               |> runtime_dispatch_opts(conn)
            ),
          response <- RuntimeWriter.await(conn),
          :ok <- runtime_response_ready(response) do
@@ -1658,6 +1673,8 @@ defmodule Arbor.MCP.HttpPlug do
       :require_replay_protection,
       :principal_id,
       :tenant_id,
+      :auth_info,
+      :session_id,
       :oauth_enabled,
       :authorize_subscription_filter,
       :authorize_subscription_publication,
@@ -2064,7 +2081,11 @@ defmodule Arbor.MCP.HttpPlug do
 
     with true <- is_nil(principal) or is_binary(principal),
          true <- is_nil(tenant) or is_binary(tenant) do
-      {:ok, opts |> Map.put(:principal_id, principal) |> Map.put(:tenant_id, tenant)}
+      {:ok,
+       opts
+       |> Map.put(:principal_id, principal)
+       |> Map.put(:tenant_id, tenant)
+       |> Map.put(:auth_info, auth_info(conn, token_info))}
     else
       false -> {:error, :invalid_mrtr_identity}
     end
@@ -2073,6 +2094,19 @@ defmodule Arbor.MCP.HttpPlug do
       Logger.error("Failed to resolve MRTR identity")
       {:error, :invalid_mrtr_identity}
   end
+
+  # A token validated here wins over auth info a host plug attached.
+  defp auth_info(conn, token_info) when is_map(token_info) do
+    token =
+      case ServerGuard.extract_bearer_token(conn.req_headers) do
+        {:ok, token} -> token
+        {:error, _missing} -> nil
+      end
+
+    AuthInfo.from_claims(token, token_info)
+  end
+
+  defp auth_info(conn, _no_token), do: conn.private[:arbor_mcp_auth_info]
 
   defp resolve_identity_value(nil, _conn, _request, _token_info, fallback), do: fallback
 
@@ -3075,7 +3109,8 @@ defmodule Arbor.MCP.HttpPlug do
             principal_id: Map.get(opts, :principal_id),
             tenant_id: Map.get(opts, :tenant_id),
             request_notification_target: Map.get(opts, :request_notification_target),
-            request_headers: Map.get(opts, :request_headers, [])
+            request_headers: Map.get(opts, :request_headers, []),
+            auth_info: Map.get(opts, :auth_info)
           })
 
         case processed_conn.response do
