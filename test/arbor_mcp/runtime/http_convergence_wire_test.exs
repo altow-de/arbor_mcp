@@ -197,15 +197,15 @@ defmodule Arbor.MCP.Server.Runtime.HTTPConvergenceWireTest do
 
   defp host(mode, plug_extra \\ []) do
     root =
-      start_supervised!(
-        {Runtime,
-         [
-           handler: Handler,
-           handler_args: [test: self()],
-           request_timeout_ms: 2_000,
-           services: [sessions: [], replay_cache: []]
-         ]}
-      )
+      start_supervised!({Runtime,
+       [
+         handler: Handler,
+         handler_args: [test: self()],
+         request_timeout_ms: 2_000,
+         services: [sessions: [], replay_cache: []],
+         # The handler counts in its state, one callback at a time.
+         execution: :stateful
+       ]})
 
     {:ok, runtime} = Runtime.ref(root)
     ref = make_ref()

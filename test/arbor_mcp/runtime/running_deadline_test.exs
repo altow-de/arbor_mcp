@@ -29,6 +29,7 @@ defmodule Arbor.MCP.Server.RuntimeRunningDeadlineTest do
   end
 
   test "running deadline reaps blocked work before another stateful callback starts" do
+    # The test is about the next stateful callback; the handler counts in its state.
     root =
       start_supervised!(
         {Runtime,
@@ -36,7 +37,8 @@ defmodule Arbor.MCP.Server.RuntimeRunningDeadlineTest do
          dispatcher: Handler,
          handler_args: self(),
          request_timeout_ms: 100,
-         cancel_grace_ms: 30}
+         cancel_grace_ms: 30,
+         execution: :stateful}
       )
 
     {:ok, runtime} = Runtime.ref(root)

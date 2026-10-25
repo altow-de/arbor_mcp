@@ -944,6 +944,8 @@ defmodule Arbor.MCP.Server.Runtime.HTTPReverseTest do
         handler: Handler,
         handler_args: [observer: self()],
         request_timeout_ms: 2_000,
+        # The handler counts calls in its state, one callback at a time.
+        execution: :stateful,
         max_concurrency: 1,
         max_queue: Keyword.get(options, :max_queue, 0),
         services: [sessions: []],

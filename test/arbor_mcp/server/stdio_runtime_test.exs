@@ -26,7 +26,10 @@ defmodule Arbor.MCP.Server.StdioRuntimeTest do
             request_timeout_ms: 2_000,
             output_timeout_ms: 1_000,
             stdio_eof_timeout_ms: 3_000,
-            shutdown_timeout_ms: 100
+            shutdown_timeout_ms: 100,
+            # These tests cover the stateful stdio edge: the handler counts in
+            # its state, and each request is held until its response is written.
+            execution: :stateful
           ],
           Keyword.delete(opts, :hold)
         )

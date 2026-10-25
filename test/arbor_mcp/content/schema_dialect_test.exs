@@ -115,7 +115,12 @@ defmodule Arbor.MCP.Content.SchemaDialectTest do
     alias Arbor.MCP.Server.HandlerServer
     alias Arbor.MCP.Transport.Test
 
-    root = start_supervised!({HandlerServer, handler: DynamicTools, transport: :test})
+    # The DynamicTools catalog lives in handler state.
+    root =
+      start_supervised!(
+        {HandlerServer, handler: DynamicTools, transport: :test, execution: :stateful}
+      )
+
     {:ok, transport} = Test.connect(server: root)
     schema = %{"type" => "array", "prefixItems" => [%{"type" => "integer"}], "items" => false}
 

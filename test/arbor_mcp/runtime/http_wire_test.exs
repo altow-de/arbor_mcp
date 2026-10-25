@@ -114,13 +114,17 @@ defmodule Arbor.MCP.Server.Runtime.HTTPWireTest do
 
   defp host(mode, extra \\ []) do
     root =
-      start_supervised!(
-        {Runtime,
-         Keyword.merge(
-           [handler: Handler, handler_args: [test: self()], request_timeout_ms: 2000],
-           extra
-         )}
-      )
+      start_supervised!({Runtime,
+       Keyword.merge(
+         [
+           handler: Handler,
+           handler_args: [test: self()],
+           request_timeout_ms: 2000,
+           # The handler counts in its state, one callback at a time.
+           execution: :stateful
+         ],
+         extra
+       )})
 
     {:ok, runtime} = Runtime.ref(root)
     ref = make_ref()

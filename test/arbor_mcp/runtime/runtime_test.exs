@@ -311,9 +311,9 @@ defmodule Arbor.MCP.Server.RuntimeTest do
     assert {:ok, %{"result" => 0}} = Runtime.request(runtime, message(5, "read"))
   end
 
-  test "concurrency configuration requires explicit stateless opt in" do
+  test "stateful execution requires max_concurrency 1" do
     assert {:error, :invalid_execution_configuration} =
-             Runtime.start_link(handler: Handler, max_concurrency: 2)
+             Runtime.start_link(handler: Handler, execution: :stateful, max_concurrency: 2)
 
     assert {:error, {:invalid_limit, :max_queue}} =
              Runtime.start_link(handler: Handler, max_queue: -1)
@@ -1112,7 +1112,9 @@ defmodule Arbor.MCP.Server.RuntimeTest do
           id: make_ref(),
           handler: Handler,
           dispatcher: Handler,
-          handler_args: [test_pid: self(), label: label, block_terminate: block_terminate]
+          handler_args: [test_pid: self(), label: label, block_terminate: block_terminate],
+          # These tests count and commit handler state, one callback at a time.
+          execution: :stateful
         ],
         opts
       )

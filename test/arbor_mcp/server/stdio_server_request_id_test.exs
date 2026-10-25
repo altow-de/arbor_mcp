@@ -45,7 +45,8 @@ defmodule Arbor.MCP.Server.StdioServerRequestIdTest do
   test "stdio rejects a duplicate process-lifetime request ID before dispatch" do
     output =
       capture_io("", fn ->
-        {:ok, server} = StdioServer.start_link(module: CountingHandler)
+        # CountingHandler counts list calls in its state.
+        {:ok, server} = StdioServer.start_link(module: CountingHandler, execution: :stateful)
         Process.unlink(server)
 
         request = %{"jsonrpc" => "2.0", "id" => "stdio-duplicate", "method" => "tools/list"}

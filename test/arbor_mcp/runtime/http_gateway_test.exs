@@ -292,7 +292,9 @@ defmodule Arbor.MCP.Server.Runtime.HTTPGatewayTest do
           dispatcher: Handler,
           handler_args: [test: self()],
           request_timeout_ms: 2000,
-          max_queue: 4
+          max_queue: 4,
+          # The handler counts in its state, one callback at a time.
+          execution: :stateful
         ],
         opts
       )

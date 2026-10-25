@@ -98,10 +98,15 @@ defmodule Arbor.MCP.Server.Runtime.HTTPMountIdentityTest do
   end
 
   defp runtime(extra \\ []) do
+    # "count" counts in handler state.
     root =
       start_supervised!(
         {Runtime,
-         handler: Handler, handler_args: [], services: [sessions: []], request_timeout_ms: 2_000}
+         handler: Handler,
+         handler_args: [],
+         services: [sessions: []],
+         request_timeout_ms: 2_000,
+         execution: :stateful}
       )
 
     {:ok, runtime} = Runtime.ref(root)

@@ -371,7 +371,17 @@ defmodule Arbor.MCP.Server.Runtime.BatchAdmissionTest do
 
   defp start_pair(opts) do
     opts =
-      Keyword.merge([handler: Handler, handler_args: [test_pid: self()], transport: :test], opts)
+      Keyword.merge(
+        [
+          handler: Handler,
+          handler_args: [test_pid: self()],
+          transport: :test,
+          # The handler counts in its state, and these tests fill the capacity
+          # of one running callback.
+          execution: :stateful
+        ],
+        opts
+      )
 
     root =
       start_supervised!(

@@ -474,7 +474,14 @@ defmodule Arbor.MCP.Server.Runtime.HTTPResourcesTest do
   end
 
   test "native non-HTTP resource callbacks retain their existing application-state contract" do
-    {:ok, root} = Runtime.start_link(handler: Handler, handler_args: [observer: self()])
+    {:ok, root} =
+      Runtime.start_link(
+        handler: Handler,
+        handler_args: [observer: self()],
+        # The handler records subscriptions in its state.
+        execution: :stateful
+      )
+
     on_exit(fn -> if Process.alive?(root), do: Runtime.stop(root) end)
     {:ok, runtime} = Runtime.ref(root)
 
@@ -705,6 +712,8 @@ defmodule Arbor.MCP.Server.Runtime.HTTPResourcesTest do
         handler: Handler,
         handler_args: [observer: self()],
         request_timeout_ms: config[:request_timeout_ms] || 1_000,
+        # The handler counts calls and records subscriptions in its state.
+        execution: :stateful,
         services: [
           sessions: [options: config[:session_limits] || []],
           resource_subscriptions: [options: config[:resource_limits] || []]

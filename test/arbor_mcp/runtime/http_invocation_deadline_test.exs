@@ -123,6 +123,8 @@ defmodule Arbor.MCP.Server.Runtime.HTTPInvocationDeadlineTest do
   end
 
   defp runtime do
+    # The handler counts in its state, and queued work waits behind one
+    # running callback.
     root =
       start_supervised!(
         {Runtime,
@@ -130,7 +132,8 @@ defmodule Arbor.MCP.Server.Runtime.HTTPInvocationDeadlineTest do
          dispatcher: Handler,
          handler_args: [test: self()],
          request_timeout_ms: 2000,
-         max_queue: 2}
+         max_queue: 2,
+         execution: :stateful}
       )
 
     {:ok, runtime} = Runtime.ref(root)

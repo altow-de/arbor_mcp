@@ -249,18 +249,18 @@ defmodule Arbor.MCP.Server.Runtime.HTTPConvergenceTest do
 
   defp runtime(extra \\ []) do
     root =
-      start_supervised!(
-        {Runtime,
-         Keyword.merge(
-           [
-             handler: Handler,
-             handler_args: [test: self()],
-             request_timeout_ms: 2_000,
-             services: [sessions: []]
-           ],
-           extra
-         )}
-      )
+      start_supervised!({Runtime,
+       Keyword.merge(
+         [
+           handler: Handler,
+           handler_args: [test: self()],
+           request_timeout_ms: 2_000,
+           services: [sessions: []],
+           # The handler counts in its state, one callback at a time.
+           execution: :stateful
+         ],
+         extra
+       )})
 
     {:ok, runtime} = Runtime.ref(root)
     {runtime, HttpPlug.init(runtime: runtime, protocol_mode: :legacy_only)}

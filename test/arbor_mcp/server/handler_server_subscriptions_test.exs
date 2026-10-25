@@ -268,7 +268,9 @@ defmodule Arbor.MCP.Server.HandlerServerSubscriptionsTest do
         principal_id: "principal-1",
         tenant_id: "tenant-1",
         authorize_subscription_filter: fn requested, _context -> {:ok, requested} end,
-        authorize_subscription_publication: fn _method, _params, _context -> true end
+        authorize_subscription_publication: fn _method, _params, _context -> true end,
+        # The handler counts list calls in its state.
+        execution: :stateful
       ]
       |> Keyword.merge(extra_opts)
 

@@ -386,6 +386,7 @@ defmodule Arbor.MCP.Server.RuntimeInitializationTest do
          handler_args: [parent: self(), label: :execution],
          dispatcher: Handler,
          transport: :test,
+         execution: :stateful,
          init_timeout_ms: 500}
       )
 
@@ -418,6 +419,7 @@ defmodule Arbor.MCP.Server.RuntimeInitializationTest do
          handler_args: [parent: self(), label: :execution_root],
          dispatcher: Handler,
          transport: :test,
+         execution: :stateful,
          init_timeout_ms: 1_000}
       )
 
@@ -466,6 +468,7 @@ defmodule Arbor.MCP.Server.RuntimeInitializationTest do
          handler_args: [parent: self(), label: :edge_state],
          dispatcher: Handler,
          transport: :test,
+         execution: :stateful,
          init_timeout_ms: 1_000}
       )
 
@@ -515,7 +518,8 @@ defmodule Arbor.MCP.Server.RuntimeInitializationTest do
       handler: Handler,
       handler_args: [parent: self(), label: :managed],
       dispatcher: Handler,
-      transport: :test
+      transport: :test,
+      execution: :stateful
     ]
 
     children = [
@@ -733,11 +737,16 @@ defmodule Arbor.MCP.Server.RuntimeInitializationTest do
   defp runtime_opts(opts) do
     {handler_args, options} = Keyword.split(opts, [:label, :hold])
 
-    [
-      handler: Handler,
-      handler_args: [parent: self()] ++ handler_args,
-      dispatcher: Handler
-    ] ++ options
+    # The handler counts in its state, one callback at a time.
+    Keyword.put_new(
+      [
+        handler: Handler,
+        handler_args: [parent: self()] ++ handler_args,
+        dispatcher: Handler
+      ] ++ options,
+      :execution,
+      :stateful
+    )
   end
 
   defp start_async(opts) do

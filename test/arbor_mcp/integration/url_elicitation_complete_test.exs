@@ -86,7 +86,9 @@ defmodule Arbor.MCP.Integration.UrlElicitationCompleteTest do
         transport: :test,
         protocol_mode: :modern_only,
         mrtr: true,
-        request_state: [active_key_id: "integration", keys: %{"integration" => @key}]
+        request_state: [active_key_id: "integration", keys: %{"integration" => @key}],
+        # handle_elicitation_complete records the completion in handler state.
+        execution: :stateful
       )
 
     Arbor.MCP.TestHelpers.stop_on_exit(server)
