@@ -778,10 +778,8 @@ defmodule Arbor.MCP.Server.DSL do
             "capabilities" => unquote(Macro.escape(capabilities))
           })
 
-        # The version is per connection, and one runtime can serve several, so
-        # it is not handler state. Leaving state unchanged keeps DSL servers
-        # valid under the default stateless execution.
-        {:ok, result, state}
+        # handle_initialize may update state even on a stateless runtime.
+        {:ok, result, Map.put(state, :protocol_version, protocol_version)}
       end
     end
   end
