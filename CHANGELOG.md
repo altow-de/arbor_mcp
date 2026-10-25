@@ -117,6 +117,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passed to a stdio transport, where it became the server's subprocess shutdown
   budget; set `:eof_grace` or `:cleanup_timeout` in the connection spec instead.
 
+### Fixed
+
+- `Server.notify_tools_changed/1` and the other change notifications,
+  `Server.call/3` and `Server.cast/2` crashed an HTTP runtime when called
+  outside a request: with no edge process to send through, they messaged the
+  runtime supervisor. List changes now go to the runtime's
+  `subscriptions/listen` streams, and calls and casts return
+  `{:error, :runtime_unavailable}`.
+
 ## [2.0.0-rc.5] — 2026-10-22
 
 ### Added

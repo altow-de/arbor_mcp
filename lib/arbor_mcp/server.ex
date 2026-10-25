@@ -287,7 +287,7 @@ defmodule Arbor.MCP.Server do
         end
 
       {:error, _reason} ->
-        case Ref.address(server) do
+        case without_edge(server) do
           {:ok, address} -> GenServer.call(address, request, timeout)
           {:error, _reason} -> {:error, :runtime_unavailable}
         end
@@ -314,7 +314,7 @@ defmodule Arbor.MCP.Server do
         end
 
       {:error, _reason} ->
-        case Ref.address(server) do
+        case without_edge(server) do
           {:ok, address} -> GenServer.cast(address, request)
           {:error, _reason} -> {:error, :runtime_unavailable}
         end
@@ -346,7 +346,7 @@ defmodule Arbor.MCP.Server do
         end
 
       {:error, _reason} ->
-        case Ref.address(server) do
+        case without_edge(server) do
           {:ok, address} -> GenServer.call(address, request, timeout)
           {:error, _reason} -> {:error, :runtime_unavailable}
         end
@@ -359,6 +359,16 @@ defmodule Arbor.MCP.Server do
         :not_http_request -> cast_native_control(server, request)
         result -> result
       end
+    end
+  end
+
+  # A runtime without an edge process (HTTP) takes no custom calls, casts or
+  # native controls; messaging its supervisor would crash it. Anything else
+  # is addressed directly.
+  defp without_edge(server) do
+    case Runtime.ref(server) do
+      {:ok, _runtime} -> {:error, :runtime_unavailable}
+      {:error, _reason} -> Ref.address(server)
     end
   end
 
@@ -378,9 +388,16 @@ defmodule Arbor.MCP.Server do
         end
 
       {:error, _reason} ->
-        case Ref.address(server) do
-          {:ok, address} -> GenServer.cast(address, request)
-          {:error, _reason} -> {:error, :runtime_unavailable}
+        # An HTTP runtime has no edge; its list changes go to listeners.
+        case Runtime.ref(server) do
+          {:ok, runtime} ->
+            HTTPNotifications.publish(runtime, request)
+
+          {:error, _reason} ->
+            case Ref.address(server) do
+              {:ok, address} -> GenServer.cast(address, request)
+              {:error, _reason} -> {:error, :runtime_unavailable}
+            end
         end
     end
   end
