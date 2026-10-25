@@ -74,7 +74,9 @@ defmodule Arbor.MCP.Server.RegistryTest do
       assert {:ok, %{"content" => [%{"text" => "Hello, Ada"}]}} =
                Client.call_tool(client, "greet", %{"name" => "Ada"}, format: :map)
 
-      assert {:error, %{"code" => -32602}} =
+      # Like DSL tools (SEP-1303), invalid arguments are a tool error.
+      assert {:ok,
+              %{"isError" => true, "content" => [%{"text" => "Input validation error" <> _}]}} =
                Client.call_tool(client, "greet", %{"name" => 7}, format: :map)
     end
   end
@@ -144,7 +146,8 @@ defmodule Arbor.MCP.Server.RegistryTest do
     assert {:ok, %{"structuredContent" => %{"n" => 1}}} =
              Client.call_tool(client, "count", %{"n" => 1}, format: :map)
 
-    assert {:error, _invalid_output} =
+    assert {:ok,
+            %{"isError" => true, "content" => [%{"text" => "Output validation failed" <> _}]}} =
              Client.call_tool(client, "count", %{"n" => "x"}, format: :map)
   end
 

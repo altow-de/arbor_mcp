@@ -42,6 +42,7 @@ defmodule Arbor.MCP.Server.Dispatch do
     MRTR,
     Registry,
     RequestContext,
+    Result,
     ResultNormalizer
   }
 
@@ -812,26 +813,32 @@ defmodule Arbor.MCP.Server.Dispatch do
   defp call_registered_tool(ctx, entry, arguments, state) do
     arguments = ResultNormalizer.stringify_keys(arguments)
 
-    case SchemaPolicy.validate_optional(Map.drop(arguments, ["_meta"]), entry.input_schema) do
-      :ok ->
-        result =
-          case run_registered(ctx, entry, [arguments]) do
-            {:ok, response} -> DSLArguments.validate_tool_response(response, entry.output_schema)
-            other -> other
+    # Invalid arguments and output that fails its schema are tool errors the
+    # model can correct, as for DSL tools (SEP-1303).
+    result =
+      case SchemaPolicy.validate_optional(Map.drop(arguments, ["_meta"]), entry.input_schema) do
+        :ok ->
+          with {:ok, response} <- run_registered(ctx, entry, [arguments]) do
+            case DSLArguments.validate_tool_response(response, entry.output_schema) do
+              {:ok, response} -> {:ok, response}
+              {:error, message} -> {:ok, Result.error(message)}
+            end
           end
 
-        callback_result(
-          ctx,
-          result,
-          "Tool call error",
-          state,
-          &ResultNormalizer.tool_result(&1, wrap_bare_map: true)
-        )
+        {:error, diagnostics} ->
+          message =
+            DSLArguments.input_error_message({:invalid_tool_arguments, List.wrap(diagnostics)})
 
-      {:error, _diagnostics} ->
-        {:response, JSONRPC.error(ctx.id, ErrorCodes.invalid_params(), "Invalid tool arguments"),
-         state}
-    end
+          {:ok, Result.error(message)}
+      end
+
+    callback_result(
+      ctx,
+      result,
+      "Tool call error",
+      state,
+      &ResultNormalizer.tool_result(&1, wrap_bare_map: true)
+    )
   end
 
   defp registered_resource(registry, uri) when is_binary(uri) do

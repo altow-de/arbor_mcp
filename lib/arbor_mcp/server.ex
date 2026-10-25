@@ -240,8 +240,9 @@ defmodule Arbor.MCP.Server do
   `name` is required, `inputSchema` defaults to `%{"type" => "object"}`, and
   `outputSchema` is optional. Both schemas are checked now. `fun` gets the
   arguments as a string-keyed map, after they are validated against
-  `inputSchema`, and returns what `handle_call_tool/3` would without the
-  state: a result such as `Arbor.MCP.Server.Result.text/1` or a map,
+  `inputSchema`; as for DSL tools, arguments or a structured result that
+  fail their schema come back as an `isError` tool result. `fun` returns
+  what `handle_call_tool/3` would without the state: a result such as `Arbor.MCP.Server.Result.text/1` or a map,
   `{:ok, result}` or `{:error, reason}`. It runs in the request's callback
   worker, inside `Arbor.MCP.Server.Context`.
 

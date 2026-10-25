@@ -36,7 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TypeScript SDK and `AddTool` in Go. Registered entries are listed after the
   handler's own, take precedence over handler entries with the same name, and
   are advertised with `listChanged: true`. Tool arguments are validated
-  against `inputSchema` and results against `outputSchema`. This works for
+  against `inputSchema` and results against `outputSchema`; a failure is an
+  `isError` tool result, as for DSL tools. This works for
   plain handlers and DSL servers alike.
 - Server middleware: the `:middleware` runtime option takes modules
   implementing the new `Arbor.MCP.Server.Middleware`, which wrap every
@@ -162,9 +163,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flow only if refreshing fails. A refreshed token is saved to the
   `:credential_store` when one is configured, and the provider struct no longer
   shows its tokens in `inspect/1`.
-
-### Fixed
-
 - A modern `tools/call` checked its `Mcp-Param-*` headers against the first
   `tools/list` page only, so a tool on a later page of a paginated list
   skipped the check. The server now follows the cursors until it finds the
