@@ -406,6 +406,33 @@ Arguments without `complete:` fall through to your `handle_complete/3`, so a
 hand-written callback can still cover the rest. Clients pass the context with
 `Arbor.MCP.Client.complete(client, ref, argument, context: %{"arguments" => ...})`.
 
+## Adding tools at runtime
+
+DSL declarations are fixed at compile time. To change what a running server
+offers, register definitions with a function that serves them:
+
+```elixir
+{:ok, server} = MyServer.start_link(transport: :http, port: 4000)
+
+:ok =
+  Arbor.MCP.Server.add_tool(
+    server,
+    %{name: "lookup", inputSchema: %{type: "object", properties: %{id: %{type: "string"}}}},
+    fn %{"id" => id} -> Arbor.MCP.Server.Result.text(MyApp.Catalog.describe(id)) end
+  )
+
+:ok = Arbor.MCP.Server.remove_tool(server, "lookup")
+```
+
+`add_resource/3`, `add_resource_template/3` and `add_prompt/3` work the same
+way. Each change sends the matching `list_changed` notification. Registered
+entries follow the DSL's in lists and take precedence over a DSL entry with
+the same name. A server whose only tools are registered at runtime should
+declare `capabilities: [tools: [listChanged: true]]` so clients that connect
+first know to ask for them. Over HTTP, a change made outside a request
+reaches clients listening with `subscriptions/listen`; legacy HTTP sessions
+see it the next time they list.
+
 ## Metadata
 
 The DSL supports spec-aligned metadata on declarations:
