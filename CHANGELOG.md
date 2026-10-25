@@ -62,24 +62,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING:** Servers handle the requests on a connection concurrently by
   default, like the other MCP SDKs. The runtime default is now
   `execution: :stateless, max_concurrency: 64` (was `execution: :stateful,
-  max_concurrency: 1`). `init/1` and `handle_initialize/2` may still set up
-  handler state, and initializations commit one at a time. Every other callback
-  must return its snapshot of the state unchanged; one that returns a changed
-  state fails its request with `invalid_handler_state` (over HTTP too, where it
-  was reported as `output_failed`), and the runtime logs a warning naming the
-  handler the first time. A stateless callback was compared with the latest
-  committed state rather than its own snapshot, so a commit made while it ran
-  (an initialization, a cancellation tracker) failed it; it is now compared
-  with its snapshot. Keep mutable data in a process or ETS table, or start the server
-  with `execution: :stateful` to run callbacks one at a time and commit their
-  state as before. `execution: :stateful` now implies `max_concurrency: 1`.
+  max_concurrency: 1`).
+  - `init/1` and `handle_initialize/2` may still set up handler state, and
+    initializations commit one at a time. Every other callback, including
+    custom `handle_call/3` and `handle_cast/2` used through `Arbor.MCP.Server.call/3`
+    and `cast/2`, gets a snapshot of the state and must return it unchanged.
+  - A callback that returns a changed state fails its request with `-32603` and
+    `%{"type" => "invalid_handler_state"}` (over HTTP too, where it was reported
+    as `output_failed`), and the runtime logs a warning naming the handler the
+    first time.
+  - `execution: :stateful` now implies `max_concurrency: 1` and rejects any
+    other value.
+  - A stateless callback was compared with the latest committed state rather
+    than its own snapshot, so a commit made while it ran (an initialization, a
+    cancellation tracker) failed it; it is now compared with its snapshot.
+  - **Upgrade:** start servers whose callbacks change state with
+    `execution: :stateful`, which keeps the previous one-at-a-time behavior, or
+    move the changing data into a process or ETS table. See
+    [upgrading from rc.5](docs/guides/V2_RELEASE_CANDIDATE.md).
+- **BREAKING:** A server's responses on one connection can arrive in completion
+  order rather than request order, on every transport including stdio: a slow
+  tool's answer can follow a later, faster one. Each response carries its
+  request's id, JSON-RPC allows any order, and ArborMCP's client and the
+  official SDKs match responses by id. **Upgrade:** a hand-written client or test
+  that reads responses in order must match them by id, or the server can start
+  with `execution: :stateful`, which still answers requests in arrival order
+  except `ping`, answered at once.
 - **BREAKING:** The server's `request_timeout_ms` defaults to one hour (was
   10 s). Tools that ran longer than 10 s used to fail with `handler_timeout`
   while the client was still waiting. The caller's timeout now decides, and a
-  timed-out request is cancelled on the server (see below).
-- **BREAKING:** DSL servers' generated `handle_initialize/2` no longer stores the
-  negotiated `:protocol_version` in handler state. The version belongs to a
-  connection, and one runtime can serve several.
+  timed-out request is cancelled on the server (see below). **Upgrade:** set
+  `request_timeout_ms` explicitly to keep a tighter server-side bound.
 - A stateful server answers `ping` while a callback runs instead of queueing it
   behind that callback, so peers can tell a busy server from a dead one.
 - The stdio server runs requests concurrently when its runtime is stateless. It
@@ -127,6 +140,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_connection/3`'s `:cleanup_timeout` bounds the scope only. It was also
   passed to a stdio transport, where it became the server's subprocess shutdown
   budget; set `:eof_grace` or `:cleanup_timeout` in the connection spec instead.
+- **BREAKING:** A DSL tool called with invalid arguments returns an `isError`
+  tool result, "Input validation error: …" naming the failing fields and rules,
+  instead of a `-32602` protocol error with no details. This follows SEP-1303,
+  as the other MCP SDKs do, and lets a model correct the call. Rejected values
+  are never included. **Upgrade:** callers that matched the error tuple from
+  `Client.call_tool/4` now receive `{:ok, %Arbor.MCP.Response{is_error: true}}`.
+
+### Fixed
+
+- The client delivered `notifications/progress` and `notifications/message` to
+  its handler only on modern HTTP request streams and dropped them on stdio,
+  BEAM and legacy HTTP. `handle_progress/3` now receives progress on every
+  transport, matched to the pending request by its `progressToken`, and
+  `handle_log_message/3` receives connection-level log messages with a `nil`
+  request id.
+- The default OAuth provider kept no refresh token, so an expired access token
+  started the full authorization flow again, which found the same authorization
+  server and failed with `:auth_loop_detected`. It now refreshes the token
+  shortly before it expires and when the server rejects it, and runs the full
+  flow only if refreshing fails. A refreshed token is saved to the
+  `:credential_store` when one is configured, and the provider struct no longer
+  shows its tokens in `inspect/1`.
 
 ### Fixed
 

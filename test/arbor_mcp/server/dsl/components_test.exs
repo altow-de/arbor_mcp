@@ -212,7 +212,7 @@ defmodule Arbor.MCP.Server.DSL.ComponentsTest do
     state = %{count: 3, test_pid: self()}
 
     for args <- [%{"count" => 0}, %{"count" => "2"}, %{"label" => "a"}] do
-      assert {:error, %Arbor.MCP.Error.ProtocolError{code: -32602}, ^state} =
+      assert {:ok, %{isError: true, content: [%{text: "Input validation error" <> _}]}, ^state} =
                Host.handle_call_tool("shared", args, state)
     end
 
