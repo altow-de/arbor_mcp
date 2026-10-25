@@ -1881,18 +1881,24 @@ defmodule Arbor.MCP.Client do
     result
   end
 
+  # A modern request stream got a 401 or 403. Answering here, one challenge at
+  # a time, means concurrent streams run one refresh or OAuth flow between
+  # them, and a stream whose token another one already replaced just retries
+  # with the new token.
   def handle_info(
-        {:modern_http_stream_auth_updated, stream_pid, request_id, changes},
+        {:modern_http_stream_auth_challenge, stream_pid, request_id, ref, challenge},
         %{
           transport_mod: HTTP,
           transport_state: %HTTP{} = transport_state
         } = state
       )
-      when is_map(changes) do
+      when is_map(challenge) do
     if HTTP.stream_owner?(transport_state, request_id, stream_pid) do
-      transport_state = merge_modern_stream_auth_state(transport_state, changes)
+      {result, transport_state} = answer_stream_challenge(transport_state, challenge)
+      send(stream_pid, {:modern_http_stream_auth_result, ref, result})
       {:noreply, %{state | transport_state: transport_state}}
     else
+      send(stream_pid, {:modern_http_stream_auth_result, ref, {:error, :stream_retired}})
       {:noreply, state}
     end
   end
@@ -2518,6 +2524,10 @@ defmodule Arbor.MCP.Client do
       {:ok, transport} ->
         {:noreply, restore.(transport)}
 
+      {:error, reason, transport} ->
+        Logger.debug("Authenticated resend failed", reason: LogSummary.describe(reason))
+        {:noreply, fail_async_post_request(restore.(transport), request_id, reason, deadline)}
+
       {:error, reason} ->
         Logger.debug("Authenticated resend failed", reason: LogSummary.describe(reason))
         {:noreply, fail_async_post_request(state, request_id, reason, deadline)}
@@ -2550,6 +2560,44 @@ defmodule Arbor.MCP.Client do
       %{state | transport_state: Map.merge(state.transport_state, changes)}
     else
       state
+    end
+  end
+
+  defp answer_stream_challenge(%HTTP{access_token: current} = transport_state, challenge)
+       when is_binary(current) and current != :erlang.map_get(:token, challenge) do
+    # Another stream replaced the rejected token. That answers a 401; a 403
+    # needs the challenged scopes, which a refresh alone doesn't add.
+    if challenge.status == 401 or
+         scopes_granted?(transport_state.auth_provider_state, challenge.scopes),
+       do: {{:ok, current}, transport_state},
+       else: run_stream_challenge(transport_state, challenge)
+  end
+
+  defp answer_stream_challenge(%HTTP{auth_provider: nil} = transport_state, _challenge),
+    do: {{:error, :no_auth_provider}, transport_state}
+
+  defp answer_stream_challenge(transport_state, challenge),
+    do: run_stream_challenge(transport_state, challenge)
+
+  defp scopes_granted?(%{granted_scopes: granted}, [_ | _] = scopes) when is_list(granted),
+    do: Enum.all?(scopes, &(&1 in granted))
+
+  defp scopes_granted?(_provider_state, _scopes), do: false
+
+  defp run_stream_challenge(%HTTP{auth_provider: provider} = transport_state, challenge) do
+    callback = if challenge.status == 401, do: :handle_unauthorized, else: :handle_forbidden
+    args = [challenge.www_authenticate, challenge.scopes, transport_state.auth_provider_state]
+
+    case apply(provider, callback, args) do
+      {:ok, token, provider_state} when is_binary(token) ->
+        changes = %{access_token: token, auth_provider_state: provider_state}
+        {{:ok, token}, merge_modern_stream_auth_state(transport_state, changes)}
+
+      {:error, reason, provider_state} ->
+        {{:error, reason}, %{transport_state | auth_provider_state: provider_state}}
+
+      other ->
+        {{:error, {:invalid_provider_response, other}}, transport_state}
     end
   end
 
