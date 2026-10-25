@@ -379,8 +379,9 @@ defmodule Arbor.MCP.Client do
   passed in a connection spec remain borrowed. This helper accepts connection
   specs, rather than existing client PIDs.
 
-  `:establish_timeout` (default 12_000) and `:cleanup_timeout` (default 1_000)
-  are positive finite milliseconds. Establishment uses one cutoff across the
+  `:establish_timeout` (default 12_000) and `:cleanup_timeout` (default 1_000,
+  or a stdio server's shutdown budget plus 500 when that is longer: 3_000 with
+  the stdio defaults) are positive finite milliseconds. Establishment uses one cutoff across the
   native constructor and protocol handshake. Cleanup uses a separate single
   cutoff. `:max_scope_workers` bounds owned reverse-request workers (default 256).
   Helper names must be local atoms. A stdio child requires a typed cleanup receipt;
@@ -409,7 +410,8 @@ defmodule Arbor.MCP.Client do
   it does not send a protocol ping on an existing client. Returns `:ok` only
   after scoped cleanup succeeds. The server and host listener remain borrowed.
   `:establish_timeout` (default 12_000 ms) and `:cleanup_timeout` (default
-  1_000 ms) are finite budgets from `with_connection/3`.
+  1_000 ms, longer for stdio as in `with_connection/3`) are finite budgets from
+  `with_connection/3`.
   """
   @spec probe(connection_spec(), keyword()) :: :ok | {:error, term()}
   def probe(spec, opts \\ []) do

@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package. Cowlib 2.21.0 fixes EEF-CVE-2026-43969 (`cow_cookie:cookie/1`), so
   its `mix hex.audit` exception is gone; only EEF-CVE-2026-43966 remains
   excepted, with the same justification as before.
+- The stdio transport follows the MCP shutdown order: `close/1` closes the
+  server's stdin, waits up to `:eof_grace` (default 2_000 ms, as in the MCP
+  reference SDKs) for it to exit, then sends SIGTERM and, after `:term_grace`,
+  SIGKILL. A server that exits on EOF is no longer signalled. The subprocess
+  `:cleanup_timeout` defaults to `eof_grace + term_grace + 400` (2_500 ms);
+  when only `:cleanup_timeout` is set, the EOF grace shrinks to fit it. The EOF
+  wait takes effect with the next ArborRPC release; earlier ArborRPC versions
+  ignore `:eof_grace` and send SIGTERM at once.
+- A client's default close limit (`:client_cleanup_timeout`, and
+  `with_connection/3`'s `:cleanup_timeout`) covers a stdio server's shutdown
+  budget plus 500 ms: 3_000 ms with the stdio defaults. Other transports keep
+  1_000 ms.
 
 ## [2.0.0-rc.5] — 2026-10-22
 

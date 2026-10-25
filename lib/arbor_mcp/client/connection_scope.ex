@@ -14,10 +14,11 @@ defmodule Arbor.MCP.Client.ConnectionScope do
     with true <- Keyword.keyword?(opts),
          {:ok, establish} <- finite_option(opts, :establish_timeout, 12_000),
          deadline = Deadline.after_ms(establish),
-         {:ok, cleanup} <- finite_option(opts, :cleanup_timeout, 1_000),
-         {:ok, workers} <- finite_option(opts, :max_scope_workers, 256),
          {:ok, client_opts} <-
            ClientConnection.connection_options(spec, opts),
+         {:ok, cleanup} <-
+           finite_option(opts, :cleanup_timeout, Deadline.cleanup_timeout(client_opts)),
+         {:ok, workers} <- finite_option(opts, :max_scope_workers, 256),
          :ok <- validate_name(client_opts),
          token = make_ref(),
          {:ok, observer} <- Observer.start(self(), client_opts, deadline, cleanup, workers, token) do
