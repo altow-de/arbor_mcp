@@ -28,10 +28,26 @@ defmodule Arbor.MCP.Server.Dispatch do
   `-32601 Method not found`.
   """
 
+  require Logger
+
+  alias Arbor.MCP.Content.SchemaPolicy
   alias Arbor.MCP.Error
   alias Arbor.MCP.Internal.MessageValidator
   alias Arbor.MCP.Protocol.{ErrorCodes, Initialize, Methods}
-  alias Arbor.MCP.Server.{Context, Discover, MRTR, RequestContext, ResultNormalizer}
+
+  alias Arbor.MCP.Server.{
+    Context,
+    Discover,
+    Middleware,
+    MRTR,
+    Registry,
+    RequestContext,
+    Result,
+    ResultNormalizer
+  }
+
+  alias Arbor.MCP.Server.DSL.Matcher
+  alias Arbor.MCP.Server.Internal.DSLArguments
   alias Arbor.MCP.Transport.HTTP.ToolHeaders
   alias Arbor.RPC.JSONRPC
 
@@ -89,7 +105,10 @@ defmodule Arbor.MCP.Server.Dispatch do
           request_context = %{
             request_context
             | application_context: Keyword.get(opts, :application_context),
-              notification_target: Keyword.get(opts, :request_notification_target)
+              notification_target: Keyword.get(opts, :request_notification_target),
+              session_id: Keyword.get(opts, :session_id),
+              auth_info: Keyword.get(opts, :auth_info),
+              request_headers: Keyword.get(opts, :request_headers)
           }
 
           ctx = %{
@@ -102,9 +121,7 @@ defmodule Arbor.MCP.Server.Dispatch do
             dispatch_opts: opts
           }
 
-          method
-          |> do_dispatch(ctx, state)
-          |> normalize_protocol_result(request_context, handler_module)
+          run_middleware(ctx, state, Keyword.get(opts, :middleware, []))
         else
           {:error, reason} ->
             context_error_result(request, reason, state, opts)
@@ -113,6 +130,103 @@ defmodule Arbor.MCP.Server.Dispatch do
       {:error, reason} ->
         context_error_result(request, reason, state, opts)
     end
+  end
+
+  defp handle(ctx, state) do
+    ctx.method
+    |> do_dispatch(ctx, state)
+    |> normalize_protocol_result(ctx.request_context, ctx.module)
+  end
+
+  defp run_middleware(ctx, state, []), do: handle(ctx, state)
+
+  # The chain never sees the handler state: the innermost step threads it
+  # through the process dictionary, and remembers its last answer so a
+  # middleware that passes it through returns the dispatch result unchanged.
+  defp run_middleware(ctx, state, middleware) do
+    key = {Middleware, make_ref()}
+    Process.put(key, {state, nil})
+
+    inner = fn %{params: params} ->
+      {current, _last} = Process.get(key)
+      result = handle_params(ctx, params, current)
+      wire = wire_result(result)
+      Process.put(key, {result_state(result), {wire, result}})
+      wire
+    end
+
+    request = %{method: ctx.method, id: ctx.id, params: ctx.params, context: ctx.request_context}
+
+    try do
+      returned =
+        Context.with_context(ctx.request_context, fn ->
+          Middleware.run(middleware, request, inner)
+        end)
+
+      case Process.get(key) do
+        {_state, {^returned, result}} -> result
+        {current, _last} -> middleware_result(returned, ctx, current)
+      end
+    after
+      Process.delete(key)
+    end
+  end
+
+  defp handle_params(%{params: params} = ctx, params, state), do: handle(ctx, state)
+
+  defp handle_params(ctx, params, state) do
+    request =
+      if ctx.request?,
+        do: %{"id" => ctx.id, "method" => ctx.method},
+        else: %{"method" => ctx.method}
+
+    case MessageValidator.validate_method_params(ctx.method, params) do
+      :ok -> handle(%{ctx | params: params}, state)
+      {:error, error} -> parameter_error_result(request, error, state)
+    end
+  end
+
+  defp wire_result({:response, %{"result" => result}, _state}),
+    do: {:ok, ResultNormalizer.stringify_keys(result)}
+
+  defp wire_result({:response, %{"error" => error}, _state}),
+    do: {:error, ResultNormalizer.stringify_keys(error)}
+
+  defp wire_result({:notification, _state}), do: :noreply
+
+  defp result_state({:response, _response, state}), do: state
+  defp result_state({:notification, state}), do: state
+
+  defp middleware_result(_returned, %{request?: false}, state), do: {:notification, state}
+
+  defp middleware_result({:ok, result}, ctx, state) when is_map(result) do
+    {:response, %{"jsonrpc" => "2.0", "id" => ctx.id, "result" => result}, state}
+    |> normalize_protocol_result(ctx.request_context, ctx.module)
+  end
+
+  defp middleware_result({:error, %Error.ProtocolError{} = error}, ctx, state),
+    do: {:response, JSONRPC.error(ctx.id, Error.to_json_rpc(error)), state}
+
+  defp middleware_result({:error, %{} = error}, ctx, state) do
+    case json_rpc_error(error) do
+      %{"code" => code, "message" => message} = error
+      when is_integer(code) and is_binary(message) ->
+        {:response, JSONRPC.error(ctx.id, error), state}
+
+      _invalid ->
+        invalid_middleware_result(ctx, state)
+    end
+  end
+
+  defp middleware_result(_returned, ctx, state), do: invalid_middleware_result(ctx, state)
+
+  defp invalid_middleware_result(ctx, state) do
+    Logger.error("MCP middleware returned an invalid result", method: ctx.method)
+
+    {:response,
+     JSONRPC.error(ctx.id, ErrorCodes.internal_error(), "Internal error", %{
+       "type" => "invalid_middleware_result"
+     }), state}
   end
 
   defp context_error_result(request, %Error.ProtocolError{} = error, state, _opts) do
@@ -176,7 +290,8 @@ defmodule Arbor.MCP.Server.Dispatch do
   defp do_dispatch("initialize", ctx, state) do
     result =
       call(ctx, :handle_initialize, [ctx.params, state], "Initialize error", state,
-        on_ok: &Initialize.build_initialize_result(ctx.params, &1)
+        on_ok:
+          &(ctx.params |> Initialize.build_initialize_result(&1) |> registered_capabilities())
       )
 
     validate_http_initialize(ctx, result, state)
@@ -188,10 +303,13 @@ defmodule Arbor.MCP.Server.Dispatch do
 
   defp do_dispatch("server/discover", ctx, state) do
     result =
-      Discover.build(handler_server_info(ctx.module) || %{}, handler_capabilities(ctx.module),
+      Discover.build(
+        handler_server_info(ctx.module) || %{},
+        ctx.module |> handler_capabilities() |> with_registered_capabilities(),
         protocol_mode: Keyword.get(ctx.dispatch_opts, :protocol_mode) || protocol_mode(state),
         instructions:
-          Keyword.get(ctx.dispatch_opts, :instructions) || state_value(state, :instructions)
+          Keyword.get(ctx.dispatch_opts, :instructions) || state_value(state, :instructions) ||
+            handler_instructions(ctx.module)
       )
 
     {:response, JSONRPC.response(ctx.id, result), state}
@@ -199,14 +317,20 @@ defmodule Arbor.MCP.Server.Dispatch do
 
   defp do_dispatch("tools/list", ctx, state) do
     args = [cursor(ctx), state]
-    paginated(ctx, :handle_list_tools, args, "tools", "List tools error", state)
+
+    registered_list(ctx, :handle_list_tools, args, "tools", "List tools error", state, :tool)
   end
 
   defp do_dispatch("tools/call", ctx, state) do
     name = Map.get(ctx.params, "name")
     arguments = tool_arguments(ctx.params)
+    registered = Registry.lookup(Registry.current(), :tool, name)
 
-    case validate_tool_headers(ctx, name, arguments, state) do
+    case validate_tool_headers(ctx, name, arguments, state, registered) do
+      {:ok, validated_state} when registered != :error ->
+        {:ok, entry} = registered
+        call_registered_tool(ctx, entry, arguments, validated_state)
+
       {:ok, validated_state} ->
         call(
           ctx,
@@ -224,28 +348,44 @@ defmodule Arbor.MCP.Server.Dispatch do
 
   defp do_dispatch("resources/list", ctx, state) do
     args = [cursor(ctx), state]
-    paginated(ctx, :handle_list_resources, args, "resources", "List resources error", state)
+
+    registered_list(
+      ctx,
+      :handle_list_resources,
+      args,
+      "resources",
+      "List resources error",
+      state,
+      :resource
+    )
   end
 
   defp do_dispatch("resources/templates/list", ctx, state) do
     args = [cursor(ctx), state]
 
-    paginated(
+    registered_list(
       ctx,
       :handle_list_resource_templates,
       args,
       "resourceTemplates",
       "List resource templates error",
-      state
+      state,
+      :resource_template
     )
   end
 
   defp do_dispatch("resources/read", ctx, state) do
     uri = Map.get(ctx.params, "uri")
+    on_ok = &%{"contents" => List.wrap(&1)}
 
-    call(ctx, :handle_read_resource, [uri, state], "Read resource error", state,
-      on_ok: &%{"contents" => List.wrap(&1)}
-    )
+    case registered_resource(Registry.current(), uri) do
+      {:ok, entry, args} ->
+        result = ctx |> run_registered(entry, args) |> resource_contents(uri, entry)
+        callback_result(ctx, result, "Read resource error", state, on_ok)
+
+      :error ->
+        call(ctx, :handle_read_resource, [uri, state], "Read resource error", state, on_ok: on_ok)
+    end
   end
 
   defp do_dispatch("resources/subscribe", ctx, state) do
@@ -260,19 +400,44 @@ defmodule Arbor.MCP.Server.Dispatch do
 
   defp do_dispatch("prompts/list", ctx, state) do
     args = [cursor(ctx), state]
-    paginated(ctx, :handle_list_prompts, args, "prompts", "List prompts error", state)
+
+    registered_list(
+      ctx,
+      :handle_list_prompts,
+      args,
+      "prompts",
+      "List prompts error",
+      state,
+      :prompt
+    )
   end
 
   defp do_dispatch("prompts/get", ctx, state) do
     name = Map.get(ctx.params, "name")
     arguments = Map.get(ctx.params, "arguments") || %{}
-    call(ctx, :handle_get_prompt, [name, arguments, state], "Get prompt error", state)
+
+    case Registry.lookup(Registry.current(), :prompt, name) do
+      {:ok, entry} ->
+        result = ctx |> run_registered(entry, [arguments]) |> prompt_messages()
+        callback_result(ctx, result, "Get prompt error", state, & &1)
+
+      :error ->
+        call(ctx, :handle_get_prompt, [name, arguments, state], "Get prompt error", state)
+    end
   end
 
+  # handle_complete/4 also receives the request's context (the values of the
+  # other arguments, since 2025-06-18); handlers with only /3 keep working.
   defp do_dispatch("completion/complete", ctx, state) do
     ref = Map.get(ctx.params, "ref")
     argument = Map.get(ctx.params, "argument")
-    call(ctx, :handle_complete, [ref, argument, state], "Completion error", state)
+
+    if exported?(ctx.module, :handle_complete, 4) do
+      context = Map.get(ctx.params, "context") || %{}
+      call(ctx, :handle_complete, [ref, argument, context, state], "Completion error", state)
+    else
+      call(ctx, :handle_complete, [ref, argument, state], "Completion error", state)
+    end
   end
 
   defp do_dispatch("logging/setLevel", ctx, state) do
@@ -380,45 +545,48 @@ defmodule Arbor.MCP.Server.Dispatch do
   # Invokes a callback returning {:ok, result, state} | {:error, reason, state}.
   defp call(ctx, fun, args, label, state, opts \\ []) do
     if exported?(ctx.module, fun, length(args)) do
-      on_ok = Keyword.get(opts, :on_ok, & &1)
-
-      case Context.with_context(ctx.request_context, fn -> apply(ctx.module, fun, args) end) do
-        {:input_required, input_requests, new_state} ->
-          input_required_response(ctx, input_requests, nil, new_state)
-
-        {:input_required, input_requests, application_state, new_state} ->
-          input_required_response(ctx, input_requests, application_state, new_state)
-
-        {:ok, %MRTR.InputRequired{} = required, new_state} ->
-          input_required_response(
-            ctx,
-            required.input_requests,
-            required.request_state,
-            new_state
-          )
-
-        {:ok, %MRTR.InputRequired{} = required} ->
-          input_required_response(ctx, required.input_requests, required.request_state, state)
-
-        {:ok, result, new_state} ->
-          {:response, JSONRPC.response(ctx.id, on_ok.(result)), new_state}
-
-        {:ok, result} ->
-          {:response, JSONRPC.response(ctx.id, on_ok.(result)), state}
-
-        {:error, reason, new_state} ->
-          {:response, error_response(ctx.id, label, reason), new_state}
-
-        {:error, reason} ->
-          {:response, error_response(ctx.id, label, reason), state}
-      end
+      result = Context.with_context(ctx.request_context, fn -> apply(ctx.module, fun, args) end)
+      callback_result(ctx, result, label, state, Keyword.get(opts, :on_ok, & &1))
     else
       {:response, method_not_found(ctx.id, ctx.method), state}
     end
   end
 
+  defp callback_result(ctx, result, label, state, on_ok) do
+    case result do
+      {:input_required, input_requests, new_state} ->
+        input_required_response(ctx, input_requests, nil, new_state)
+
+      {:input_required, input_requests, application_state, new_state} ->
+        input_required_response(ctx, input_requests, application_state, new_state)
+
+      {:ok, %MRTR.InputRequired{} = required, new_state} ->
+        input_required_response(
+          ctx,
+          required.input_requests,
+          required.request_state,
+          new_state
+        )
+
+      {:ok, %MRTR.InputRequired{} = required} ->
+        input_required_response(ctx, required.input_requests, required.request_state, state)
+
+      {:ok, result, new_state} ->
+        {:response, JSONRPC.response(ctx.id, on_ok.(result)), new_state}
+
+      {:ok, result} ->
+        {:response, JSONRPC.response(ctx.id, on_ok.(result)), state}
+
+      {:error, reason, new_state} ->
+        {:response, error_response(ctx.id, label, reason), new_state}
+
+      {:error, reason} ->
+        {:response, error_response(ctx.id, label, reason), state}
+    end
+  end
+
   # Invokes a paginated list callback returning {:ok, entries, cursor, state}.
-  defp paginated(ctx, fun, args, key, label, state) do
+  defp paginated(ctx, fun, args, key, label, state, unimplemented \\ nil) do
     if exported?(ctx.module, fun, length(args)) do
       case Context.with_context(ctx.request_context, fn -> apply(ctx.module, fun, args) end) do
         {:ok, entries, next_cursor, new_state} ->
@@ -430,15 +598,31 @@ defmodule Arbor.MCP.Server.Dispatch do
           {:response, JSONRPC.response(ctx.id, result), new_state}
 
         {:error, reason, new_state} ->
-          {:response, error_response(ctx.id, label, reason), new_state}
+          list_error(ctx, label, reason, new_state, unimplemented)
 
         {:error, reason} ->
-          {:response, error_response(ctx.id, label, reason), state}
+          list_error(ctx, label, reason, state, unimplemented)
       end
     else
-      {:response, method_not_found(ctx.id, ctx.method), state}
+      if unimplemented,
+        do: unimplemented.(state),
+        else: {:response, method_not_found(ctx.id, ctx.method), state}
     end
   end
+
+  # The Handler defaults for lists a handler doesn't serve.
+  @unimplemented_lists [
+    "Resources not implemented",
+    "Resource templates not implemented",
+    "Prompts not implemented"
+  ]
+
+  defp list_error(_ctx, _label, reason, state, unimplemented)
+       when is_function(unimplemented, 1) and reason in @unimplemented_lists,
+       do: unimplemented.(state)
+
+  defp list_error(ctx, label, reason, state, _unimplemented),
+    do: {:response, error_response(ctx.id, label, reason), state}
 
   defp cursor(ctx), do: Map.get(ctx.params, "cursor")
 
@@ -520,26 +704,36 @@ defmodule Arbor.MCP.Server.Dispatch do
 
   defp validate_http_initialize(_ctx, result, _state), do: result
 
+  # The tool's x-mcp-header annotations may be on any page of tools/list, so
+  # follow the cursors until it turns up. A list that runs past the bound
+  # fails closed rather than skipping the header check.
+  @max_tool_pages 100
+
+  defp validate_tool_headers(
+         %{request_context: %{era: :modern}, dispatch_opts: opts},
+         name,
+         arguments,
+         state,
+         {:ok, entry}
+       ) do
+    if Keyword.has_key?(opts, :request_headers),
+      do: validate_tool_header_entries([entry.definition], name, arguments, opts, state),
+      else: {:ok, state}
+  end
+
   defp validate_tool_headers(
          %{request_context: %{era: :modern}, dispatch_opts: opts} = ctx,
          name,
          arguments,
-         state
+         state,
+         :error
        ) do
     if Keyword.has_key?(opts, :request_headers) do
-      tools =
-        Context.with_context(ctx.request_context, fn ->
-          ctx.module.handle_list_tools(nil, state)
-        end)
+      case listed_tool(ctx, name, nil, state, @max_tool_pages) do
+        {:ok, tools, next_state} ->
+          validate_tool_header_entries(tools, name, arguments, opts, next_state)
 
-      case tools do
-        {:ok, entries, _cursor, next_state} when is_list(entries) ->
-          validate_tool_header_entries(entries, name, arguments, opts, next_state)
-
-        {:ok, entries, next_state} when is_list(entries) ->
-          validate_tool_header_entries(entries, name, arguments, opts, next_state)
-
-        _unavailable ->
+        :unavailable ->
           {:error, "Tool schema unavailable"}
       end
     else
@@ -547,7 +741,172 @@ defmodule Arbor.MCP.Server.Dispatch do
     end
   end
 
-  defp validate_tool_headers(_ctx, _name, _arguments, state), do: {:ok, state}
+  defp validate_tool_headers(_ctx, _name, _arguments, state, _registered), do: {:ok, state}
+
+  defp listed_tool(_ctx, _name, _cursor, _state, 0), do: :unavailable
+
+  defp listed_tool(ctx, name, cursor, state, pages) do
+    page =
+      Context.with_context(ctx.request_context, fn ->
+        ctx.module.handle_list_tools(cursor, state)
+      end)
+
+    case page do
+      {:ok, entries, next, next_state} when is_list(entries) ->
+        if is_binary(next) and not listed?(entries, name),
+          do: listed_tool(ctx, name, next, next_state, pages - 1),
+          else: {:ok, entries, next_state}
+
+      {:ok, entries, next_state} when is_list(entries) ->
+        {:ok, entries, next_state}
+
+      _unavailable ->
+        :unavailable
+    end
+  end
+
+  defp listed?(entries, name),
+    do: Enum.any?(ResultNormalizer.stringify_keys(entries), &(&1["name"] == name))
+
+  # Tools, resources and prompts added with Server.add_tool/3 and its
+  # siblings. Their entries come after the handler's, on its last page, and
+  # replace handler entries with the same identifier.
+  defp registered_list(ctx, fun, args, key, label, state, kind) do
+    case Registry.entries(Registry.current(), kind) do
+      [] ->
+        paginated(ctx, fun, args, key, label, state)
+
+      entries ->
+        # A handler that doesn't serve this list lists only the registered
+        # entries; any other error it returns stands.
+        only = fn state ->
+          result = %{key => Enum.map(entries, & &1.definition)}
+          {:response, JSONRPC.response(ctx.id, result), state}
+        end
+
+        ctx
+        |> paginated(fun, args, key, label, state, only)
+        |> merge_registered(entries, key)
+    end
+  end
+
+  defp merge_registered({:response, %{"result" => result} = response, state}, entries, key) do
+    ids = MapSet.new(entries, & &1.id)
+
+    own =
+      result
+      |> Map.get(key, [])
+      |> ResultNormalizer.stringify_keys()
+      |> Enum.reject(&(registered_id(&1) in ids))
+
+    listed = if result["nextCursor"], do: own, else: own ++ Enum.map(entries, & &1.definition)
+    {:response, %{response | "result" => Map.put(result, key, listed)}, state}
+  end
+
+  defp merge_registered(other, _entries, _key), do: other
+
+  defp registered_id(%{"uriTemplate" => template}), do: template
+  defp registered_id(%{"uri" => uri}), do: uri
+  defp registered_id(%{"name" => name}), do: name
+  defp registered_id(_entry), do: nil
+
+  defp call_registered_tool(ctx, entry, arguments, state) do
+    arguments = ResultNormalizer.stringify_keys(arguments)
+
+    # Invalid arguments and output that fails its schema are tool errors the
+    # model can correct, as for DSL tools (SEP-1303).
+    result =
+      case SchemaPolicy.validate_optional(Map.drop(arguments, ["_meta"]), entry.input_schema) do
+        :ok ->
+          with {:ok, response} <- run_registered(ctx, entry, [arguments]) do
+            case DSLArguments.validate_tool_response(response, entry.output_schema) do
+              {:ok, response} -> {:ok, response}
+              {:error, message} -> {:ok, Result.error(message)}
+            end
+          end
+
+        {:error, diagnostics} ->
+          message =
+            DSLArguments.input_error_message(
+              {:invalid_tool_arguments, List.wrap(diagnostics)},
+              entry.definition["inputSchema"]
+            )
+
+          {:ok, Result.error(message)}
+      end
+
+    callback_result(
+      ctx,
+      result,
+      "Tool call error",
+      state,
+      &ResultNormalizer.tool_result(&1, wrap_bare_map: true)
+    )
+  end
+
+  defp registered_resource(registry, uri) when is_binary(uri) do
+    case Registry.lookup(registry, :resource, uri) do
+      {:ok, entry} ->
+        {:ok, entry, [uri]}
+
+      :error ->
+        registry
+        |> Registry.entries(:resource_template)
+        |> Enum.find_value(:error, fn entry ->
+          case Matcher.match_uri_template(uri, entry.id) do
+            {:ok, variables} -> {:ok, entry, [uri, variables]}
+            :error -> nil
+          end
+        end)
+    end
+  end
+
+  defp registered_resource(_registry, _uri), do: :error
+
+  # Registered functions take no handler state; they return a result,
+  # {:ok, result} or {:error, reason}.
+  defp run_registered(ctx, entry, args) do
+    case Context.with_context(ctx.request_context, fn -> apply(entry.fun, args) end) do
+      {:ok, result} -> {:ok, result}
+      {:error, reason} -> {:error, reason}
+      result -> {:ok, result}
+    end
+  end
+
+  defp resource_contents({:ok, text}, uri, entry) when is_binary(text) do
+    contents =
+      %{"uri" => uri, "text" => text}
+      |> Arbor.MCP.Internal.Maps.put_present("mimeType", entry.definition["mimeType"])
+
+    {:ok, contents}
+  end
+
+  defp resource_contents(result, _uri, _entry), do: result
+
+  defp prompt_messages({:ok, text}) when is_binary(text),
+    do:
+      {:ok,
+       %{"messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => text}}]}}
+
+  defp prompt_messages(result), do: result
+
+  # Kinds with registered entries are advertised with listChanged, so a
+  # handler that registers everything at runtime needs no static declaration.
+  defp registered_capabilities(%{"capabilities" => capabilities} = result),
+    do: %{result | "capabilities" => with_registered_capabilities(capabilities)}
+
+  defp registered_capabilities(result), do: result
+
+  defp with_registered_capabilities(capabilities) do
+    registry = Registry.current()
+
+    [tool: "tools", resource: "resources", resource_template: "resources", prompt: "prompts"]
+    |> Enum.filter(fn {kind, _key} -> Registry.any?(registry, kind) end)
+    |> Enum.reduce(capabilities, fn {_kind, key}, acc ->
+      acc = ResultNormalizer.stringify_keys(acc)
+      Map.update(acc, key, %{"listChanged" => true}, &Map.put(&1, "listChanged", true))
+    end)
+  end
 
   defp validate_tool_header_entries(entries, name, arguments, opts, state) do
     tool = Enum.find(ResultNormalizer.stringify_keys(entries), &(&1["name"] == name))
@@ -568,6 +927,11 @@ defmodule Arbor.MCP.Server.Dispatch do
     if exported?(handler_module, :__server_info__, 0),
       do: handler_module.__server_info__(),
       else: nil
+  end
+
+  defp handler_instructions(handler_module) do
+    if exported?(handler_module, :__server_instructions__, 0),
+      do: handler_module.__server_instructions__()
   end
 
   defp handler_capabilities(handler_module) do

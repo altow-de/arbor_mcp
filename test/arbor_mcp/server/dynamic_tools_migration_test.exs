@@ -31,6 +31,22 @@ defmodule Arbor.MCP.Server.DynamicToolsMigrationTest do
 
   test "application state owns register, get, list, call and removal without global names" do
     {root, transport} = start_catalog()
+    # List changes reach a connection once it is initialized.
+    initialize = %{
+      "jsonrpc" => "2.0",
+      "id" => 0,
+      "method" => "initialize",
+      "params" => %{
+        "protocolVersion" => "2025-11-25",
+        "capabilities" => %{},
+        "clientInfo" => %{"name" => "dynamic-example", "version" => "2"}
+      }
+    }
+
+    assert {:ok, _} = Test.send_message(initialize, transport)
+    assert_receive {:transport_message, initialized}
+    assert %{"result" => %{"protocolVersion" => _}} = decoded(initialized)
+
     descriptor = definition("echo")
     assert {:ok, :ok} = register(root, descriptor)
     assert {:ok, ^descriptor} = Server.call(root, {:get, "echo"})

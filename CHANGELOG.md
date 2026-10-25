@@ -7,8 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- DSL server options `instructions:`, `capabilities:` and `page_size:`.
+  Instructions are returned by `initialize` and `server/discover`, and clients
+  read them with the new `Arbor.MCP.Client.instructions/1`. Capabilities are
+  merged into the generated ones. A page size paginates the four list methods
+  with an opaque cursor; an invalid cursor fails with `-32602`.
+- DSL completion: prompt arguments and resource-template variables take
+  `complete:` with a list of strings, a local function name or an external
+  capture of arity 2. The generated server advertises `completions` and
+  answers `completion/complete` for them, passing the request's `context`
+  (already-filled arguments) to functions. Other arguments still reach
+  `handle_complete/3`.
+- `Handler.handle_complete/4` receives the completion `context` (MCP
+  2025-06-18), and `Client.complete/4` sends one with `context:`.
+- `Server.Context.request_id/0`, `session_id/0`, `auth_info/0` and
+  `request_headers/0` describe the request a callback handles, like the
+  `extra` argument of TypeScript SDK handlers. Over HTTP with
+  `oauth_enabled: true`, `auth_info/0` returns the validated bearer token as a
+  new `Arbor.MCP.Server.AuthInfo`, which leaves the token out of `inspect/1`. A
+  host that authenticates requests in its own plug can attach one with
+  `Arbor.MCP.HttpPlug.put_auth_info/2`.
+- `Server.add_tool/3`, `add_resource/3`, `add_resource_template/3` and
+  `add_prompt/3` add definitions to a running server with a function that
+  serves them, and `remove_tool/2` and its siblings take them away. Each
+  change notifies clients that the list changed, like `registerTool` in the
+  TypeScript SDK and `AddTool` in Go. Registered entries are listed after the
+  handler's own, take precedence over handler entries with the same name, and
+  are advertised with `listChanged: true`. Tool arguments are validated
+  against `inputSchema` and results against `outputSchema`; a failure is an
+  `isError` tool result, as for DSL tools. This works for
+  plain handlers and DSL servers alike.
+- Server middleware: the `:middleware` runtime option takes modules
+  implementing the new `Arbor.MCP.Server.Middleware`, which wrap every
+  request and notification dispatched to the handler, on every transport,
+  like Python's `MCPServer(middleware=[...])` and Go's
+  `AddReceivingMiddleware`. A middleware can refuse a request, rewrite its
+  params or change its result, and never sees the handler state.
+
 ### Changed
 
+- **BREAKING:** Resource-template variables are percent-decoded, so a handler
+  that decoded them itself now decodes twice. Template matching supports every
+  RFC 6570 operator (`{+path}` and `{#frag}` span slashes, `{/a,b}`, `{.ext}`,
+  `{;params}`, `{?query}` and `{&more}`), exploded lists and prefixes. Later
+  variables of a path expression may be omitted. Query variables match in
+  any order and may be absent, and other query parameters are ignored. As
+  in Python's MCPServer, a decoded value doesn't match if it contains a NUL
+  byte, climbs above its start with `..`, or is an absolute path, however it
+  was encoded. Before, every expression matched one path segment as written.
+- DSL servers advertise `listChanged: true` for tools, resources and prompts,
+  as the TypeScript SDK does. Send the notifications with
+  `Arbor.MCP.Server.notify_tools_changed/1` and its siblings.
 - **BREAKING:** Servers handle the requests on a connection concurrently by
   default, like the other MCP SDKs. The runtime default is now
   `execution: :stateless, max_concurrency: 64` (was `execution: :stateful,
@@ -124,9 +175,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refreshes again. Modern HTTP request streams hand their 401 and 403
   challenges to the client process, which runs one refresh or flow for all of
   them, so a rotating refresh token isn't used twice; a 403 reuses another
-  stream's newer token only if that token was granted the challenged scopes. The provider struct no
-  longer shows its tokens or its auth config, which can hold a client secret,
-  in `inspect/1`.
+  stream's newer token only if that token was granted the challenged scopes.
+  The provider struct no longer shows its tokens or its auth config, which
+  can hold a client secret, in `inspect/1`.
+- A BEAM or test-transport server sent list changes to a connection that
+  hadn't sent `initialize` or a modern request yet. A client establishing
+  that connection took the notification for the answer to its
+  `server/discover` probe and failed to connect. The connection now gets
+  list changes once its era is set.
+- A modern `tools/call` checked its `Mcp-Param-*` headers against the first
+  `tools/list` page only, so a tool on a later page of a paginated list
+  skipped the check. The server now follows the cursors until it finds the
+  tool, for up to 100 pages, and fails the request closed past that.
+- `Server.notify_tools_changed/1` and the other change notifications,
+  `Server.call/3` and `Server.cast/2` crashed an HTTP runtime when called
+  outside a request: with no edge process to send through, they messaged the
+  runtime supervisor. List changes now go to the runtime's
+  `subscriptions/listen` streams, and calls and casts return
+  `{:error, :runtime_unavailable}`.
 
 ## [2.0.0-rc.5] — 2026-10-22
 

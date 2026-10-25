@@ -38,6 +38,25 @@ defmodule Arbor.MCP.Server.Runtime.HTTPNotifications do
     end
   end
 
+  @doc false
+  # An HTTP runtime has no edge process to send through. Outside a request,
+  # list changes go to its subscriptions/listen streams, under the service's
+  # publication rules.
+  def publish(runtime, control) do
+    with {:ok, %{"method" => method, "params" => params}} <- notification(control),
+         true <- method in @topic_methods,
+         {:ok, service} <- Runtime.service(runtime, :subscriptions) do
+      case Subscriptions.publish(method, params, service: service) do
+        %{} -> :ok
+        {:error, reason} when is_atom(reason) -> {:error, reason}
+        _rejected -> {:error, :publication_rejected}
+      end
+    else
+      false -> {:error, :unsupported_http_control}
+      {:error, _reason} = error -> error
+    end
+  end
+
   def deliver(runtime, lease, message) do
     with {:ok, source} <- Source.capture(),
          true <- Source.runtime(source) == runtime and Source.lease(source) == lease do

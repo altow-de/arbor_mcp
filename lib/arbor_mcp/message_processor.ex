@@ -191,7 +191,10 @@ defmodule Arbor.MCP.MessageProcessor do
       request_context = %{
         request_context
         | notification_target: Map.get(opts, :request_notification_target),
-          cancellation_scope: scope
+          cancellation_scope: scope,
+          session_id: conn.session_id,
+          auth_info: Map.get(opts, :auth_info),
+          request_headers: Map.get(opts, :request_headers)
       }
 
       conn =
@@ -345,10 +348,12 @@ defmodule Arbor.MCP.MessageProcessor do
            timeout: timeout,
            await_timeout: timeout,
            dispatch_opts:
-             Keyword.merge(mrtr_opts(conn, opts),
+             mrtr_opts(conn, opts)
+             |> Keyword.merge(
                protocol_mode: Map.get(opts, :protocol_mode),
                instructions: Map.get(opts, :instructions)
              )
+             |> Keyword.merge(request_info_opts(conn, opts))
          ) do
       {:ok, response} ->
         put_response(conn, ResultNormalizer.stringify_keys(response))
@@ -367,6 +372,16 @@ defmodule Arbor.MCP.MessageProcessor do
           )
         )
     end
+  end
+
+  # Only present keys: a :request_headers key turns on modern tool-header checks.
+  defp request_info_opts(conn, opts) do
+    [
+      session_id: conn.session_id,
+      auth_info: Map.get(opts, :auth_info),
+      request_headers: Map.get(opts, :request_headers)
+    ]
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
   end
 
   defp runtime_scope(conn), do: {:message_processor, conn.session_id || self()}

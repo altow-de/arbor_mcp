@@ -419,31 +419,44 @@ defmodule Arbor.MCP.Server.Handler do
               | input_required_return()
 
   @doc """
-  Handles a completion request for argument autocompletion.
-
-  This callback is invoked when a client requests completion suggestions
-  for tool arguments, resource URIs, or prompt arguments.
+  Handles a `completion/complete` request: suggestions for a prompt argument
+  or a resource template variable.
 
   ## Parameters
-    - ref: Reference type (e.g., "argument")
-    - params: Map containing:
-      - name: The argument/parameter name to complete
-      - value: The partial value to complete
+    - ref: what is being completed, `%{"type" => "ref/prompt", "name" => name}`
+      or `%{"type" => "ref/resource", "uri" => uri_template}`
+    - argument: `%{"name" => argument_name, "value" => partial_value}`
 
   ## Return Value
-    Should return a map with:
-    - completion: List of completion suggestion strings
+    `{:ok, %{completion: %{values: [String.t()], total: n, hasMore: boolean}}, state}`,
+    with at most 100 values. Define `handle_complete/4` to also receive the
+    values of the other arguments.
 
   ## Example
 
-      def handle_complete("argument", %{"name" => "file_path", "value" => "/home/"}, state) do
-        completions = ["/home/user/", "/home/documents/", "/home/downloads/"]
-        {:ok, %{completion: completions}, state}
+      def handle_complete(%{"type" => "ref/prompt", "name" => "code_review"},
+                          %{"name" => "language", "value" => prefix}, state) do
+        values = Enum.filter(["elixir", "erlang", "go"], &String.starts_with?(&1, prefix))
+        {:ok, %{completion: %{values: values, total: length(values), hasMore: false}}, state}
       end
 
-  Note: Servers should declare the `completion` capability to advertise support.
+  Declare the `completions` capability to advertise support. DSL modules
+  whose arguments declare `complete:` advertise it for you.
   """
-  @callback handle_complete(ref :: String.t(), params :: map(), state()) ::
+  @callback handle_complete(ref :: map(), argument :: map(), state()) ::
+              {:ok, result :: map(), state()} | {:error, any(), state()}
+
+  @doc """
+  Like `handle_complete/3`, and also receives the request's `context`
+  (`%{"arguments" => %{...}}`: the values of the other arguments so far,
+  since protocol 2025-06-18). When a handler defines this callback the
+  server calls it instead of `handle_complete/3`. DSL modules whose prompt
+  arguments or template variables declare `complete:` define it for you,
+  and fall back to `handle_complete/3` for anything else.
+
+  @doc api: :public
+  """
+  @callback handle_complete(ref :: map(), argument :: map(), context :: map(), state()) ::
               {:ok, result :: map(), state()} | {:error, any(), state()}
 
   @doc """
@@ -583,6 +596,7 @@ defmodule Arbor.MCP.Server.Handler do
     handle_list_prompts: 2,
     handle_get_prompt: 3,
     handle_complete: 3,
+    handle_complete: 4,
     handle_create_message: 2,
     handle_list_roots: 1,
     handle_subscribe_resource: 2,

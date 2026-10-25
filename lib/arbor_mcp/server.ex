@@ -34,11 +34,13 @@ defmodule Arbor.MCP.Server do
   scoped subscription service and its publication authorization rules.
 
   Static definitions use `Arbor.MCP.Server.DSL`, including compile-time components.
-  Dynamic tool descriptors and dispatch belong in the application's Handler state;
-  `handle_list_tools/2` and `handle_call_tool/3` share its Runtime scheduler.
-  The former `Server.Tools` family was removed in v2. The
-  [dynamic tool example](https://github.com/trust-arbor/arbor_mcp/blob/master/examples/dynamic_tools.exs)
-  demonstrates registration, replacement, strict validation, and explicit defaults.
+  To change what a running server offers, `add_tool/3`, `add_resource/3`,
+  `add_resource_template/3` and `add_prompt/3` register a definition with a
+  function, the `remove_*` functions take it away, and each change notifies
+  clients that the list changed, like `registerTool` in the TypeScript SDK and
+  `AddTool` in Go. Handlers can also keep their own catalog in a process or ETS
+  table and call `notify_tools_changed/1` and its siblings. The former
+  `Server.Tools` family was removed in v2.
 
   > #### Protocol-deprecated features {: .warning}
   >
@@ -49,7 +51,7 @@ defmodule Arbor.MCP.Server do
   > directly; and use stderr or OpenTelemetry for operational logs.
   """
 
-  alias Arbor.MCP.Server.{HandlerServer, Runtime, StdioServer}
+  alias Arbor.MCP.Server.{HandlerServer, Registry, Runtime, StdioServer}
 
   alias Arbor.MCP.Server.Runtime.{
     Admission,
@@ -231,6 +233,121 @@ defmodule Arbor.MCP.Server do
   end
 
   @doc """
+  Adds a tool to a running server, or replaces the one with the same name,
+  and notifies clients that the tool list changed.
+
+  `tool` is the definition as `tools/list` shows it, with atom or string keys.
+  `name` is required, `inputSchema` defaults to `%{"type" => "object"}`, and
+  `outputSchema` is optional. Both schemas are checked now. `fun` gets the
+  arguments as a string-keyed map, after they are validated against
+  `inputSchema`; as for DSL tools, arguments or a structured result that
+  fail their schema come back as an `isError` tool result. `fun` returns
+  what `handle_call_tool/3` would without the state: a result such as `Arbor.MCP.Server.Result.text/1` or a map,
+  `{:ok, result}` or `{:error, reason}`. It runs in the request's callback
+  worker, inside `Arbor.MCP.Server.Context`.
+
+      :ok =
+        Arbor.MCP.Server.add_tool(server, %{name: "greet", inputSchema: schema}, fn args ->
+          Arbor.MCP.Server.Result.text("Hello, \#{args["name"]}")
+        end)
+
+  Registered tools are listed after the handler's own and take precedence
+  over a handler tool with the same name. Once a kind has entries, the server
+  advertises it with `listChanged: true`; declare the capability yourself if
+  clients connect before you add the first one. Entries last as long as the
+  runtime supervisor.
+  """
+  @spec add_tool(server(), map(), (map() -> term())) :: :ok | {:error, term()}
+  def add_tool(server, tool, fun), do: register(server, :tool, tool, fun)
+
+  @doc "Removes a tool added with `add_tool/3` and notifies clients."
+  @spec remove_tool(server(), String.t()) :: :ok | {:error, :not_found | term()}
+  def remove_tool(server, name), do: unregister(server, :tool, name)
+
+  @doc """
+  Adds a resource to a running server, or replaces the one with the same URI,
+  and notifies clients that the resource list changed.
+
+  `resource` needs `uri` and `name`. `fun` gets the URI and returns its
+  contents: a string (text with the resource's `mimeType`), a contents map or
+  list of them, `{:ok, contents}` or `{:error, reason}`. See `add_tool/3` for
+  how registered entries are listed and advertised.
+  """
+  @spec add_resource(server(), map(), (String.t() -> term())) :: :ok | {:error, term()}
+  def add_resource(server, resource, fun), do: register(server, :resource, resource, fun)
+
+  @doc "Removes a resource added with `add_resource/3` and notifies clients."
+  @spec remove_resource(server(), String.t()) :: :ok | {:error, :not_found | term()}
+  def remove_resource(server, uri), do: unregister(server, :resource, uri)
+
+  @doc """
+  Adds a resource template to a running server, or replaces the one with the
+  same `uriTemplate`, and notifies clients that the resource list changed.
+
+  `template` needs `uriTemplate` (RFC 6570) and `name`. `fun` gets the URI
+  being read and the template's variables, string-keyed and percent-decoded,
+  and returns contents as for `add_resource/3`. Exact resources are matched
+  before templates, and templates in the order they were added.
+  """
+  @spec add_resource_template(server(), map(), (String.t(), map() -> term())) ::
+          :ok | {:error, term()}
+  def add_resource_template(server, template, fun),
+    do: register(server, :resource_template, template, fun)
+
+  @doc "Removes a resource template added with `add_resource_template/3`."
+  @spec remove_resource_template(server(), String.t()) :: :ok | {:error, :not_found | term()}
+  def remove_resource_template(server, uri_template),
+    do: unregister(server, :resource_template, uri_template)
+
+  @doc """
+  Adds a prompt to a running server, or replaces the one with the same name,
+  and notifies clients that the prompt list changed.
+
+  `prompt` needs `name`, and may list `arguments`. `fun` gets the arguments
+  map and returns a string (one user message), a result with `messages`,
+  `{:ok, result}` or `{:error, reason}`.
+  """
+  @spec add_prompt(server(), map(), (map() -> term())) :: :ok | {:error, term()}
+  def add_prompt(server, prompt, fun), do: register(server, :prompt, prompt, fun)
+
+  @doc "Removes a prompt added with `add_prompt/3` and notifies clients."
+  @spec remove_prompt(server(), String.t()) :: :ok | {:error, :not_found | term()}
+  def remove_prompt(server, name), do: unregister(server, :prompt, name)
+
+  defp register(server, kind, definition, fun) do
+    with {:ok, registry} <- registry(server),
+         :ok <- Registry.put(registry, kind, definition, fun),
+         do: notify_changed(server, kind)
+  end
+
+  defp unregister(server, kind, id) do
+    with {:ok, registry} <- registry(server),
+         :ok <- Registry.delete(registry, kind, id),
+         do: notify_changed(server, kind)
+  end
+
+  defp registry(server) do
+    with {:ok, runtime} <- Runtime.ref(server) do
+      case Registry.of_table(Ref.table(runtime)) do
+        nil -> {:error, :runtime_unavailable}
+        registry -> {:ok, registry}
+      end
+    end
+  end
+
+  # The change is made whether or not a client is connected to hear about it.
+  defp notify_changed(server, kind) do
+    _result =
+      case kind do
+        :tool -> notify_tools_changed(server)
+        :prompt -> notify_prompts_changed(server)
+        _resource -> notify_resources_changed(server)
+      end
+
+    :ok
+  end
+
+  @doc """
   Gets the list of pending request IDs on the server.
   """
   @spec get_pending_requests(server()) :: [Arbor.MCP.Types.request_id()] | {:error, atom()}
@@ -287,7 +404,7 @@ defmodule Arbor.MCP.Server do
         end
 
       {:error, _reason} ->
-        case Ref.address(server) do
+        case without_edge(server) do
           {:ok, address} -> GenServer.call(address, request, timeout)
           {:error, _reason} -> {:error, :runtime_unavailable}
         end
@@ -314,7 +431,7 @@ defmodule Arbor.MCP.Server do
         end
 
       {:error, _reason} ->
-        case Ref.address(server) do
+        case without_edge(server) do
           {:ok, address} -> GenServer.cast(address, request)
           {:error, _reason} -> {:error, :runtime_unavailable}
         end
@@ -346,7 +463,7 @@ defmodule Arbor.MCP.Server do
         end
 
       {:error, _reason} ->
-        case Ref.address(server) do
+        case without_edge(server) do
           {:ok, address} -> GenServer.call(address, request, timeout)
           {:error, _reason} -> {:error, :runtime_unavailable}
         end
@@ -359,6 +476,16 @@ defmodule Arbor.MCP.Server do
         :not_http_request -> cast_native_control(server, request)
         result -> result
       end
+    end
+  end
+
+  # A runtime without an edge process (HTTP) takes no custom calls, casts or
+  # native controls; messaging its supervisor would crash it. Anything else
+  # is addressed directly.
+  defp without_edge(server) do
+    case Runtime.ref(server) do
+      {:ok, _runtime} -> {:error, :runtime_unavailable}
+      {:error, _reason} -> Ref.address(server)
     end
   end
 
@@ -378,9 +505,16 @@ defmodule Arbor.MCP.Server do
         end
 
       {:error, _reason} ->
-        case Ref.address(server) do
-          {:ok, address} -> GenServer.cast(address, request)
-          {:error, _reason} -> {:error, :runtime_unavailable}
+        # An HTTP runtime has no edge; its list changes go to listeners.
+        case Runtime.ref(server) do
+          {:ok, runtime} ->
+            HTTPNotifications.publish(runtime, request)
+
+          {:error, _reason} ->
+            case Ref.address(server) do
+              {:ok, address} -> GenServer.cast(address, request)
+              {:error, _reason} -> {:error, :runtime_unavailable}
+            end
         end
     end
   end

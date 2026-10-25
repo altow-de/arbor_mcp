@@ -84,6 +84,8 @@ defmodule Arbor.MCP.Client do
     :transport_mod,
     :transport_state,
     :server_info,
+    # The server's `instructions` from initialize or server/discover, or nil.
+    :server_instructions,
     :transport_opts,
     :pending_requests,
     :pending_batches,
@@ -1025,6 +1027,19 @@ defmodule Arbor.MCP.Client do
   end
 
   @doc """
+  Gets the instructions the server gave for using it (`instructions` in its
+  initialize or server/discover result), or `nil` when it gave none. Clients
+  typically add them to a model's context.
+  """
+  @spec instructions(t()) :: {:ok, String.t() | nil} | {:error, any()}
+  def instructions(client) do
+    case get_status(client) do
+      {:ok, %{server_instructions: instructions}} -> {:ok, instructions}
+      _ -> {:error, :not_connected}
+    end
+  end
+
+  @doc """
   Gets server capabilities.
   """
   @spec server_capabilities(t()) :: {:ok, map()} | {:error, any()}
@@ -1733,6 +1748,7 @@ defmodule Arbor.MCP.Client do
     status = %{
       connection_status: state.connection_status,
       server_info: state.server_info,
+      server_instructions: state.server_instructions,
       server_capabilities: state.server_capabilities,
       protocol_version: state.protocol_version,
       transport: state.transport_mod,
@@ -1751,7 +1767,8 @@ defmodule Arbor.MCP.Client do
         state
         | protocol_version: version,
           server_capabilities: discovery.capabilities,
-          server_info: discovery.server_info
+          server_info: discovery.server_info,
+          server_instructions: discovery.instructions
       }
 
       {:reply, :ok, updated_state}
@@ -3440,13 +3457,22 @@ defmodule Arbor.MCP.Client do
         %{"type" => "ref/resource", "uri" => "file:///"},
         %{"name" => "path", "value" => "/src"}
       )
+
+      # Pass the values of the other arguments (protocol 2025-06-18 and later)
+      {:ok, result} = Arbor.MCP.Client.complete(
+        client,
+        %{"type" => "ref/prompt", "name" => "code_generator"},
+        %{"name" => "framework", "value" => "ph"},
+        context: %{"arguments" => %{"language" => "elixir"}}
+      )
   """
   @spec complete(t(), map(), map(), keyword()) :: {:ok, map()} | {:error, any()}
   def complete(client, ref, argument, opts \\ []) do
     params =
       ref
       |> RequestParams.completion(argument)
-      |> RequestParams.with_opts_meta(opts)
+      |> Arbor.MCP.Internal.Maps.put_present("context", Keyword.get(opts, :context))
+      |> RequestParams.with_opts_meta(Keyword.delete(opts, :context))
 
     make_request(client, "completion/complete", params, opts, 5_000)
   end
