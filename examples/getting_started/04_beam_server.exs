@@ -68,6 +68,6 @@ if System.get_env("MCP_ENV") != "test" do
   IO.puts("Starting BEAM-local MCP server.")
   IO.puts("Start a client in the same VM with transport: :beam and server: pid.")
 
-  {:ok, _server} = BeamHelloServer.start_link(transport: :beam)
+  {:ok, _server} = BeamHelloServer.start_link(transport: :beam, execution: :stateful)
   Process.sleep(:infinity)
 end

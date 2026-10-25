@@ -50,7 +50,7 @@ defmodule Arbor.MCP.Client.AsyncPostResultTest do
       assert {:noreply, new_state} =
                Client.handle_info({:DOWN, task_ref, :process, self(), :boom}, state)
 
-      assert_receive {^reply_tag, {:error, {:transport_error, :boom}}}
+      assert_receive {^reply_tag, {:error, %{type: :transport_error, reason: :boom}}}
       assert new_state.pending_requests == %{}
       assert new_state.async_post_tasks == %{}
     end
@@ -154,7 +154,7 @@ defmodule Arbor.MCP.Client.AsyncPostResultTest do
       assert {:noreply, new_state} =
                Client.handle_info({:async_post_result, {:error, :econnrefused}, meta}, state)
 
-      assert_receive {^reply_tag, {:error, {:transport_error, :econnrefused}}}
+      assert_receive {^reply_tag, {:error, %{type: :transport_error, reason: :econnrefused}}}
       assert new_state.pending_requests == %{}
     end
 

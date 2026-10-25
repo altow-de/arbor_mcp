@@ -37,7 +37,7 @@ defmodule MyApp.MCPHandler do
   use Arbor.MCP.Server.DSL, name: "my-phoenix-app", version: "1.0.0"
 
   @impl true
-  def init(_application_opts), do: {:ok, %{calls: 0}}
+  def init(_application_opts), do: {:ok, %{}}
 
   tool "search_posts", "Search blog posts" do
     param :query, :string, required: true
@@ -46,7 +46,7 @@ defmodule MyApp.MCPHandler do
     run fn %{query: query, limit: limit}, state ->
       posts = MyApp.Blog.search_posts(query, limit: limit)
       content = Enum.map(posts, &%{type: "text", text: &1.title})
-      {:ok, %{content: content}, %{state | calls: state.calls + 1}}
+      {:ok, %{content: content}, state}
     end
   end
 end
@@ -71,7 +71,10 @@ Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
 ```
 
 `handler_args` supplies application-level `init/1` arguments. `init/1` is not run
-for every HTTP request. Stateful callbacks are serialized by the runtime; use
+for every HTTP request. Callbacks run concurrently by default and return the
+state from `init/1` unchanged; keep mutable data in your database, a process
+or ETS, or set
+`execution: :stateful` to run them one at a time. Use
 request context for identity and authorization, rather than putting the current
 HTTP user into persistent handler state. The explicit `:mounted_http` mode selects legacy-capable runtime service defaults
 for sessions and resource subscriptions; replay protection remains explicitly

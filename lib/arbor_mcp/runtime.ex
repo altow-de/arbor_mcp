@@ -2,9 +2,17 @@ defmodule Arbor.MCP.Server.Runtime do
   @moduledoc """
   Supervises one independently owned MCP server and its bounded callback work.
 
-  Stateful callbacks execute serially by default. Set `execution: :stateless`
-  explicitly before increasing `max_concurrency`; stateless callbacks cannot
-  change their initialized handler state.
+  Callbacks run concurrently by default, like the other MCP SDKs:
+  `execution: :stateless` runs up to `max_concurrency` (default 64) at once,
+  each in its own supervised task. `init/1` and `handle_initialize/2` may set
+  up handler state (initializations commit one at a time); every other
+  callback sees a snapshot and must return it unchanged, so keep mutable data
+  in a process or ETS table. A callback that returns a changed state fails its
+  request, and the runtime logs a warning once. `execution: :stateful` runs
+  one callback at a time and commits the state each returns; `ping` is still
+  answered while one runs.
+  `request_timeout_ms` (default one hour) is a safety net: callers end work
+  with their own timeout and `notifications/cancelled`.
 
   One original `init_timeout_ms` budget covers configuration validation and all
   owned startup phases through final admission readiness. A genuine service or

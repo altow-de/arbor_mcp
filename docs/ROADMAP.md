@@ -10,7 +10,8 @@ The maintained ExMCP line has released `ex_mcp` `1.6.0`.
 
 - Separate MCP, ACP and RPC ownership, with an optional vendor adapter bundle.
 - Per-server runtime supervision, common dispatch and bounded callback scheduling
-  across BEAM, test, stdio and HTTP. Stateful handlers remain serialized by default.
+  across BEAM, test, stdio and HTTP. Requests run concurrently by default;
+  stateful handlers opt into one-at-a-time execution.
 - Scoped sessions, subscriptions, Tasks and replay stores, explicit cancellation,
   deadlines, output accounting and ownership-aware shutdown.
 - Optional Cowboy/Bandit listeners and mounted Phoenix/Plug hosting.

@@ -298,10 +298,13 @@ Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
 ```
 
 Pass initialization data with root `:handler_args`. The returned PID and name
-identify a supervisor, not the handler GenServer. Stateful callbacks are
-serialized through the Runtime; they run in managed callback Tasks. Keep
-long-lived resources under supervision and do not depend on a callback running
-in the same process as initialization. Use `Arbor.MCP.Server.call/2,3` and
+identify a supervisor, not the handler GenServer. Callbacks run in managed
+callback Tasks, concurrently by default: set handler state up in `init/1` or
+`handle_initialize/2`, return it unchanged from other callbacks and keep
+mutable data in a process or ETS table, or start the server
+with `execution: :stateful` to run callbacks one at a time and commit the state
+each returns, as 1.x did. Keep long-lived resources under supervision and do
+not depend on a callback running in the same process as initialization. Use `Arbor.MCP.Server.call/2,3` and
 `cast/2` for custom handler controls instead of raw `GenServer.call/cast` on the
 root. Use public Runtime APIs rather than inspecting private process state.
 

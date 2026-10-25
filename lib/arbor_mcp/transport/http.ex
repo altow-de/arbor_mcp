@@ -365,10 +365,29 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   def send_message(message, %__MODULE__{use_sse: true, sse_pid: sse_pid} = state)
-      when is_pid(sse_pid) do
-    # SSE mode with active connection — use async POST so the GenServer
-    # can process SSE events (elicitation, sampling) while waiting for
-    # the POST response. The response arrives as {:async_post_result, result, meta}.
+      when is_pid(sse_pid),
+      do: async_post(message, state)
+
+  def send_message(message, %__MODULE__{} = state) do
+    # SSE mode without active connection (pre-initialization) or fallback
+    case perform_and_maybe_auth(message, state) do
+      {:ok, response} -> handle_http_response(response, state, message)
+      {:ok, response, new_state} -> handle_http_response(response, new_state, message)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc false
+  # POSTs `message` from its own monitored task and returns at once, so the
+  # client process can send further requests and handle server messages while
+  # this one runs. The response arrives as {:async_post_result, result, meta}.
+  # Used for every request sent after establishment, and for all messages
+  # once a legacy SSE stream is open.
+  @spec send_async(binary(), t()) :: {:ok, t()}
+  def send_async(message, %__MODULE__{} = state) when is_binary(message),
+    do: state |> maybe_start_deferred_sse(message) |> then(&async_post(message, &1))
+
+  defp async_post(message, state) do
     parent = self()
     request_id = extract_request_id(message)
     nonce = make_ref()
@@ -412,15 +431,6 @@ defmodule Arbor.MCP.Transport.HTTP do
     # Return without response data — it will arrive via :async_post_result
     # or via the GET SSE stream (for SSE-formatted POST responses)
     {:ok, state}
-  end
-
-  def send_message(message, %__MODULE__{} = state) do
-    # SSE mode without active connection (pre-initialization) or fallback
-    case perform_and_maybe_auth(message, state) do
-      {:ok, response} -> handle_http_response(response, state, message)
-      {:ok, response, new_state} -> handle_http_response(response, new_state, message)
-      {:error, reason} -> {:error, reason}
-    end
   end
 
   # Perform HTTP request with automatic OAuth retry via auth provider.
@@ -751,7 +761,7 @@ defmodule Arbor.MCP.Transport.HTTP do
       BoundedClient.request(:post, url, headers, "application/json", body,
         deadline: state.deadline,
         connect_timeout: state.timeouts.connect,
-        request_timeout: state.timeouts.request,
+        request_timeout: response_timeout(state),
         max_request_bytes: state.max_request_bytes,
         max_response_bytes: state.max_response_bytes,
         transport_opts: transport_opts,
@@ -761,6 +771,14 @@ defmodule Arbor.MCP.Transport.HTTP do
       )
     end
   end
+
+  # A caller's own deadline decides how long it waits for its response, as
+  # in the other MCP SDKs; the transport's :request_timeout covers sends
+  # that carry none.
+  defp response_timeout(%{deadline: deadline}) when is_integer(deadline),
+    do: max(deadline - System.monotonic_time(:millisecond), 1)
+
+  defp response_timeout(state), do: state.timeouts.request
 
   @doc false
   # Builds the `http_options` list handed to `:httpc.request/4,5`.

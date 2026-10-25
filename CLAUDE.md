@@ -159,6 +159,14 @@ See `docs/ARCHITECTURE.md`, `docs/TRANSPORT_GUIDE.md`, and
 - Server handlers implement the `Arbor.MCP.Server.Handler` behaviour
 - Use `Arbor.MCP.Types` for type definitions and specs
 - Protocol messages follow MCP specification exactly
+- Servers run callbacks concurrently by default (`execution: :stateless`,
+  `max_concurrency: 64`), like the other MCP SDKs, so callbacks other than
+  `init/1` and `handle_initialize/2` must return the handler state unchanged.
+  A handler (including a test fixture) that keeps counters or other data in
+  its state must be started with `execution: :stateful`, which runs callbacks
+  one at a time. The server's
+  `request_timeout_ms` defaults to one hour; clients cancel requests they
+  time out.
 
 ## Testing Approach
 

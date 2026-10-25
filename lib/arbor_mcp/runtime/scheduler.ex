@@ -20,7 +20,8 @@ defmodule Arbor.MCP.Server.Runtime.Scheduler do
     OutputLedger,
     Ref,
     Services,
-    ShutdownGuard
+    ShutdownGuard,
+    WorkClass
   }
 
   def start_link(opts) do
@@ -106,7 +107,8 @@ defmodule Arbor.MCP.Server.Runtime.Scheduler do
          queue: :queue.new(),
          work: %{},
          tasks: %{},
-         owners: %{}
+         owners: %{},
+         state_warning: false
        }}
     else
       {:error, reason} -> {:stop, {:handler_init_failed, reason}}
@@ -176,6 +178,8 @@ defmodule Arbor.MCP.Server.Runtime.Scheduler do
           work = %{
             reservation: reservation,
             request: request,
+            class: work_class(state.config, reservation, request),
+            snapshot: nil,
             opts: opts,
             owner_ref: owner_ref,
             deadline_timer: deadline_timer,
@@ -192,9 +196,13 @@ defmodule Arbor.MCP.Server.Runtime.Scheduler do
           state = %{
             state
             | work: Map.put(state.work, token, work),
-              owners: Map.put(state.owners, owner_ref, token),
-              queue: :queue.in(token, state.queue)
+              owners: Map.put(state.owners, owner_ref, token)
           }
+
+          state =
+            if beside_slot?(state.config, work),
+              do: start_work(state, token),
+              else: %{state | queue: :queue.in(token, state.queue)}
 
           {:noreply, start_available(state)}
 
@@ -410,30 +418,70 @@ defmodule Arbor.MCP.Server.Runtime.Scheduler do
   end
 
   defp start_available(state) do
-    if map_size(state.tasks) < state.config.max_concurrency do
-      case :queue.out(state.queue) do
-        {:empty, _queue} ->
-          state
+    case next_startable(state) do
+      nil ->
+        state
 
-        {{:value, token}, queue} ->
-          state = %{state | queue: queue}
-          work = Map.fetch!(state.work, token)
-
-          case start_failure(state, work) do
-            nil ->
-              state |> start_task(token, work) |> start_available()
-
-            :request_cancelled ->
-              state |> cancel_work(token, :request_cancelled) |> start_available()
-
-            reason ->
-              state |> fail(token, reason) |> remove_work(token) |> start_available()
-          end
-      end
-    else
-      state
+      token ->
+        %{state | queue: :queue.delete(token, state.queue)}
+        |> start_work(token)
+        |> start_available()
     end
   end
+
+  # Stateful: queued work is all ordered, one at a time, in arrival order.
+  defp next_startable(%{config: %{execution: :stateful}} = state) do
+    if ordered_running(state) < state.config.max_concurrency do
+      case :queue.peek(state.queue) do
+        {:value, token} -> token
+        :empty -> nil
+      end
+    end
+  end
+
+  # Stateless: up to max_concurrency at once, in arrival order, except that
+  # an ordered item (initialize, a cancellation tracker) waits for the one
+  # already running, so two commits never start from the same state.
+  defp next_startable(state) do
+    if map_size(state.tasks) < state.config.max_concurrency do
+      ordered_busy? = ordered_running(state) > 0
+
+      state.queue
+      |> :queue.to_list()
+      |> Enum.find(&(not ordered_busy? or state.work[&1].class != :ordered))
+    end
+  end
+
+  defp start_work(state, token) do
+    work = Map.fetch!(state.work, token)
+
+    case start_failure(state, work) do
+      nil -> start_task(state, token, work)
+      :request_cancelled -> cancel_work(state, token, :request_cancelled)
+      reason -> state |> fail(token, reason) |> remove_work(token)
+    end
+  end
+
+  defp ordered_running(state),
+    do: Enum.count(state.tasks, fn {_ref, token} -> state.work[token].class == :ordered end)
+
+  # Ordered work commits the state it returns, one item at a time. Snapshot
+  # work must return the state it started from and commits none of its own,
+  # so it cannot undo an ordered commit made while it ran. A stateful runtime
+  # orders everything but ping; a stateless one orders only initialize (and
+  # cancellation trackers), so handlers can still set state up there.
+  defp work_class(%{execution: :stateful}, %{kind: :rpc}, request),
+    do: if(WorkClass.snapshot?(request), do: :snapshot, else: :ordered)
+
+  defp work_class(%{execution: :stateful}, _reservation, _request), do: :ordered
+  defp work_class(_config, %{kind: :rpc}, %{"method" => "initialize"}), do: :ordered
+  defp work_class(_config, _reservation, _request), do: :snapshot
+
+  # Ping on a stateful runtime runs beside the callback holding the slot.
+  defp beside_slot?(config, work), do: config.execution == :stateful and work.class == :snapshot
+
+  defp execution(%{class: :snapshot}), do: :stateless
+  defp execution(_work), do: :stateful
 
   defp start_task(state, token, work) do
     snapshot = state.handler_state
@@ -474,7 +522,7 @@ defmodule Arbor.MCP.Server.Runtime.Scheduler do
               proposal = invoke(invocation, work, config, snapshot)
 
               CallbackContext.with_context(invocation, fn ->
-                prepare_proposal(proposal, invocation, work, config, snapshot, output)
+                prepare_proposal(proposal, invocation, work, snapshot, output)
               end)
 
             {:error, reason} ->
@@ -491,10 +539,12 @@ defmodule Arbor.MCP.Server.Runtime.Scheduler do
         do: %{group: match?(%{batch?: true}, Keyword.get(work.opts, :output))},
         else: nil
 
+    snapshot = if work.class == :snapshot, do: snapshot
+
     %{
       state
       | tasks: Map.put(state.tasks, task.ref, token),
-        work: Map.put(state.work, token, %{work | task: task, output: output})
+        work: Map.put(state.work, token, %{work | task: task, output: output, snapshot: snapshot})
     }
   rescue
     _exception -> state |> fail(token, :handler_start_failed) |> remove_work(token)
@@ -549,8 +599,8 @@ defmodule Arbor.MCP.Server.Runtime.Scheduler do
       deadline: work.reservation.deadline,
       request_id: work.reservation.request_id,
       kind: if(work.phase == :tracker, do: :cast, else: work.reservation.kind),
-      execution: state.config.execution,
-      state: state.handler_state
+      execution: execution(work),
+      state: if(work.class == :snapshot, do: work.snapshot, else: state.handler_state)
     }
 
     decision =
@@ -560,8 +610,29 @@ defmodule Arbor.MCP.Server.Runtime.Scheduler do
         true -> Lifecycle.complete(context, proposal, now())
       end
 
+    decision =
+      case {work.class, decision} do
+        {:snapshot, {:commit, result, _snapshot}} -> {:commit, result, state.handler_state}
+        _other -> decision
+      end
+
+    state = warn_state_change(state, decision)
     apply_completion(state, token, ticket, decision)
   end
+
+  defp warn_state_change(%{state_warning: false} = state, {:fail, :invalid_handler_state}) do
+    Logger.warning(
+      "#{inspect(state.config.handler)} returned a changed handler state, which a " <>
+        "stateless MCP runtime (the default) commits only from init/1 and " <>
+        "handle_initialize/2, so the request failed. Keep mutable state in a process " <>
+        "or ETS table, or start the server with execution: :stateful to run callbacks " <>
+        "one at a time and commit their state."
+    )
+
+    %{state | state_warning: true}
+  end
+
+  defp warn_state_change(state, _decision), do: state
 
   defp apply_completion(state, _token, ticket, :ignore) do
     release_ticket(ticket)
@@ -631,15 +702,15 @@ defmodule Arbor.MCP.Server.Runtime.Scheduler do
 
   defp restore_proposal(proposal), do: {proposal, nil}
 
-  defp prepare_proposal(proposal, _invocation, _work, _config, _snapshot, nil), do: proposal
+  defp prepare_proposal(proposal, _invocation, _work, _snapshot, nil), do: proposal
 
-  defp prepare_proposal(proposal, invocation, work, config, snapshot, output) do
+  defp prepare_proposal(proposal, invocation, work, snapshot, output) do
     context = %{
       terminal: false,
       deadline: invocation.deadline,
       request_id: work.reservation.request_id,
       kind: work.reservation.kind,
-      execution: config.execution,
+      execution: execution(work),
       state: snapshot
     }
 
@@ -851,6 +922,8 @@ defmodule Arbor.MCP.Server.Runtime.Scheduler do
     work = %{
       work
       | task: nil,
+        class: :ordered,
+        snapshot: nil,
         phase: :tracker,
         tracker_pending: false,
         kill_timer: nil,
