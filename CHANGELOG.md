@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `handle_complete/3`.
 - `Handler.handle_complete/4` receives the completion `context` (MCP
   2025-06-18), and `Client.complete/4` sends one with `context:`.
+- `Server.Context.request_id/0`, `session_id/0`, `auth_info/0` and
+  `request_headers/0` describe the request a callback handles, like the
+  `extra` argument of TypeScript SDK handlers. Over HTTP with
+  `oauth_enabled: true`, `auth_info/0` returns the validated bearer token as a
+  new `Arbor.MCP.Server.AuthInfo`, which leaves the token out of `inspect/1`. A
+  host that authenticates requests in its own plug can attach one with
+  `Arbor.MCP.HttpPlug.put_auth_info/2`.
 
 ### Changed
 

@@ -89,7 +89,10 @@ defmodule Arbor.MCP.Server.Dispatch do
           request_context = %{
             request_context
             | application_context: Keyword.get(opts, :application_context),
-              notification_target: Keyword.get(opts, :request_notification_target)
+              notification_target: Keyword.get(opts, :request_notification_target),
+              session_id: Keyword.get(opts, :session_id),
+              auth_info: Keyword.get(opts, :auth_info),
+              request_headers: Keyword.get(opts, :request_headers)
           }
 
           ctx = %{

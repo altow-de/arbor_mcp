@@ -203,6 +203,22 @@ if Context.progress_token() do
 end
 ```
 
+`Context.request_id/0`, `Context.session_id/0`, `Context.auth_info/0` and
+`Context.request_headers/0` describe the request itself, like the `extra`
+argument of TypeScript SDK handlers. `session_id/0` is the legacy
+`Mcp-Session-Id` and `nil` for stateless modern requests. With
+`oauth_enabled: true`, `auth_info/0` is the validated bearer token as an
+`Arbor.MCP.Server.AuthInfo` (client id, subject, scopes, expiry, audience and
+claims). If your pipeline authenticates requests itself, attach the result in
+a plug before the forward:
+
+```elixir
+def call(conn, _opts) do
+  claims = conn.assigns.current_token_claims
+  Arbor.MCP.HttpPlug.put_auth_info(conn, Arbor.MCP.Server.AuthInfo.from_claims(nil, claims))
+end
+```
+
 Context and its origin proof are invocation-scoped. Retain neither the context
 nor a `Plug.Conn` as handler state for a later request. Successful callbacks keep
 admitted effects valid under their original cutoff; cancellation, expiry and

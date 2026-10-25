@@ -7,10 +7,12 @@ defmodule Arbor.MCP.Server.Context do
   be read later from a spawned process.
 
   `cancelled?/0` reports whether the current request id has been cancelled.
+  `request_id/0`, `session_id/0`, `auth_info/0` and `request_headers/0` describe
+  the request, like the `extra` argument of TypeScript SDK handlers.
   """
 
   alias Arbor.MCP.Internal.Protocol
-  alias Arbor.MCP.Server.{Cancellation, RequestContext}
+  alias Arbor.MCP.Server.{AuthInfo, Cancellation, RequestContext}
   alias Arbor.MCP.Server.Runtime.{CallbackContext, HTTPNotificationTarget}
 
   @key {__MODULE__, :current}
@@ -89,6 +91,43 @@ defmodule Arbor.MCP.Server.Context do
   def progress_token do
     case current() do
       %RequestContext{progress_token: token} -> token
+      nil -> nil
+    end
+  end
+
+  @doc """
+  Returns the JSON-RPC id of the request being handled, or `nil` for a
+  notification.
+  """
+  @spec request_id() :: Arbor.MCP.Types.request_id() | nil
+  def request_id, do: field(:request_id)
+
+  @doc """
+  Returns the `Mcp-Session-Id` of a legacy Streamable HTTP request.
+
+  Modern HTTP is stateless and has no session, and stdio and BEAM connections
+  have none either, so this is `nil` for them.
+  """
+  @spec session_id() :: String.t() | nil
+  def session_id, do: field(:session_id)
+
+  @doc """
+  Returns the validated access token of an HTTP request, or `nil` when the
+  request carried none. See `Arbor.MCP.Server.AuthInfo`.
+  """
+  @spec auth_info() :: AuthInfo.t() | nil
+  def auth_info, do: field(:auth_info)
+
+  @doc """
+  Returns the HTTP request headers as `{lowercase_name, value}` pairs, as in
+  `Plug.Conn.req_headers`, or `nil` for stdio and BEAM requests.
+  """
+  @spec request_headers() :: [{String.t(), String.t()}] | nil
+  def request_headers, do: field(:request_headers)
+
+  defp field(key) do
+    case current() do
+      %RequestContext{} = context -> Map.fetch!(context, key)
       nil -> nil
     end
   end

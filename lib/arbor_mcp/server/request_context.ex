@@ -37,6 +37,9 @@ defmodule Arbor.MCP.Server.RequestContext do
     :notification_target,
     :application_context,
     :cancellation_scope,
+    :session_id,
+    :auth_info,
+    :request_headers,
     meta: %{},
     trace_context: %{}
   ]
@@ -63,6 +66,9 @@ defmodule Arbor.MCP.Server.RequestContext do
           notification_target: term(),
           application_context: term(),
           cancellation_scope: term(),
+          session_id: String.t() | nil,
+          auth_info: Arbor.MCP.Server.AuthInfo.t() | nil,
+          request_headers: [{String.t(), String.t()}] | nil,
           meta: map(),
           trace_context: map()
         }
