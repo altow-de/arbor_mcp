@@ -45,7 +45,12 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
   # Renew this many seconds before the access token's expiry.
   @refresh_skew 30
 
-  @derive {Inspect, except: [:access_token, :refresh]}
+  # A token refreshed because of a 401 that is rejected again this soon didn't
+  # help, so the next 401 rediscovers the authorization server instead.
+  @rejected_refresh_window 60
+
+  # auth_config can hold a client secret or an identity assertion.
+  @derive {Inspect, except: [:access_token, :refresh, :auth_config]}
   defstruct [
     :access_token,
     :resource_url,
@@ -57,6 +62,8 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
     :expires_at,
     # FullOAuthFlow's refresh context, or nil without a refresh token.
     :refresh,
+    # When a 401 last led to a refresh (system seconds).
+    :refreshed_on_rejection_at,
     granted_scopes: [],
     auth_completed: false
   ]
@@ -89,11 +96,22 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
 
   @impl true
   def handle_unauthorized(www_authenticate, scopes, %__MODULE__{} = state) do
-    case refresh(state) do
-      {:ok, _token, _state} = refreshed -> refreshed
-      {:error, _reason} -> authenticate_again(www_authenticate, scopes, state)
+    if refresh_just_rejected?(state) do
+      # The resource may have moved to another authorization server.
+      authenticate_again(www_authenticate, scopes, %{state | refreshed_on_rejection_at: nil})
+    else
+      case refresh(state) do
+        {:ok, token, state} ->
+          {:ok, token, %{state | refreshed_on_rejection_at: System.system_time(:second)}}
+
+        {:error, _reason} ->
+          authenticate_again(www_authenticate, scopes, state)
+      end
     end
   end
+
+  defp refresh_just_rejected?(%{refreshed_on_rejection_at: at}),
+    do: is_integer(at) and System.system_time(:second) - at < @rejected_refresh_window
 
   defp authenticate_again(www_authenticate, scopes, state) do
     if state.auth_completed && state.access_token,

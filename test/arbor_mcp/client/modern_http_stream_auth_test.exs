@@ -29,6 +29,29 @@ defmodule Arbor.MCP.Client.ModernHTTPStreamAuthTest do
     end
   end
 
+  defp client_state(transport_state) do
+    %Client{
+      transport_mod: HTTP,
+      transport_state: transport_state,
+      pending_requests: %{},
+      pending_batches: %{},
+      cancelled_requests: MapSet.new(),
+      async_post_tasks: %{}
+    }
+  end
+
+  # The test is the stream's parent, so it hands each auth challenge to the
+  # client's handler, as Arbor.MCP.Client does.
+  defp answer_challenge(stream_pid, request_id, client_state) do
+    assert_receive {:modern_http_stream_auth_challenge, ^stream_pid, ^request_id, _ref,
+                    _challenge} =
+                     message,
+                   1_000
+
+    assert {:noreply, client_state} = Client.handle_info(message, client_state)
+    client_state
+  end
+
   test "a modern POST-owned request stream reauthenticates and persists provider state" do
     bypass = Bypass.open()
     attempts = start_supervised!({Agent, fn -> 0 end})
@@ -79,26 +102,10 @@ defmodule Arbor.MCP.Client.ModernHTTPStreamAuthTest do
     assert {:ok, transport_state} = HTTP.open_stream(request, transport_state, self())
     stream_pid = Map.fetch!(transport_state.modern_streams, 42)
 
-    assert_receive {:provider_challenge, ~s(Bearer realm="mcp", scope="tools.read tools.call"),
-                    ["tools.read", "tools.call"]},
-                   1_000
+    client_state = answer_challenge(stream_pid, 42, client_state(transport_state))
 
-    assert_receive {:modern_http_stream_auth_updated, ^stream_pid, 42, changes}, 1_000
-
-    client_state = %Client{
-      transport_mod: HTTP,
-      transport_state: transport_state,
-      pending_requests: %{},
-      pending_batches: %{},
-      cancelled_requests: MapSet.new(),
-      async_post_tasks: %{}
-    }
-
-    assert {:noreply, client_state} =
-             Client.handle_info(
-               {:modern_http_stream_auth_updated, stream_pid, 42, changes},
-               client_state
-             )
+    assert_received {:provider_challenge, ~s(Bearer realm="mcp", scope="tools.read tools.call"),
+                     ["tools.read", "tools.call"]}
 
     assert client_state.transport_state.access_token == "request-stream-token"
     assert client_state.transport_state.auth_provider_state.generation == 1
@@ -171,22 +178,17 @@ defmodule Arbor.MCP.Client.ModernHTTPStreamAuthTest do
     assert {:ok, transport_state} = HTTP.open_stream(request, transport_state, self())
     stream_pid = Map.fetch!(transport_state.modern_streams, 84)
 
-    assert_receive {:provider_challenge, ~s(Bearer scope="tools.call"), ["tools.call"]}, 1_000
+    client_state = answer_challenge(stream_pid, 84, client_state(transport_state))
+    assert_received {:provider_challenge, ~s(Bearer scope="tools.call"), ["tools.call"]}
+    assert client_state.transport_state.access_token == "request-stream-token"
 
-    assert_receive {:modern_http_stream_auth_updated, ^stream_pid, 84,
-                    %{access_token: "request-stream-token"}},
-                   1_000
+    client_state = answer_challenge(stream_pid, 84, client_state)
 
-    assert_receive {:provider_step_up, ~s(Bearer error="insufficient_scope", scope="admin"),
-                    ["admin"]},
-                   1_000
+    assert_received {:provider_step_up, ~s(Bearer error="insufficient_scope", scope="admin"),
+                     ["admin"]}
 
-    assert_receive {:modern_http_stream_auth_updated, ^stream_pid, 84,
-                    %{
-                      access_token: "request-stream-step-up-token",
-                      auth_provider_state: %{generation: 2}
-                    }},
-                   1_000
+    assert client_state.transport_state.access_token == "request-stream-step-up-token"
+    assert client_state.transport_state.auth_provider_state.generation == 2
 
     assert_receive {:modern_http_stream_message, ^stream_pid, 84,
                     %{"jsonrpc" => "2.0", "id" => 84, "result" => %{}}},
@@ -197,7 +199,7 @@ defmodule Arbor.MCP.Client.ModernHTTPStreamAuthTest do
     assert Agent.get(attempts, & &1) == 3
   end
 
-  test "auth updates from a stale stream cannot overwrite the active transport" do
+  test "a stale stream's challenge neither runs the provider nor changes the transport" do
     active_pid = spawn(fn -> Process.sleep(:infinity) end)
     stale_pid = spawn(fn -> Process.sleep(:infinity) end)
 
@@ -209,27 +211,49 @@ defmodule Arbor.MCP.Client.ModernHTTPStreamAuthTest do
     transport_state = %HTTP{
       headers: [{"Authorization", "Bearer current"}],
       access_token: "current",
-      auth_provider_state: %{generation: 2},
+      auth_provider: Provider,
+      auth_provider_state: %{test_pid: self(), generation: 2},
       modern_streams: %{42 => active_pid}
     }
 
-    client_state = %Client{
-      transport_mod: HTTP,
-      transport_state: transport_state,
-      pending_requests: %{},
-      pending_batches: %{},
-      cancelled_requests: MapSet.new(),
-      async_post_tasks: %{}
-    }
+    ref = make_ref()
+    challenge = %{status: 401, www_authenticate: "Bearer", scopes: [], token: "current"}
 
     assert {:noreply, unchanged} =
              Client.handle_info(
-               {:modern_http_stream_auth_updated, stale_pid, 42,
-                %{access_token: "stale", auth_provider_state: %{generation: 1}}},
-               client_state
+               {:modern_http_stream_auth_challenge, self(), 42, ref, challenge},
+               client_state(transport_state)
              )
 
+    assert_received {:modern_http_stream_auth_result, ^ref, {:error, :stream_retired}}
+    refute_received {:provider_challenge, _, _}
     assert unchanged.transport_state.access_token == "current"
-    assert unchanged.transport_state.auth_provider_state == %{generation: 2}
+    assert unchanged.transport_state.auth_provider_state.generation == 2
+  end
+
+  test "a challenge for a token another stream already replaced reuses the new token" do
+    stream_pid = self()
+
+    transport_state = %HTTP{
+      headers: [{"Authorization", "Bearer fresh"}],
+      access_token: "fresh",
+      auth_provider: Provider,
+      auth_provider_state: %{test_pid: self(), generation: 1},
+      modern_streams: %{7 => stream_pid}
+    }
+
+    ref = make_ref()
+    # Sent with the token the first stream's 401 already replaced.
+    challenge = %{status: 401, www_authenticate: "Bearer", scopes: [], token: "expired"}
+
+    assert {:noreply, client_state} =
+             Client.handle_info(
+               {:modern_http_stream_auth_challenge, stream_pid, 7, ref, challenge},
+               client_state(transport_state)
+             )
+
+    assert_received {:modern_http_stream_auth_result, ^ref, {:ok, "fresh"}}
+    refute_received {:provider_challenge, _, _}
+    assert client_state.transport_state.auth_provider_state.generation == 1
   end
 end

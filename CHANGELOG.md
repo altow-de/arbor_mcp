@@ -92,7 +92,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget; set `:eof_grace` or `:cleanup_timeout` in the connection spec instead.
 - **BREAKING:** A DSL tool called with invalid arguments returns an `isError`
   tool result, "Input validation error: …" naming the failing fields and rules,
-  instead of a `-32602` protocol error with no details. This follows SEP-1303,
+  instead of a `-32602` protocol error with no details. Paths name only the
+  properties the schema declares; a key the caller sent shows as `*`. This follows SEP-1303,
   as the other MCP SDKs do, and lets a model correct the call. Rejected values
   are never included. **Upgrade:** callers that matched the error tuple from
   `Client.call_tool/4` now receive `{:ok, %Arbor.MCP.Response{is_error: true}}`.
@@ -104,14 +105,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BEAM and legacy HTTP. `handle_progress/3` now receives progress on every
   transport, matched to the pending request by its `progressToken`, and
   `handle_log_message/3` receives connection-level log messages with a `nil`
-  request id.
+  request id. A request whose `progressToken` a pending request already
+  carries is refused with a `:not_sent` transport error
+  (`cause: :duplicate_progress_token`), since its progress would be
+  misrouted.
 - The default OAuth provider kept no refresh token, so an expired access token
   started the full authorization flow again, which found the same authorization
   server and failed with `:auth_loop_detected`. It now refreshes the token
   shortly before it expires and when the server rejects it, and runs the full
-  flow only if refreshing fails. A refreshed token is saved to the
-  `:credential_store` when one is configured, and the provider struct no longer
-  shows its tokens in `inspect/1`.
+  flow only if refreshing fails. A refreshed token replaces the stored one in
+  the `:credential_store`, under the resource and scopes of the flow that
+  issued the first, and keeps the refresh token and scopes when the server's
+  response omits them. If a token refreshed after a 401 is rejected again
+  within a minute, the provider rediscovers the authorization server instead
+  of refreshing. Modern HTTP request streams hand their 401 and 403
+  challenges to the client process, which runs one refresh or flow for all of
+  them, so a rotating refresh token isn't used twice. The provider struct no
+  longer shows its tokens or its auth config, which can hold a client secret,
+  in `inspect/1`.
 
 ## [2.0.0-rc.5] — 2026-10-22
 

@@ -12,6 +12,24 @@ defmodule Arbor.MCP.Authorization.ProviderOAuthRefreshTest do
 
   alias Arbor.MCP.Authorization.Provider.OAuth
 
+  defmodule RecordingStore do
+    @moduledoc false
+    @behaviour Arbor.MCP.Authorization.CredentialStore
+
+    @impl true
+    def fetch_registration(_context, _issuer, _pid), do: :not_found
+    @impl true
+    def put_registration(_context, _key, _registration, _pid), do: :ok
+    @impl true
+    def fetch_token(_key, _pid), do: :not_found
+
+    @impl true
+    def put_token(key, token, pid) do
+      send(pid, {:put_token, key, token})
+      :ok
+    end
+  end
+
   setup do
     bypass = Bypass.open()
     %{bypass: bypass, token_endpoint: "http://localhost:#{bypass.port}/token"}
@@ -111,9 +129,64 @@ defmodule Arbor.MCP.Authorization.ProviderOAuthRefreshTest do
     assert_received {:token_request, %{"grant_type" => "refresh_token"}}
   end
 
-  test "tokens stay out of inspect output", context do
-    inspected = inspect(state(context.token_endpoint, []))
+  test "tokens and the auth config stay out of inspect output", context do
+    inspected =
+      inspect(state(context.token_endpoint, auth_config: %{idp_id_token: "assertion-secret"}))
+
     refute inspected =~ "old-token"
     refute inspected =~ "refresh-1"
+    refute inspected =~ "assertion-secret"
+  end
+
+  test "a refresh replaces the stored token under the first flow's binding",
+       %{bypass: bypass} = context do
+    # No new refresh token and no scope: the earlier ones stay in force.
+    expect_refresh(bypass, {200, %{"access_token" => "new-token", "expires_in" => 3600}})
+
+    binding = %{
+      issuer: "https://auth.example",
+      client_id: "client-1",
+      resource: "https://discovered.example/mcp",
+      audience: nil,
+      subject: nil,
+      client_identity: "client-1",
+      granted_scopes: "tools:read"
+    }
+
+    rejected =
+      state(context.token_endpoint, auth_config: %{credential_store: {RecordingStore, self()}})
+
+    rejected = put_in(rejected.refresh[:binding], binding)
+
+    assert {:ok, "new-token", _state} =
+             OAuth.handle_unauthorized(~s(Bearer realm="mcp"), [], rejected)
+
+    assert_received {:put_token, _key, token}
+    assert token.access_token == "new-token"
+    assert token.refresh_token == "refresh-1"
+    assert token.resource == "https://discovered.example/mcp"
+    assert token.granted_scopes == ["tools:read"]
+  end
+
+  test "a refreshed token rejected again rediscovers instead of refreshing",
+       %{bypass: bypass} = context do
+    expect_refresh(bypass, {200, %{"access_token" => "new-token", "expires_in" => 3600}})
+
+    assert {:ok, "new-token", refreshed} =
+             OAuth.handle_unauthorized(
+               ~s(Bearer realm="mcp"),
+               [],
+               state(context.token_endpoint, [])
+             )
+
+    assert_received {:token_request, %{"grant_type" => "refresh_token"}}
+
+    # Discovery fails at once: nothing listens there. No second refresh is tried.
+    refreshed = %{refreshed | resource_url: "https://127.0.0.1:1/mcp"}
+
+    assert {:error, {:oauth_failed, _reason}, _state} =
+             OAuth.handle_unauthorized(~s(Bearer realm="mcp"), [], refreshed)
+
+    refute_received {:token_request, _}
   end
 end

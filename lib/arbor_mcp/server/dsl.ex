@@ -791,7 +791,11 @@ defmodule Arbor.MCP.Server.DSL do
     input_schema = compile_tool_schema(definition[:inputSchema], :input)
     output_schema = compile_tool_schema(definition[:outputSchema], :output)
 
-    {definition.name, {:"__ex_mcp_dsl_tool_#{index}__", input_schema, output_schema, params}}
+    # The names an input error may show; anything else is caller-supplied.
+    declared = DSLArguments.declared_names(definition[:inputSchema] || %{})
+
+    {definition.name,
+     {:"__ex_mcp_dsl_tool_#{index}__", input_schema, output_schema, params, declared}}
   end
 
   defp generate_local_tool_execution do
@@ -814,7 +818,7 @@ defmodule Arbor.MCP.Server.DSL do
           end
 
         {:error, reason} ->
-          {:ok, Result.error(DSLArguments.input_error_message(reason)), state}
+          {:ok, Result.error(DSLArguments.input_error_message(reason, declared)), state}
       end
     end
   end
@@ -834,7 +838,7 @@ defmodule Arbor.MCP.Server.DSL do
           {:component, module, id} -> module.handle_call_tool(id, arguments, state)
         end,
         quote do
-          {handler, input_schema, output_schema, params} ->
+          {handler, input_schema, output_schema, params, declared} ->
             unquote(generate_local_tool_execution())
         end,
         quote do

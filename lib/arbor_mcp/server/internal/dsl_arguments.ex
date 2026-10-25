@@ -30,19 +30,62 @@ defmodule Arbor.MCP.Server.Internal.DSLArguments do
   # they come back as an `isError` result rather than a protocol error, as
   # SEP-1303 recommends and the other MCP SDKs do. Schema diagnostics name
   # the failing location and rule but never the rejected value.
-  def input_error_message({:invalid_tool_arguments, []}), do: "Input validation error"
+  #
+  # A path segment the schema doesn't declare is a key the caller sent, and
+  # so part of the rejected value (with propertyNames, it is the value), so
+  # it's shown as `*`. Only declared property names and array indices stay.
+  def input_error_message(reason, declared \\ MapSet.new())
 
-  def input_error_message({:invalid_tool_arguments, diagnostics}) do
+  def input_error_message({:invalid_tool_arguments, []}, _declared), do: "Input validation error"
+
+  def input_error_message({:invalid_tool_arguments, diagnostics}, declared) do
     details =
       Enum.map_join(diagnostics, "; ", fn
-        {message, path} when is_binary(message) and path in ["#", "", nil] -> message
-        {message, path} when is_binary(message) and is_binary(path) -> "#{path}: #{message}"
-        message when is_binary(message) -> message
-        _other -> "invalid"
+        {message, path} when is_binary(message) and path in ["#", "", nil] ->
+          message
+
+        {message, path} when is_binary(message) and is_binary(path) ->
+          "#{safe_path(path, declared)}: #{message}"
+
+        message when is_binary(message) ->
+          message
+
+        _other ->
+          "invalid"
       end)
 
     "Input validation error: " <> details
   end
+
+  defp safe_path(path, declared) do
+    path
+    |> String.split("/")
+    |> Enum.map_join("/", fn segment ->
+      if segment == "#" or segment =~ ~r/^\d+$/ or MapSet.member?(declared, segment),
+        do: segment,
+        else: "*"
+    end)
+  end
+
+  @doc false
+  # The property names a schema declares, at any depth.
+  def declared_names(schemas) when is_list(schemas),
+    do: schemas |> Enum.flat_map(&property_names/1) |> MapSet.new()
+
+  def declared_names(schema), do: declared_names([schema])
+
+  defp property_names(%{} = schema) do
+    own =
+      case Map.get(schema, "properties") || Map.get(schema, :properties) do
+        %{} = properties -> Enum.map(Map.keys(properties), &to_string/1)
+        _none -> []
+      end
+
+    own ++ (schema |> Map.values() |> Enum.flat_map(&property_names/1))
+  end
+
+  defp property_names(list) when is_list(list), do: Enum.flat_map(list, &property_names/1)
+  defp property_names(_other), do: []
 
   def validate_tool_response(response, nil), do: {:ok, response}
 

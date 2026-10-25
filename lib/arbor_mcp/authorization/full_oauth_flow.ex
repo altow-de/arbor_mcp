@@ -597,13 +597,14 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlow do
        do: :ok
 
   defp persist_token(token_data, as_metadata, client_info, config) do
-    expires_at =
-      case token_field(token_data, :expires_in) do
-        seconds when is_integer(seconds) and seconds >= 0 -> System.system_time(:second) + seconds
-        _other -> nil
-      end
+    binding = token_binding(token_data, as_metadata, client_info, config)
+    put_token(binding, token_data, token_field(token_data, :refresh_token), config)
+  end
 
-    token = %{
+  # What a stored token is filed under. A refresh reuses the binding of the
+  # flow that issued the first token, so it replaces that record.
+  defp token_binding(token_data, as_metadata, client_info, config) do
+    %{
       issuer: as_metadata["issuer"],
       client_id: client_info.client_id,
       resource: config[:resource] || config[:resource_url],
@@ -611,12 +612,24 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlow do
       subject: config[:subject],
       client_identity: config[:client_identity] || client_info.client_id,
       granted_scopes:
-        token_field(token_data, :scope) || config[:scopes] || config[:prm_scopes] || [],
-      access_token: token_field(token_data, :access_token),
-      refresh_token: token_field(token_data, :refresh_token),
-      token_type: token_field(token_data, :token_type) || "Bearer",
-      expires_at: expires_at
+        token_field(token_data, :scope) || config[:scopes] || config[:prm_scopes] || []
     }
+  end
+
+  defp put_token(binding, token_data, refresh_token, config) do
+    expires_at =
+      case token_field(token_data, :expires_in) do
+        seconds when is_integer(seconds) and seconds >= 0 -> System.system_time(:second) + seconds
+        _other -> nil
+      end
+
+    token =
+      Map.merge(binding, %{
+        access_token: token_field(token_data, :access_token),
+        refresh_token: refresh_token,
+        token_type: token_field(token_data, :token_type) || "Bearer",
+        expires_at: expires_at
+      })
 
     CredentialStore.put_token(config.credential_store, token)
   end
@@ -633,7 +646,8 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlow do
         auth_methods:
           as_metadata["token_endpoint_auth_methods_supported"] || ["client_secret_post"],
         client_info: client_info,
-        resource: config[:resource] || config[:resource_url]
+        resource: config[:resource] || config[:resource_url],
+        binding: token_binding(token_data, as_metadata, client_info, config)
       }
     else
       _none -> nil
@@ -664,11 +678,30 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlow do
            maybe_add_client_assertion(base, client_info, context.token_endpoint, config, method),
          {:ok, token_data} <-
            HTTPClient.make_token_request(context.token_endpoint, body, auth_method: method),
-         :ok <-
-           persist_token(token_data, %{"issuer" => context.issuer}, client_info, config) do
-      next = %{context | refresh_token: token_field(token_data, :refresh_token) || refresh_token}
-      {:ok, token_data, next}
+         # A server that doesn't rotate refresh tokens, or omits the granted
+         # scope, leaves the earlier ones in force.
+         refresh_token = token_field(token_data, :refresh_token) || refresh_token,
+         :ok <- persist_refreshed(token_data, refresh_token, context, config) do
+      {:ok, token_data, %{context | refresh_token: refresh_token}}
     end
+  end
+
+  defp persist_refreshed(_token_data, _refresh_token, _context, config)
+       when not is_map_key(config, :credential_store),
+       do: :ok
+
+  defp persist_refreshed(token_data, refresh_token, context, config) do
+    binding =
+      Map.get(context, :binding) ||
+        token_binding(token_data, %{"issuer" => context.issuer}, context.client_info, config)
+
+    binding =
+      case token_field(token_data, :scope) do
+        nil -> binding
+        scope -> %{binding | granted_scopes: scope}
+      end
+
+    put_token(binding, token_data, refresh_token, config)
   end
 
   defp credential_context(config),
