@@ -120,7 +120,7 @@ defmodule Arbor.MCP.Server.Runtime.HTTPReverseTest do
     # An MRTR handler: a legacy HTTP client gets its input request as a
     # server-to-client request on the session stream.
     def handle_call_tool("bridge", _args, state) do
-      case Arbor.MCP.Server.Context.input_responses() do
+      case Server.Context.input_responses() do
         nil ->
           request = %{
             "method" => "elicitation/create",

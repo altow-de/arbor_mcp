@@ -692,8 +692,6 @@ defmodule Arbor.MCP.Server.Dispatch do
       else: :ok
   end
 
-  defp snapshot_kept(_ctx, _state), do: :ok
-
   defp legacy_round(round) when round <= @max_legacy_input_rounds, do: :ok
 
   defp legacy_round(_round),
