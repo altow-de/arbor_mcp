@@ -622,11 +622,11 @@ defmodule Arbor.MCP.Server.Runtime.Scheduler do
 
   defp warn_state_change(%{state_warning: false} = state, {:fail, :invalid_handler_state}) do
     Logger.warning(
-      "#{inspect(state.config.handler)} returned a changed handler state, which a " <>
-        "stateless MCP runtime (the default) commits only from init/1 and " <>
-        "handle_initialize/2, so the request failed. Keep mutable state in a process " <>
-        "or ETS table, or start the server with execution: :stateful to run callbacks " <>
-        "one at a time and commit their state."
+      "#{inspect(state.config.handler)} returned a changed handler state from a " <>
+        "callback that may not change it, so the request failed. On a stateless MCP " <>
+        "runtime (the default) only init/1 and handle_initialize/2 may change it: keep " <>
+        "mutable state in a process or ETS table, or start the server with " <>
+        "execution: :stateful to run callbacks one at a time and commit their state."
     )
 
     %{state | state_warning: true}

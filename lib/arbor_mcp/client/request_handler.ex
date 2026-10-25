@@ -873,6 +873,26 @@ defmodule Arbor.MCP.Client.RequestHandler do
     end)
   end
 
+  @doc false
+  # An HTTP POST's response answers the request that POST carried, whatever
+  # id its body echoes (a server may answer an invalid request with a null
+  # id), as when the POST was synchronous. Anything else it carries, such as
+  # a batch, a notification or a server request, is routed as usual.
+  def handle_post_response(response_data, request_id, state) do
+    with true <- pending_single?(state.pending_requests, request_id),
+         {kind, payload, _echoed_id} when kind in [:result, :error] <-
+           Protocol.parse_message(response_data) do
+      handle_single_response({kind, payload, request_id}, state)
+    else
+      _other -> parse_transport_message(response_data, state)
+    end
+  end
+
+  defp pending_single?(pending, request_id) do
+    match?({_from, :single, _method}, Map.get(pending, request_id)) or
+      match?({_from, :single}, Map.get(pending, request_id))
+  end
+
   @doc """
   Handles a single response from the transport.
   """

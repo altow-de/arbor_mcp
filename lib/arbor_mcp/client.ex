@@ -1988,7 +1988,7 @@ defmodule Arbor.MCP.Client do
     if current_async_post?(state, meta) do
       state = merge_async_transport_state(state, meta)
       state = finish_async_post(state, meta)
-      handle_async_post_result(result, Map.get(meta, :request_id), state)
+      handle_async_post_result(result, meta, state)
     else
       {:noreply, state}
     end
@@ -1997,7 +1997,7 @@ defmodule Arbor.MCP.Client do
   # Legacy 2-tuple shape (no metadata) kept for compatibility.
   def handle_info({:async_post_result, result}, state) do
     if is_nil(Lifetime.current()),
-      do: handle_async_post_result(result, nil, state),
+      do: handle_async_post_result(result, %{}, state),
       else: {:noreply, state}
   end
 
@@ -2437,21 +2437,49 @@ defmodule Arbor.MCP.Client do
     %{state | async_post_tasks: tasks}
   end
 
-  defp handle_async_post_result({:ok, _new_ts, response_data}, _request_id, state) do
-    # POST response contains data — parse it as a transport message
-    RequestHandler.parse_transport_message(response_data, state)
+  defp handle_async_post_result({:ok, _new_ts, response_data}, meta, state) do
+    RequestHandler.handle_post_response(response_data, Map.get(meta, :request_id), state)
   end
 
-  defp handle_async_post_result({:ok, _new_ts}, _request_id, state) do
+  defp handle_async_post_result({:ok, _new_ts}, _meta, state) do
     # POST returned but no inline data — result will come via SSE stream
     {:noreply, state}
   end
 
+  # The server asked the task's POST to authenticate. Re-sending from this
+  # process runs at most one authentication at a time, and later challenges
+  # reuse the credentials it obtained.
+  defp handle_async_post_result({:error, {:reauthenticate, message}}, meta, state) do
+    request_id = Map.get(meta, :request_id)
+    deadline = Map.get(meta, :deadline)
+
+    if Map.has_key?(state.pending_requests, request_id || make_ref()) do
+      previous = Deadline.on_transport(HTTP, state.transport_state)
+      transport = Deadline.put_on_transport(HTTP, state.transport_state, deadline)
+      restore = &%{state | transport_state: Deadline.put_on_transport(HTTP, &1, previous)}
+
+      case HTTP.send_authenticated(message, transport) do
+        {:ok, transport, response_data} ->
+          RequestHandler.handle_post_response(response_data, request_id, restore.(transport))
+
+        {:ok, transport} ->
+          {:noreply, restore.(transport)}
+
+        {:error, reason} ->
+          {:noreply, fail_async_post_request(state, request_id, reason, deadline)}
+      end
+    else
+      {:noreply, state}
+    end
+  end
+
   # The caller receives the failure, as from a synchronous send, so it is not
   # logged as an error here.
-  defp handle_async_post_result({:error, reason}, request_id, state) do
+  defp handle_async_post_result({:error, reason}, meta, state) do
     Logger.debug("Async POST failed", reason: LogSummary.describe(reason))
-    {:noreply, fail_async_post_request(state, request_id, reason)}
+
+    {:noreply,
+     fail_async_post_request(state, Map.get(meta, :request_id), reason, Map.get(meta, :deadline))}
   end
 
   # Merge the durable transport-state changes computed by an async POST task
@@ -2565,15 +2593,25 @@ defmodule Arbor.MCP.Client do
     end
   end
 
-  defp fail_async_post_request(state, request_id, reason) do
+  # A POST that failed at or after its caller's deadline is the caller's
+  # timeout, answered as a synchronous send was, and is cancelled on the
+  # server: the client's own timeout timer finds nothing left to cancel.
+  defp fail_async_post_request(state, request_id, reason, deadline \\ nil) do
+    timed_out? =
+      reason != :deadline_expired and is_integer(deadline) and Deadline.expired?(deadline)
+
+    error = if timed_out?, do: :timeout, else: RequestHandler.send_error(reason, state)
+
     case request_id && Map.get(state.pending_requests, request_id) do
       {from, :single, _method} ->
-        GenServer.reply(from, {:error, RequestHandler.send_error(reason, state)})
-        %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+        GenServer.reply(from, {:error, error})
+        state = %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+        if timed_out?, do: cancel_timed_out(request_id, state), else: state
 
       {from, :single} ->
-        GenServer.reply(from, {:error, RequestHandler.send_error(reason, state)})
-        %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+        GenServer.reply(from, {:error, error})
+        state = %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+        if timed_out?, do: cancel_timed_out(request_id, state), else: state
 
       _ ->
         state

@@ -38,7 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The HTTP client sends each request after establishment from its own task, so
   concurrent calls on one client no longer wait for each other. Before, only a
   legacy client with an open SSE stream did; a modern-era client sent one POST
-  at a time.
+  at a time. A client holds at most `:max_client_workers` (256) requests in
+  flight. When a server asks a request to authenticate, the client re-sends it
+  from its own process, so concurrent challenges run one token refresh or OAuth
+  flow; POST tasks, including the legacy SSE ones, no longer authenticate on
+  their own. A POST's response answers the request it carried even when the
+  body echoes a null or different id.
 - The HTTP client waits as long as the caller's own timeout for a response. The
   transport's `:request_timeout` (30 s) applied even when a caller asked for
   longer; it now covers only sends that carry no caller deadline.
@@ -46,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spec asks: it sends `notifications/cancelled`, or over modern Streamable HTTP
   closes the request's connection. It used to stop waiting without telling the
   server.
+- A stdio server's default EOF drain stays at the request timeout, at most 10 s,
+  plus the output timeout (15 s with the defaults), rather than following the
+  new one-hour request deadline.
 - Locked `plug_crypto` 2.2.1 and `cowlib` 2.21.0. plug_crypto 2.2.1 fixes
   CVE-2026-105963 (the secret key base or compared secret landing in
   `FunctionClauseError` stack frames); Arbor.MCP only calls
