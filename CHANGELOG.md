@@ -92,8 +92,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget; set `:eof_grace` or `:cleanup_timeout` in the connection spec instead.
 - **BREAKING:** A DSL tool called with invalid arguments returns an `isError`
   tool result, "Input validation error: …" naming the failing fields and rules,
-  instead of a `-32602` protocol error with no details. Paths name only the
-  properties the schema declares; a key the caller sent shows as `*`. This follows SEP-1303,
+  instead of a `-32602` protocol error with no details. A path shows only
+  the properties and array indices the schema declares at that position; a
+  key the caller sent, and everything below it, shows as `*`. This follows SEP-1303,
   as the other MCP SDKs do, and lets a model correct the call. Rejected values
   are never included. **Upgrade:** callers that matched the error tuple from
   `Client.call_tool/4` now receive `{:ok, %Arbor.MCP.Response{is_error: true}}`.
@@ -116,11 +117,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flow only if refreshing fails. A refreshed token replaces the stored one in
   the `:credential_store`, under the resource and scopes of the flow that
   issued the first, and keeps the refresh token and scopes when the server's
-  response omits them. If a token refreshed after a 401 is rejected again
-  within a minute, the provider rediscovers the authorization server instead
-  of refreshing. Modern HTTP request streams hand their 401 and 403
+  response omits them, or under the new scope when it changes. If a token
+  refreshed after a 401 is rejected in turn, the provider runs discovery,
+  which asks nothing of the user, and starts the full flow only if the
+  resource now names a different authorization server; otherwise it
+  refreshes again. Modern HTTP request streams hand their 401 and 403
   challenges to the client process, which runs one refresh or flow for all of
-  them, so a rotating refresh token isn't used twice. The provider struct no
+  them, so a rotating refresh token isn't used twice; a 403 reuses another
+  stream's newer token only if that token was granted the challenged scopes. The provider struct no
   longer shows its tokens or its auth config, which can hold a client secret,
   in `inspect/1`.
 

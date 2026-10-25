@@ -2537,13 +2537,27 @@ defmodule Arbor.MCP.Client do
   end
 
   defp answer_stream_challenge(%HTTP{access_token: current} = transport_state, challenge)
-       when is_binary(current) and current != :erlang.map_get(:token, challenge),
-       do: {{:ok, current}, transport_state}
+       when is_binary(current) and current != :erlang.map_get(:token, challenge) do
+    # Another stream replaced the rejected token. That answers a 401; a 403
+    # needs the challenged scopes, which a refresh alone doesn't add.
+    if challenge.status == 401 or
+         scopes_granted?(transport_state.auth_provider_state, challenge.scopes),
+       do: {{:ok, current}, transport_state},
+       else: run_stream_challenge(transport_state, challenge)
+  end
 
   defp answer_stream_challenge(%HTTP{auth_provider: nil} = transport_state, _challenge),
     do: {{:error, :no_auth_provider}, transport_state}
 
-  defp answer_stream_challenge(%HTTP{auth_provider: provider} = transport_state, challenge) do
+  defp answer_stream_challenge(transport_state, challenge),
+    do: run_stream_challenge(transport_state, challenge)
+
+  defp scopes_granted?(%{granted_scopes: granted}, [_ | _] = scopes) when is_list(granted),
+    do: Enum.all?(scopes, &(&1 in granted))
+
+  defp scopes_granted?(_provider_state, _scopes), do: false
+
+  defp run_stream_challenge(%HTTP{auth_provider: provider} = transport_state, challenge) do
     callback = if challenge.status == 401, do: :handle_unauthorized, else: :handle_forbidden
     args = [challenge.www_authenticate, challenge.scopes, transport_state.auth_provider_state]
 

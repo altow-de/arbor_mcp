@@ -231,6 +231,39 @@ defmodule Arbor.MCP.Client.ModernHTTPStreamAuthTest do
     assert unchanged.transport_state.auth_provider_state.generation == 2
   end
 
+  test "a 403 reuses a newer token only if it was granted the challenged scopes" do
+    stream_pid = self()
+
+    for {granted, reused?} <- [{["tools.read"], false}, {["tools.read", "admin"], true}] do
+      transport_state = %HTTP{
+        headers: [{"Authorization", "Bearer fresh"}],
+        access_token: "fresh",
+        auth_provider: Provider,
+        auth_provider_state: %{test_pid: self(), generation: 1, granted_scopes: granted},
+        modern_streams: %{7 => stream_pid}
+      }
+
+      ref = make_ref()
+      challenge = %{status: 403, www_authenticate: "Bearer", scopes: ["admin"], token: "old"}
+
+      assert {:noreply, _client_state} =
+               Client.handle_info(
+                 {:modern_http_stream_auth_challenge, stream_pid, 7, ref, challenge},
+                 client_state(transport_state)
+               )
+
+      if reused? do
+        assert_received {:modern_http_stream_auth_result, ^ref, {:ok, "fresh"}}
+        refute_received {:provider_step_up, _, _}
+      else
+        assert_received {:provider_step_up, "Bearer", ["admin"]}
+
+        assert_received {:modern_http_stream_auth_result, ^ref,
+                         {:ok, "request-stream-step-up-token"}}
+      end
+    end
+  end
+
   test "a challenge for a token another stream already replaced reuses the new token" do
     stream_pid = self()
 

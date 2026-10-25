@@ -40,14 +40,10 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
 
   require Logger
 
-  alias Arbor.MCP.Authorization.{FullOAuthFlow, LogSanitizer}
+  alias Arbor.MCP.Authorization.{FullOAuthFlow, Issuer, LogSanitizer}
 
   # Renew this many seconds before the access token's expiry.
   @refresh_skew 30
-
-  # A token refreshed because of a 401 that is rejected again this soon didn't
-  # help, so the next 401 rediscovers the authorization server instead.
-  @rejected_refresh_window 60
 
   # auth_config can hold a client secret or an identity assertion.
   @derive {Inspect, except: [:access_token, :refresh, :auth_config]}
@@ -62,8 +58,9 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
     :expires_at,
     # FullOAuthFlow's refresh context, or nil without a refresh token.
     :refresh,
-    # When a 401 last led to a refresh (system seconds).
-    :refreshed_on_rejection_at,
+    # The access token a refresh after a 401 returned. Its own rejection
+    # means refreshing didn't help.
+    :rejection_refreshed_token,
     granted_scopes: [],
     auth_completed: false
   ]
@@ -95,23 +92,33 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
   end
 
   @impl true
+  # A token refreshed after a 401 and rejected in turn may mean the resource
+  # moved to another authorization server. Discovery, which asks nothing of
+  # the user, decides: the full flow, which may open a browser, runs only for
+  # a different issuer. Otherwise the provider refreshes again.
   def handle_unauthorized(www_authenticate, scopes, %__MODULE__{} = state) do
-    if refresh_just_rejected?(state) do
-      # The resource may have moved to another authorization server.
-      authenticate_again(www_authenticate, scopes, %{state | refreshed_on_rejection_at: nil})
+    if refreshed_token_rejected?(state) and issuer_moved?(www_authenticate, state) do
+      authenticate_again(www_authenticate, scopes, %{state | rejection_refreshed_token: nil})
     else
       case refresh(state) do
-        {:ok, token, state} ->
-          {:ok, token, %{state | refreshed_on_rejection_at: System.system_time(:second)}}
-
-        {:error, _reason} ->
-          authenticate_again(www_authenticate, scopes, state)
+        {:ok, token, state} -> {:ok, token, %{state | rejection_refreshed_token: token}}
+        {:error, _reason} -> authenticate_again(www_authenticate, scopes, state)
       end
     end
   end
 
-  defp refresh_just_rejected?(%{refreshed_on_rejection_at: at}),
-    do: is_integer(at) and System.system_time(:second) - at < @rejected_refresh_window
+  defp refreshed_token_rejected?(%{access_token: token, rejection_refreshed_token: token})
+       when is_binary(token),
+       do: true
+
+  defp refreshed_token_rejected?(_state), do: false
+
+  defp issuer_moved?(www_authenticate, %{authorization_server_issuer: current} = state) do
+    case FullOAuthFlow.discover_issuer(flow_config(www_authenticate, [], state)) do
+      {:ok, issuer} -> is_binary(current) and Issuer.compare(issuer, current) != :ok
+      {:error, _reason} -> false
+    end
+  end
 
   defp authenticate_again(www_authenticate, scopes, state) do
     if state.auth_completed && state.access_token,
@@ -171,21 +178,18 @@ defmodule Arbor.MCP.Authorization.Provider.OAuth do
     end
   end
 
-  defp do_authenticate(www_authenticate, scopes, state) do
+  defp flow_config(www_authenticate, scopes, state) do
     config =
       (state.auth_config || %{})
       |> Map.put(:resource_url, state.resource_url)
       |> Map.put(:www_authenticate, www_authenticate)
       |> Map.put(:protocol_version, state.protocol_version)
 
-    config =
-      if scopes != [] do
-        Map.put(config, :scopes, scopes)
-      else
-        config
-      end
+    if scopes != [], do: Map.put(config, :scopes, scopes), else: config
+  end
 
-    case FullOAuthFlow.execute(config) do
+  defp do_authenticate(www_authenticate, scopes, state) do
+    case FullOAuthFlow.execute(flow_config(www_authenticate, scopes, state)) do
       {:ok, token_result} ->
         access_token = token_result[:access_token] || token_result["access_token"]
         Logger.info("OAuth token obtained")

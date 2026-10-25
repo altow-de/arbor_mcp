@@ -168,25 +168,112 @@ defmodule Arbor.MCP.Authorization.ProviderOAuthRefreshTest do
     assert token.granted_scopes == ["tools:read"]
   end
 
-  test "a refreshed token rejected again rediscovers instead of refreshing",
+  # Discovery for https://mcp.example/mcp names `issuer` as its authorization
+  # server. The metadata is served without the network.
+  defp discovery(issuer) do
+    test_pid = self()
+
+    client = fn uri, _address, _opts ->
+      send(test_pid, {:metadata_fetch, uri.host, uri.path})
+
+      body =
+        case {uri.host, uri.path} do
+          {"mcp.example", "/prm"} ->
+            %{"authorization_servers" => [issuer]}
+
+          {_host, "/.well-known/" <> _kind} ->
+            %{
+              "issuer" => issuer,
+              "authorization_endpoint" => issuer <> "/authorize",
+              "token_endpoint" => issuer <> "/token",
+              "response_types_supported" => ["code"]
+            }
+
+          _other ->
+            nil
+        end
+
+      if body,
+        do: {:ok, %{status: 200, headers: [], body: Jason.encode!(body)}},
+        else: {:ok, %{status: 404, headers: [], body: ""}}
+    end
+
+    %{
+      metadata_fetch: [
+        http_client: client,
+        dns_resolver: fn _host, _timeout -> {:ok, [{93, 184, 216, 34}]} end
+      ]
+    }
+  end
+
+  @challenge ~s(Bearer resource_metadata="https://mcp.example/prm")
+
+  test "a refreshed token rejected again is refreshed again while the issuer is the same",
+       %{bypass: bypass} = context do
+    test_pid = self()
+
+    Bypass.expect(bypass, "POST", "/token", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      send(test_pid, {:token_request, URI.decode_query(body)})
+
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.resp(
+        200,
+        Jason.encode!(%{"access_token" => "new-token", "expires_in" => 3600})
+      )
+    end)
+
+    rejected = state(context.token_endpoint, auth_config: discovery("https://auth.example"))
+    assert {:ok, "new-token", refreshed} = OAuth.handle_unauthorized(@challenge, [], rejected)
+    assert_received {:token_request, %{"grant_type" => "refresh_token"}}
+
+    # Discovery finds the same authorization server: no browser flow.
+    assert {:ok, "new-token", _state} = OAuth.handle_unauthorized(@challenge, [], refreshed)
+    assert_received {:metadata_fetch, "mcp.example", "/prm"}
+    assert_received {:token_request, %{"grant_type" => "refresh_token"}}
+  end
+
+  test "a refreshed token rejected again runs the full flow once the issuer has moved",
        %{bypass: bypass} = context do
     expect_refresh(bypass, {200, %{"access_token" => "new-token", "expires_in" => 3600}})
 
-    assert {:ok, "new-token", refreshed} =
-             OAuth.handle_unauthorized(
-               ~s(Bearer realm="mcp"),
-               [],
-               state(context.token_endpoint, [])
-             )
-
+    rejected = state(context.token_endpoint, auth_config: discovery("https://new-auth.example"))
+    assert {:ok, "new-token", refreshed} = OAuth.handle_unauthorized(@challenge, [], rejected)
     assert_received {:token_request, %{"grant_type" => "refresh_token"}}
 
-    # Discovery fails at once: nothing listens there. No second refresh is tried.
-    refreshed = %{refreshed | resource_url: "https://127.0.0.1:1/mcp"}
-
+    # The flow stops at client registration, none being configured, but it
+    # ran against the new server instead of refreshing at the old one.
     assert {:error, {:oauth_failed, _reason}, _state} =
-             OAuth.handle_unauthorized(~s(Bearer realm="mcp"), [], refreshed)
+             OAuth.handle_unauthorized(@challenge, [], refreshed)
 
+    assert_received {:metadata_fetch, "new-auth.example", _path}
     refute_received {:token_request, _}
+  end
+
+  test "a refresh that changes the granted scope files later tokens under it",
+       %{bypass: bypass} = context do
+    expect_refresh(bypass, {200, %{"access_token" => "new-token", "scope" => "tools:read"}})
+
+    binding = %{
+      issuer: "https://auth.example",
+      client_id: "client-1",
+      resource: "https://mcp.example/mcp",
+      audience: nil,
+      subject: nil,
+      client_identity: "client-1",
+      granted_scopes: "tools:read tools:write"
+    }
+
+    rejected =
+      state(context.token_endpoint, auth_config: %{credential_store: {RecordingStore, self()}})
+
+    rejected = put_in(rejected.refresh[:binding], binding)
+
+    assert {:ok, "new-token", refreshed} =
+             OAuth.handle_unauthorized(~s(Bearer realm="mcp"), [], rejected)
+
+    assert_received {:put_token, _key, %{granted_scopes: ["tools:read"]}}
+    assert refreshed.refresh.binding.granted_scopes == "tools:read"
   end
 end

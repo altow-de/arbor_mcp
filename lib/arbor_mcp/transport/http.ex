@@ -559,8 +559,10 @@ defmodule Arbor.MCP.Transport.HTTP do
       {:ok, nil, new_ps} ->
         %{state | auth_provider_state: new_ps}
 
+      # access_token names the token the header carries, which a stream's
+      # auth challenge is compared with.
       {:ok, token, new_ps} ->
-        %{state | auth_provider_state: new_ps, headers: put_bearer_header(state.headers, token)}
+        %{apply_token_to_state(state, token) | auth_provider_state: new_ps}
 
       {:error, _} ->
         state

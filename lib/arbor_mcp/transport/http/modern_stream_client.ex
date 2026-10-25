@@ -30,6 +30,12 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
   # credentials, the body the request's arguments, and the HTTP options TLS
   # settings: none is printed, and format_status/1 keeps them out of crash
   # reports too.
+  # How long a stream waits for the client to answer its auth challenge. A
+  # browser flow can take minutes; the caller's own timeout cancels the
+  # stream sooner, and a dead client is noticed through the parent monitor,
+  # so this only bounds a lost answer.
+  @auth_wait_ms 600_000
+
   @derive {Inspect, except: [:headers, :body, :http_options, :auth_provider_state]}
   defstruct [
     :parent,
@@ -442,7 +448,7 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
       {:modern_http_stream_auth_challenge, self(), state.request_id, ref, challenge}
     )
 
-    timer = Process.send_after(self(), {:auth_timeout, ref}, state.handshake_timeout)
+    timer = Process.send_after(self(), {:auth_timeout, ref}, @auth_wait_ms)
     {:await_auth, %{state | request_ref: nil, auth_wait: {ref, timer}}}
   end
 

@@ -80,6 +80,21 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlow do
   @typep redirect_visited :: %{optional(String.t()) => true}
   @typep redirect_context :: {redirect_visited(), String.t()}
 
+  @doc false
+  # The issuer of the authorization server protecting the resource, found as
+  # execute/1 finds it, without registering or authorizing anything.
+  @spec discover_issuer(config()) :: {:ok, String.t()} | {:error, term()}
+  def discover_issuer(config) do
+    with {:ok, prm} <- discover_resource_metadata(config),
+         :ok <- validate_prm_resource(prm, config),
+         {:ok, as_metadata} <- discover_as_metadata(prm, config) do
+      case as_metadata["issuer"] do
+        issuer when is_binary(issuer) -> {:ok, issuer}
+        _missing -> {:error, :missing_authorization_server_issuer}
+      end
+    end
+  end
+
   @doc """
   Execute the full OAuth flow.
 
@@ -681,28 +696,36 @@ defmodule Arbor.MCP.Authorization.FullOAuthFlow do
          # A server that doesn't rotate refresh tokens, or omits the granted
          # scope, leaves the earlier ones in force.
          refresh_token = token_field(token_data, :refresh_token) || refresh_token,
-         :ok <- persist_refreshed(token_data, refresh_token, context, config) do
-      {:ok, token_data, %{context | refresh_token: refresh_token}}
+         binding = refreshed_binding(token_data, context, config),
+         :ok <- persist_refreshed(token_data, refresh_token, binding, config) do
+      next =
+        context
+        |> Map.put(:refresh_token, refresh_token)
+        |> Map.put(:binding, binding)
+
+      {:ok, token_data, next}
     end
   end
 
-  defp persist_refreshed(_token_data, _refresh_token, _context, config)
-       when not is_map_key(config, :credential_store),
-       do: :ok
-
-  defp persist_refreshed(token_data, refresh_token, context, config) do
+  # A refresh that changes the granted scope files the token, and the ones
+  # after it, under the new scope.
+  defp refreshed_binding(token_data, context, config) do
     binding =
       Map.get(context, :binding) ||
         token_binding(token_data, %{"issuer" => context.issuer}, context.client_info, config)
 
-    binding =
-      case token_field(token_data, :scope) do
-        nil -> binding
-        scope -> %{binding | granted_scopes: scope}
-      end
-
-    put_token(binding, token_data, refresh_token, config)
+    case token_field(token_data, :scope) do
+      nil -> binding
+      scope -> %{binding | granted_scopes: scope}
+    end
   end
+
+  defp persist_refreshed(_token_data, _refresh_token, _binding, config)
+       when not is_map_key(config, :credential_store),
+       do: :ok
+
+  defp persist_refreshed(token_data, refresh_token, binding, config),
+    do: put_token(binding, token_data, refresh_token, config)
 
   defp credential_context(config),
     do: config[:credential_context] || config[:resource_url]
