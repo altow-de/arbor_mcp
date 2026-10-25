@@ -1123,10 +1123,10 @@ defmodule Arbor.MCP.Client.RequestHandler do
   # without one has none to check.
   defp remember_tool_schemas(state, "tools/list", response_data) do
     with %{} = result <- list_result(response_data),
-         tools when is_list(tools) <- field(result, "tools") do
+         tools when is_list(tools) <- field(result, "tools", :tools) do
       schemas =
         Enum.reduce(tools, Map.get(state, :tool_output_schemas) || %{}, fn tool, acc ->
-          case {field(tool, "name"), field(tool, "outputSchema")} do
+          case {field(tool, "name", :name), field(tool, "outputSchema", :outputSchema)} do
             {name, schema} when is_binary(name) and is_map(schema) -> Map.put(acc, name, schema)
             {name, _none} when is_binary(name) -> Map.delete(acc, name)
             _other -> acc
@@ -1152,8 +1152,8 @@ defmodule Arbor.MCP.Client.RequestHandler do
   end
 
   # In-process transports deliver maps that may still have atom keys.
-  defp field(%{} = map, key), do: Map.get(map, key) || Map.get(map, String.to_existing_atom(key))
-  defp field(_other, _key), do: nil
+  defp field(%{} = map, key, atom), do: Map.get(map, key) || Map.get(map, atom)
+  defp field(_other, _key, _atom), do: nil
 
   # A changed tool list may change a schema; validate again once relisted.
   defp forget_tool_schemas(state, "notifications/tools/list_changed"),

@@ -34,8 +34,6 @@ defmodule Arbor.MCP.Client.HTTPStreamRetryTest do
 
     def handle_call(:get_default_retry_policy, _from, state), do: {:reply, {:ok, []}, state}
 
-    def handle_call({:tool_output_schema, _name}, _from, state), do: {:reply, nil, state}
-
     def handle_call(:get_default_timeout, _from, state),
       do: {:reply, {:ok, state.default_timeout}, state}
 

@@ -147,8 +147,15 @@ defmodule Arbor.MCP.Client.Operations.Tools do
 
   defp validate_output(result, _client, _tool_name, _opts), do: result
 
+  # Only an Arbor.MCP.Client records schemas; a stand-in process (a test
+  # double or a wrapper) isn't asked, so it needn't answer.
   defp output_schema(client, tool_name) do
-    GenServer.call(client, {:tool_output_schema, tool_name}, 5_000)
+    with pid when is_pid(pid) <- GenServer.whereis(client),
+         {Arbor.MCP.Client, :init, 1} <- :proc_lib.translate_initial_call(pid) do
+      GenServer.call(pid, {:tool_output_schema, tool_name}, 5_000)
+    else
+      _not_a_client -> nil
+    end
   catch
     :exit, _reason -> nil
   end
