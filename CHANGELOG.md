@@ -152,6 +152,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A tool result its connection's revision can't carry, such as a
+  non-object `structuredContent` in a legacy era, raised in the server and
+  reached the client as an opaque `handler_crash`. It's now a `-32603`
+  error with `%{"type" => "invalid_result"}`, and the server logs why.
 - The client delivered `notifications/progress` and `notifications/message` to
   its handler only on modern HTTP request streams and dropped them on stdio,
   BEAM and legacy HTTP. `handle_progress/3` now receives progress on every

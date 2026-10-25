@@ -135,7 +135,7 @@ defmodule Arbor.MCP.Server.Dispatch do
   defp handle(ctx, state) do
     ctx.method
     |> do_dispatch(ctx, state)
-    |> normalize_protocol_result(ctx.request_context, ctx.module)
+    |> normalize_protocol_result(ctx.request_context, ctx.module, state)
   end
 
   defp run_middleware(ctx, state, []), do: handle(ctx, state)
@@ -201,7 +201,7 @@ defmodule Arbor.MCP.Server.Dispatch do
 
   defp middleware_result({:ok, result}, ctx, state) when is_map(result) do
     {:response, %{"jsonrpc" => "2.0", "id" => ctx.id, "result" => result}, state}
-    |> normalize_protocol_result(ctx.request_context, ctx.module)
+    |> normalize_protocol_result(ctx.request_context, ctx.module, state)
   end
 
   defp middleware_result({:error, %Error.ProtocolError{} = error}, ctx, state),
@@ -662,10 +662,13 @@ defmodule Arbor.MCP.Server.Dispatch do
       (Code.ensure_loaded?(module) and function_exported?(module, fun, arity))
   end
 
+  # before_state is the handler state from before the callback: a rejected
+  # result must not commit what the callback changed.
   defp normalize_protocol_result(
          {:response, %{"result" => result} = response, state},
          request_context,
-         handler_module
+         handler_module,
+         before_state
        ) do
     case ResultNormalizer.validate_result_capabilities(result, request_context) do
       :ok ->
@@ -679,9 +682,22 @@ defmodule Arbor.MCP.Server.Dispatch do
       {:error, error} ->
         {:response, JSONRPC.error(response["id"], Error.to_json_rpc(error)), state}
     end
+  rescue
+    # A result this revision can't carry, such as non-object structuredContent
+    # in a legacy era, is the handler's bug: say so rather than crash.
+    exception in ArgumentError ->
+      Logger.error(
+        "#{inspect(handler_module)} returned an invalid result: #{Exception.message(exception)}"
+      )
+
+      {:response,
+       JSONRPC.error(response["id"], ErrorCodes.internal_error(), "Invalid result", %{
+         "type" => "invalid_result"
+       }), before_state}
   end
 
-  defp normalize_protocol_result(other, _request_context, _handler_module), do: other
+  defp normalize_protocol_result(other, _request_context, _handler_module, _before_state),
+    do: other
 
   defp validate_http_initialize(
          ctx,
