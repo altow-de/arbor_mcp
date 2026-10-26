@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Servers can check JWT access tokens locally against the authorization
+  server's keys instead of introspecting each one: `jwks_uri:` in
+  `:auth_config` uses the new `Arbor.MCP.Authorization.JWTVerifier`, which
+  accepts only asymmetric signatures, keeps the key set for ten minutes and
+  fetches it again when a token names an unknown key (at most once a
+  minute). Any `Arbor.MCP.Authorization.TokenVerifier` can be plugged in with
+  `token_verifier:`, as the TypeScript SDK's `OAuthTokenVerifier` can. The
+  guard still binds such tokens to the configured issuer, audience and
+  scopes.
 - The client keeps results the server marks fresh, as the TypeScript SDK's
   client does: each `tools/list`, `prompts/list`, `resources/list` and
   `resources/templates/list` page and each `resources/read` is answered from
@@ -275,6 +284,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime supervisor. List changes now go to the runtime's
   `subscriptions/listen` streams, and calls and casts return
   `{:error, :runtime_unavailable}`.
+- When a legacy Streamable HTTP request got a 401 or 403, the client sent it
+  again from its own process, after authenticating, and held every other
+  request and server message until that POST finished; a server request on
+  its stream couldn't be answered. As with a modern request stream, the
+  client process now answers the challenge, one at a time across requests,
+  and the request's own task sends it again.
 - An elicitation a handler asks for in an `input_required` result was sent to
   a modern client unchecked, though the legacy bridge holds the same request
   to the protocol's ElicitRequest schema. Both eras now check it, and a
