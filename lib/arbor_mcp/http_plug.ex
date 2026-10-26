@@ -1537,31 +1537,34 @@ defmodule Arbor.MCP.HttpPlug do
     |> maybe_put_session_header(RuntimeSession.id(session))
   end
 
+  # Every recursive call is a tail call: a request can wait through one
+  # keepalive per interval for its whole deadline without growing its stack.
   defp await_runtime_output(conn, :sse, opts) do
     case RuntimeWriter.await(conn, opts.request_keepalive_interval_ms) do
-      :idle ->
-        case RuntimeWriter.request_keepalive(conn) do
-          {:ok, conn} ->
-            await_runtime_output(conn, :sse, opts)
-
-          {:not_entered, conn} ->
-            await_runtime_output(conn, :sse, opts)
-
-          {:closed, conn} ->
-            cancel_closed_request(conn)
-            {:stream_closed, conn}
-        end
-
-      response ->
-        {:ok, response, conn}
+      :idle -> keepalive_runtime_output(conn, opts)
+      response -> {:ok, response, conn}
     end
-  rescue
-    RuntimeWriter.AdmissionError ->
-      cancel_closed_request(conn)
-      {:stream_closed, conn}
   end
 
   defp await_runtime_output(conn, _format, _opts), do: {:ok, RuntimeWriter.await(conn), conn}
+
+  defp keepalive_runtime_output(conn, opts) do
+    case RuntimeWriter.request_keepalive(conn) do
+      {:ok, conn} ->
+        await_runtime_output(conn, :sse, opts)
+
+      {:not_entered, conn} ->
+        await_runtime_output(conn, :sse, opts)
+
+      {:closed, conn} ->
+        cancel_closed_request(conn)
+        {:stream_closed, conn}
+
+      {:raised, kind, reason, stacktrace} ->
+        cancel_closed_request(conn)
+        :erlang.raise(kind, reason, stacktrace)
+    end
+  end
 
   defp cancel_closed_request(conn) do
     binding = RuntimeWriter.binding(conn)

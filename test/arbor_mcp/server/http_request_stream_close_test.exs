@@ -33,12 +33,19 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
 
     def send_chunked(state, status, headers) do
       send(state.observer, {:stream_headers, self(), status})
+
+      if state.raise_headers,
+        do: raise(Bandit.TransportError, message: "Unrecoverable error: closed", error: :closed)
+
       Conn.send_chunked(state, status, headers)
     end
 
     def chunk(state, body) do
       wire = IO.iodata_to_binary(body)
       send(state.observer, {:stream_wire, self(), wire})
+
+      if state.report_stack and wire == ":\r\n\r\n",
+        do: send(state.observer, {:keepalive_stack, self(), Process.info(self(), :stack_size)})
 
       cond do
         wire == ":\r\n\r\n" and state.fail_keepalive ->
@@ -246,6 +253,44 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
     assert_released(runtime)
   end
 
+  test "a keepalive whose headers raise cancels the request and re-raises the adapter error" do
+    runtime = start_runtime([])
+    socket = stream_request(runtime, "hold", raise_headers: true)
+    assert_receive {:tool_started, worker}, 1_000
+    monitor = Process.monitor(worker)
+    assert_receive {:stream_headers, ^socket, 200}, 1_000
+    assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}, 1_000
+
+    # The adapter handles its own transport error; an unsent conn returned
+    # in its place would make Bandit raise Plug.Conn.NotSentError instead.
+    assert_receive {:stream_result, ^socket, {:raised, :error, %Bandit.TransportError{}}}, 1_000
+    assert_released(runtime)
+  end
+
+  test "keepalives keep the request process stack bounded" do
+    runtime = start_runtime([])
+
+    socket =
+      stream_request(runtime, "hold", [report_stack: true], request_keepalive_interval_ms: 1)
+
+    assert_receive {:tool_started, worker}, 1_000
+
+    sizes =
+      for _keepalive <- 1..200 do
+        assert_receive {:keepalive_stack, ^socket, {:stack_size, size}}, 1_000
+        size
+      end
+
+    # Each comment is written from the same call site, so a tail-recursive
+    # wait loop reports the same stack size every time.
+    assert Enum.max(sizes) == hd(sizes)
+
+    send(worker, :release)
+    assert_receive {:stream_result, ^socket, {:returned, conn}}, 1_000
+    assert conn.state == :chunked
+    assert_released(runtime)
+  end
+
   defp start_runtime(opts) do
     root =
       start_supervised!(
@@ -286,7 +331,13 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
             state,
             Map.new(
               Keyword.merge(
-                [observer: parent, hold_keepalive: false, fail_keepalive: false],
+                [
+                  observer: parent,
+                  hold_keepalive: false,
+                  fail_keepalive: false,
+                  raise_headers: false,
+                  report_stack: false
+                ],
                 adapter_opts
               )
             )

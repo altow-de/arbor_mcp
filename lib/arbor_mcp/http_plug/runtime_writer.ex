@@ -125,28 +125,29 @@ defmodule Arbor.MCP.HttpPlug.RuntimeWriter do
 
   # The first comment also sends the SSE headers. When its chunk then fails,
   # the closure carries the chunked conn: returning the earlier unsent conn
-  # would make the adapter treat the request as never answered.
+  # would make the adapter treat the request as never answered. Only this one
+  # write is guarded, so the caller's wait loop stays tail-recursive. A raised
+  # write is returned for the caller to cancel the request and re-raise.
   defp write_request_keepalive(conn, effect, wire) do
-    conn = if conn.state == :chunked, do: conn, else: Plug.Conn.send_chunked(conn, 200)
+    result =
+      try do
+        conn = if conn.state == :chunked, do: conn, else: Plug.Conn.send_chunked(conn, 200)
 
-    case Plug.Conn.chunk(conn, wire) do
-      {:ok, conn} ->
-        HTTPWriterRegistry.complete(effect, :ok)
-        {:ok, conn}
+        case Plug.Conn.chunk(conn, wire) do
+          {:ok, conn} -> {:ok, conn}
+          {:error, _reason} -> {:closed, conn}
+        end
+      catch
+        kind, reason -> {:raised, kind, reason, __STACKTRACE__}
+      end
 
-      {:error, _reason} ->
-        HTTPWriterRegistry.complete(effect, {:error, :http_write_failed})
-        {:closed, conn}
-    end
-  rescue
-    _exception ->
-      HTTPWriterRegistry.complete(effect, {:error, :http_write_uncertain})
-      raise AdmissionError
-  catch
-    _kind, _reason ->
-      HTTPWriterRegistry.complete(effect, {:error, :http_write_uncertain})
-      raise AdmissionError
+    HTTPWriterRegistry.complete(effect, keepalive_outcome(result))
+    result
   end
+
+  defp keepalive_outcome({:ok, _conn}), do: :ok
+  defp keepalive_outcome({:closed, _conn}), do: {:error, :http_write_failed}
+  defp keepalive_outcome(_raised), do: {:error, :http_write_uncertain}
 
   def perform(conn, effect, wire, write) do
     case perform_if_ready(conn, effect, wire, write) do
