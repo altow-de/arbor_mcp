@@ -1552,12 +1552,22 @@ defmodule Arbor.MCP.HttpPlug do
   defp await_runtime_output(conn, :sse, keepalive) do
     case RuntimeWriter.await(conn, keepalive) do
       :idle -> keepalive_runtime_output(conn, keepalive)
-      response -> {:ok, response, conn}
+      response -> sse_runtime_output(conn, response)
     end
   end
 
   defp await_runtime_output(conn, _format, _keepalive),
     do: {:ok, RuntimeWriter.await(conn), conn}
+
+  # Once a keepalive or notification has sent the SSE headers, only an output
+  # frame can continue the response: no error status, JSON rejection or
+  # subscription stream may send headers again. Without a frame the response
+  # is aborted, as it is after a notification.
+  defp sse_runtime_output(%{state: :chunked} = conn, {:ok, _effect, _wire} = response),
+    do: {:ok, response, conn}
+
+  defp sse_runtime_output(%{state: :chunked}, _response), do: raise(RuntimeWriter.AdmissionError)
+  defp sse_runtime_output(conn, response), do: {:ok, response, conn}
 
   defp keepalive_runtime_output(conn, keepalive) do
     case RuntimeWriter.request_keepalive(conn) do
@@ -1824,11 +1834,7 @@ defmodule Arbor.MCP.HttpPlug do
 
     initialization_error? = kind == :response and initialization_error?(request, wire)
 
-    conn =
-      if initialization_error?,
-        do:
-          conn |> assign(:suppress_session_header, true) |> delete_resp_header("mcp-session-id"),
-        else: conn
+    conn = if initialization_error?, do: suppress_session_header(conn), else: conn
 
     conn = write_runtime_response(conn, effect, wire, format)
 
@@ -1849,6 +1855,14 @@ defmodule Arbor.MCP.HttpPlug do
       conn
     end
   end
+
+  # Headers already sent with a chunked response cannot be withdrawn. Only a
+  # modern request streams, and it carries no session header to withdraw.
+  defp suppress_session_header(%{state: :chunked} = conn),
+    do: assign(conn, :suppress_session_header, true)
+
+  defp suppress_session_header(conn),
+    do: conn |> assign(:suppress_session_header, true) |> delete_resp_header("mcp-session-id")
 
   defp initialization_error?(%{"method" => "initialize"}, wire) when wire != "",
     do: Map.has_key?(decode_runtime_wire(wire), "error")
@@ -1871,7 +1885,7 @@ defmodule Arbor.MCP.HttpPlug do
   defp initialization_error?(_request, _wire), do: false
 
   defp write_runtime_response(conn, effect, "", _format),
-    do: RuntimeWriter.perform(conn, effect, "", &Plug.Conn.send_resp(&1, 202, &2))
+    do: RuntimeWriter.perform(conn, effect, "", &send_accepted/2)
 
   # A successful deprecated POST acknowledges a durable replay commit. The
   # existing physical companion conservatively retains JSON bytes even though
@@ -1910,6 +1924,11 @@ defmodule Arbor.MCP.HttpPlug do
       end
     end)
   end
+
+  # An empty output has nothing to add to a stream whose headers already went
+  # out; the stream then ends when the plug returns.
+  defp send_accepted(%{state: :chunked} = conn, _wire), do: conn
+  defp send_accepted(conn, wire), do: Plug.Conn.send_resp(conn, 202, wire)
 
   defp write_legacy_response(conn, effect, wire, primary) do
     case Arbor.MCP.Server.Runtime.OutputTicket.session(primary) do

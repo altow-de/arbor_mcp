@@ -41,7 +41,11 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
     alias Plug.Adapters.Test.Conn
 
     defdelegate read_req_body(state, opts), to: Conn
-    defdelegate send_resp(state, status, headers, body), to: Conn
+
+    def send_resp(state, status, headers, body) do
+      send(state.observer, {:stream_resp, self(), status})
+      Conn.send_resp(state, status, headers, body)
+    end
 
     def send_chunked(state, status, headers) do
       send(state.observer, {:stream_headers, self(), status})
@@ -311,6 +315,62 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
     assert acknowledgment =~ "notifications/subscriptions/acknowledged"
     refute_received {:stream_result, ^socket, _result}
     assert Process.alive?(socket)
+  end
+
+  test "a streaming initialize is answered before any request keepalive can send headers" do
+    runtime = start_runtime([])
+
+    body =
+      Jason.encode!(%{
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: %{
+          protocolVersion: "2026-07-28",
+          capabilities: %{},
+          clientInfo: %{name: "close-test", version: "1"},
+          _meta: %{
+            "io.modelcontextprotocol/protocolVersion" => "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities" => %{},
+            "progressToken" => "initialize"
+          }
+        }
+      })
+
+    socket =
+      stream_post(runtime, body, [{"mcp-method", "initialize"}], [],
+        request_keepalive_interval_ms: 1
+      )
+
+    # Modern requests have no initialize, so it is rejected before the SSE
+    # wait. Its initialization-error handling therefore never runs on a conn
+    # that a keepalive has chunked; the plug also guards that case.
+    assert_receive {:stream_result, ^socket, {:returned, conn}}, 1_000
+    assert conn.state == :sent
+    assert %{"error" => %{"code" => _code}} = Jason.decode!(conn.resp_body)
+    refute_received {:stream_headers, ^socket, _status}
+    refute_received {:stream_wire, ^socket, _wire}
+  end
+
+  test "a stream that loses its invocation after a keepalive is aborted without an error response" do
+    runtime = start_runtime([])
+    socket = stream_request(runtime, "hold", [])
+    assert_receive {:tool_started, _worker}, 1_000
+    assert_receive {:stream_wire, ^socket, ":\r\n\r\n"}, 1_000
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = Runtime.stop(runtime)
+
+        assert_receive {:stream_result, ^socket,
+                        {:raised, :error, %Arbor.MCP.HttpPlug.RuntimeWriter.AdmissionError{}}},
+                       2_000
+      end)
+
+    # The keepalive already sent the headers, so the plug must not attempt a
+    # 500 or a JSON-RPC rejection with the conn it had before the stream began.
+    refute log =~ "MCP request processing failed"
+    refute_received {:stream_resp, ^socket, _status}
   end
 
   test "a handler timeout during an in-flight keepalive still writes the timeout error" do
