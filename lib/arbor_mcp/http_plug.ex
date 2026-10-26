@@ -118,9 +118,8 @@ defmodule Arbor.MCP.HttpPlug do
   refused with 405, the client carries on POST-only.
 
   In the legacy Streamable HTTP revisions, a request that carries
-  `_meta.progressToken`, from a client whose `Accept` header allows
-  `text/event-stream`, owns its POST response stream, as with the TypeScript
-  SDK's servers. Its progress and its callback's other notifications are
+  `_meta.progressToken`, from a client that accepts `text/event-stream`, owns
+  its POST response stream, as with the TypeScript SDK's servers. Its progress and its callback's other notifications are
   written there ahead of the response. `initialize`, batches and requests
   without a progress token are answered with JSON; their callback's progress,
   log messages and list changes go to the session's own GET stream. Requests a
@@ -134,7 +133,10 @@ defmodule Arbor.MCP.HttpPlug do
   (default: `15_000`; set `:infinity` to disable).
 
   An ordinary modern request that opts into progress or request logs also owns
-  its POST response stream. `notifications/progress` and
+  its POST response stream. In either era a client accepts an event stream
+  when its `Accept` header names `text/event-stream` with a quality above
+  zero; `text/event-stream;q=0` refuses one, and a wildcard such as `*/*`
+  gets JSON. `notifications/progress` and
   `notifications/message` are written only there, followed by one final
   JSON-RPC response that closes the stream. A disconnect or chunk failure
   cancels that request's worker without affecting other
@@ -190,6 +192,7 @@ defmodule Arbor.MCP.HttpPlug do
 
   alias Arbor.MCP.Transport.HTTP.RequestHeaders
   alias Arbor.RPC.{JSONRPC, LogSummary}
+  alias Plug.Conn.Utils, as: ConnUtils
 
   @session_id_max_bytes 128
 
@@ -730,12 +733,8 @@ defmodule Arbor.MCP.HttpPlug do
   # Per MCP spec, SSE GET uses the same endpoint as POST.
   # Handle GET requests with Accept: text/event-stream on any path.
   defp do_dispatch("GET", _path, conn, opts) do
-    accepts_sse =
-      conn
-      |> get_req_header("accept")
-      |> Enum.any?(&String.contains?(&1, "text/event-stream"))
-
-    if legacy_http_sse_enabled?(opts) and accepts_sse and mcp_endpoint_path?(conn, opts) do
+    if legacy_http_sse_enabled?(opts) and accepts_event_stream?(conn) and
+         mcp_endpoint_path?(conn, opts) do
       handle_runtime_session_endpoint(conn, opts)
     else
       conn
@@ -2062,7 +2061,7 @@ defmodule Arbor.MCP.HttpPlug do
   end
 
   defp json_request?(conn) do
-    case Plug.Conn.Utils.content_type(List.first(get_req_header(conn, "content-type"), "")) do
+    case ConnUtils.content_type(List.first(get_req_header(conn, "content-type"), "")) do
       {:ok, "application", subtype, _params} ->
         subtype == "json" or String.ends_with?(subtype, "+json")
 
@@ -3108,11 +3107,32 @@ defmodule Arbor.MCP.HttpPlug do
 
   defp request_stream?(_conn, _request), do: false
 
+  # Whether the client accepts an event stream in either era: its Accept
+  # header names `text/event-stream` with a quality above zero (RFC 9110
+  # section 12.5.1), so `text/event-stream;q=0` refuses one. A wildcard such
+  # as `*/*` or `text/*` doesn't opt in: the MCP spec asks clients to list
+  # `text/event-stream` itself, and JSON is always a valid answer to a POST.
   defp accepts_event_stream?(conn) do
     conn
     |> get_req_header("accept")
-    |> Enum.any?(&String.contains?(&1, "text/event-stream"))
+    |> Enum.flat_map(&ConnUtils.list/1)
+    |> Enum.any?(&event_stream_range?/1)
   end
+
+  defp event_stream_range?(range) do
+    case ConnUtils.media_type(range) do
+      {:ok, "text", "event-stream", params} -> positive_quality?(params)
+      _other -> false
+    end
+  end
+
+  # A malformed qvalue makes its range unusable, so it doesn't opt in either.
+  defp positive_quality?(%{"q" => q}) do
+    Regex.match?(~r/\A(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)\z/, q) and
+      not Regex.match?(~r/\A0(?:\.0{0,3})?\z/, q)
+  end
+
+  defp positive_quality?(_params), do: true
 
   defp process_mcp_request(%{"method" => "subscriptions/listen"} = request, opts) do
     open_http_subscription(request, opts)

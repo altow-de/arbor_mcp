@@ -98,7 +98,8 @@ not require `use_sse: true`.
 
 In the legacy era an ArborMCP server answers a request that carries
 `_meta.progressToken` with request-owned SSE when the client's `Accept` header
-allows `text/event-stream`, as the TypeScript SDK's servers do: the request's
+names `text/event-stream` with a quality above zero (not `q=0`, and not just
+`*/*`), as the TypeScript SDK's servers do: the request's
 progress, and its callback's other notifications, arrive ahead of the result.
 Other legacy requests get JSON. Their callback's progress, log messages and
 list changes, and every request a callback sends to the client (roots,

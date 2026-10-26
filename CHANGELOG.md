@@ -29,11 +29,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Context.report_progress/3` and `Server.notify_progress/4` returned
   `{:error, :stream_closed}` to a client without one (`use_sse: false`). As
   the TypeScript SDK's servers do, a legacy request that carries
-  `_meta.progressToken`, from a client whose `Accept` header allows
-  `text/event-stream`, now gets an event stream that carries its progress, and
-  its callback's other notifications, ahead of the result. `initialize`,
-  batches and a client that accepts only JSON still get JSON, with progress on
-  the session's GET stream.
+  `_meta.progressToken`, from a client that accepts `text/event-stream`, now
+  gets an event stream that carries its progress, and its callback's other
+  notifications, ahead of the result. `initialize`, batches and a client that
+  accepts only JSON still get JSON, with progress on the session's GET stream.
+- The server read the `Accept` header by looking for the text
+  `text/event-stream`, so a modern request that asked for progress or request
+  logs got an event stream even from a client that refused one with
+  `text/event-stream;q=0`, and JSON from one that wrote
+  `Text/Event-Stream`. Both eras now parse the header's media ranges: an event
+  stream needs `text/event-stream` named with a quality above zero, in any
+  case. A wildcard such as `*/*` still gets JSON, since the MCP spec asks
+  clients to list `text/event-stream`. The Streamable HTTP GET stream uses
+  the same rule.
 
 ## [2.0.0-rc.6] — 2026-10-26
 
