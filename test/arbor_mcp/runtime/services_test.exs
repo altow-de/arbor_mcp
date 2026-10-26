@@ -629,11 +629,9 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
   test "owned blocked termination obeys total shutdown budget and leaves siblings alive" do
     sibling = start_runtime()
 
-    # Wide enough that "still blocked" and "cutoff in the past" cannot swap
-    # places when a sleep overruns. The service never leaves terminate.
     runtime =
       start_runtime(
-        shutdown_timeout_ms: 5_000,
+        shutdown_timeout_ms: 80,
         services: [
           replay_cache: [
             adapter: LifecycleReplay,
@@ -642,29 +640,16 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
         ]
       )
 
-    assert_receive {:service_initializing, service, _table, guard, _owned}, 5_000
+    assert_receive {:service_initializing, service, _table, guard, _owned}
     {:ok, task_binding} = Services.resolve(runtime, :tasks)
     {:ok, subscription_binding} = Services.resolve(runtime, :subscriptions)
-    stopper = stop_async(runtime)
-
-    assert_receive {:service_terminating, ^service}, 5_000
-    deadline = await_stop_deadline(Ref.table(runtime))
-    assert Process.alive?(service)
-    assert Deadline.now() < deadline - 2_000
-
-    await_deadline(deadline)
-    assert_stop_finished(stopper)
-
-    eventually(
-      fn ->
-        Enum.all?(
-          [service, guard, task_binding.server, subscription_binding.server],
-          &(not Process.alive?(&1))
-        )
-      end,
-      1_000
-    )
-
+    service_monitor = Process.monitor(service)
+    others = Enum.map([guard, task_binding.server, subscription_binding.server], &monitor/1)
+    stop_within_budget(runtime, 80)
+    assert_receive {:service_terminating, ^service}
+    # It never leaves terminate on its own: the budget's forced cleanup ended it.
+    assert_receive {:DOWN, ^service_monitor, :process, ^service, :killed}
+    for {pid, ref} <- others, do: assert_receive({:DOWN, ^ref, :process, ^pid, _reason}, 1_000)
     assert {:ok, %{"result" => 0}} = Runtime.request(sibling, request(1, "read"))
   end
 
@@ -681,7 +666,7 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
 
     {runtime, edge, connection} =
       start_subscription_runtime(
-        shutdown_timeout_ms: 5_000,
+        shutdown_timeout_ms: 80,
         services: [subscriptions: [options: [authorize_publication: authorizer]]]
       )
 
@@ -697,17 +682,15 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
         end
       end)
 
-    assert_receive {:blocked_listener, ^listener}, 5_000
+    assert_receive {:blocked_listener, ^listener}
     [{:shutdown_guard, guard}] = :ets.lookup(Ref.table(runtime), :shutdown_guard)
-    stopper = stop_async(runtime)
-    deadline = await_stop_deadline(Ref.table(runtime))
-    assert Process.alive?(listener)
-    assert Deadline.now() < deadline - 2_000
-
-    await_deadline(deadline)
-    assert_stop_finished(stopper)
-    eventually(fn -> not Process.alive?(listener) and not Process.alive?(guard) end, 1_000)
-    Task.await(publication, 5_000)
+    {^listener, listener_monitor} = monitor(listener)
+    {^guard, guard_monitor} = monitor(guard)
+    stop_within_budget(runtime, 80)
+    # A trapping authorizer that never returns is only ended by force.
+    assert_receive {:DOWN, ^listener_monitor, :process, ^listener, :killed}
+    assert_receive {:DOWN, ^guard_monitor, :process, ^guard, _reason}, 1_000
+    Task.await(publication, 1_000)
     assert {:ok, %{"result" => 0}} = Runtime.request(sibling, request(1, "read"))
   end
 
@@ -776,62 +759,29 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
     if transport == :test, do: Jason.decode!(response), else: response
   end
 
-  defp stop_async(runtime) do
-    parent = self()
-    stopper = spawn(fn -> send(parent, {:stopped, self(), Runtime.stop(runtime)}) end)
-    on_exit(fn -> if Process.alive?(stopper), do: Process.exit(stopper, :kill) end)
-    stopper
-  end
+  defp monitor(pid), do: {pid, Process.monitor(pid)}
 
-  defp assert_stop_finished(stopper) do
-    assert_receive {:stopped, ^stopper, result}, 5_000
+  # Stop charges its whole budget once, when it is called, and never outlives
+  # it. It returns :ok only after the observer has confirmed every owned DOWN,
+  # and an unconfirmed cleanup only once that charged cutoff has passed; the
+  # observer still confirms the cleanup (phase 3) and then exits.
+  defp stop_within_budget(runtime, budget) do
+    {:ok, control} = ShutdownControl.lookup(Ref.table(runtime))
+    observer = Process.monitor(ShutdownControl.observer(control))
+    called = Deadline.now()
+    result = Runtime.stop(runtime)
+    returned = Deadline.now()
+    cutoff = :atomics.get(control.cells, 1)
+    assert (cutoff - budget) in called..returned
 
-    assert result in [:ok, {:error, :shutdown_cleanup_unconfirmed}],
-           "stop did not finish on the charged cutoff: #{inspect(result)}"
-  end
-
-  defp await_stop_deadline(table) do
-    give_up = Deadline.now() + 5_000
-    await_stop_deadline(table, give_up)
-  end
-
-  defp await_stop_deadline(table, give_up) do
-    case stop_deadline(table) do
-      deadline when is_integer(deadline) ->
-        deadline
-
-      _missing ->
-        if Deadline.now() >= give_up do
-          flunk("stop cutoff was not charged")
-        else
-          Process.sleep(10)
-          await_stop_deadline(table, give_up)
-        end
+    case result do
+      :ok -> assert :atomics.get(control.cells, 2) == 3
+      {:error, :shutdown_cleanup_unconfirmed} -> assert returned >= cutoff
     end
-  end
 
-  defp stop_deadline(table) do
-    case ShutdownControl.lookup(table) do
-      {:ok, control} ->
-        case :ets.lookup(control.ledger, :stop) do
-          [{:stop, _reason, deadline, _started}] -> deadline
-          _missing -> nil
-        end
-
-      _unavailable ->
-        nil
-    end
-  end
-
-  defp await_deadline(deadline) do
-    remaining = deadline - Deadline.now()
-
-    if remaining <= 0 do
-      :ok
-    else
-      Process.sleep(min(remaining, 50))
-      await_deadline(deadline)
-    end
+    assert_receive {:DOWN, ^observer, :process, _pid, :normal}, 2_000
+    assert :atomics.get(control.cells, 2) == 3
+    result
   end
 
   defp eventually(predicate, attempts \\ 150)
