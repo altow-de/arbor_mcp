@@ -8,6 +8,8 @@ defmodule Arbor.MCP.Authorization.HTTPClient do
 
   alias Arbor.MCP.Authorization.{EndpointPolicy, Issuer, SecureHTTP}
 
+  @redacted_body "[REDACTED]"
+
   @doc """
   Makes a token request to the authorization server.
 
@@ -38,7 +40,7 @@ defmodule Arbor.MCP.Authorization.HTTPClient do
             parse_token_response(token_data)
 
           {:error, reason} ->
-            {:error, {:json_decode_error, reason}}
+            {:error, {:json_decode_error, redact_decode_error(reason)}}
         end
 
       {:ok, {{_, status, _}, _headers, error_body}} ->
@@ -46,8 +48,10 @@ defmodule Arbor.MCP.Authorization.HTTPClient do
           {:ok, error_data} ->
             {:error, {:oauth_error, status, error_data}}
 
+          # A body that isn't an OAuth error may echo the request, secrets
+          # and all (a proxy's error page, say), so it isn't passed on.
           {:error, _} ->
-            {:error, {:http_error, status, error_body}}
+            {:error, {:http_error, status, @redacted_body}}
         end
 
       {:error, reason} ->
@@ -89,8 +93,10 @@ defmodule Arbor.MCP.Authorization.HTTPClient do
           {:ok, error_data} ->
             {:error, {:oauth_error, status, error_data}}
 
+          # A body that isn't an OAuth error may echo the request, secrets
+          # and all (a proxy's error page, say), so it isn't passed on.
           {:error, _} ->
-            {:error, {:http_error, status, error_body}}
+            {:error, {:http_error, status, @redacted_body}}
         end
 
       {:error, reason} ->
@@ -259,5 +265,9 @@ defmodule Arbor.MCP.Authorization.HTTPClient do
       nil -> :ok
       expected -> Issuer.compare(expected, actual)
     end
+  end
+
+  defp redact_decode_error(%Jason.DecodeError{} = reason) do
+    %{reason | data: "[REDACTED]"}
   end
 end

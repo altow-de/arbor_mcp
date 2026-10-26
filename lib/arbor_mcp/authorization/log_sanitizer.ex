@@ -10,8 +10,29 @@ defmodule Arbor.MCP.Authorization.LogSanitizer do
     code state cookie set_cookie authorization
   ))
 
+  # Exception/struct fields that commonly carry raw input (e.g. Jason.DecodeError.data).
+  @raw_payload_keys MapSet.new([:data, :term])
+  # An exception's message may quote what it failed on; its type is kept.
+  @exception_text_keys MapSet.new([:message])
+
   @doc false
   @spec sanitize(term()) :: term()
+  def sanitize(%module{} = value) do
+    exception? = Map.has_key?(value, :__exception__)
+
+    value
+    |> Map.from_struct()
+    |> Map.new(fn {key, nested} ->
+      if sensitive_key?(key) or raw_payload_key?(key) or
+           (exception? and MapSet.member?(@exception_text_keys, key)) do
+        {key, @redacted}
+      else
+        {key, sanitize(nested)}
+      end
+    end)
+    |> Map.put(:__struct__, module)
+  end
+
   def sanitize(value) when is_map(value) do
     Map.new(value, fn {key, nested} ->
       if sensitive_key?(key) do
@@ -20,6 +41,20 @@ defmodule Arbor.MCP.Authorization.LogSanitizer do
         {key, sanitize(nested)}
       end
     end)
+  end
+
+  def sanitize({:http_error, status, _body}) do
+    {:http_error, status, @redacted}
+  end
+
+  # Only the status and the standard error code: a server's free-text
+  # description, or other fields, may carry what it was sent.
+  def sanitize({:oauth_error, status, %{} = body}) do
+    {:oauth_error, status, Map.take(body, ["error", :error])}
+  end
+
+  def sanitize({:json_decode_error, reason}) do
+    {:json_decode_error, sanitize(reason)}
   end
 
   def sanitize(value) when is_tuple(value) do
@@ -49,9 +84,11 @@ defmodule Arbor.MCP.Authorization.LogSanitizer do
   @doc false
   @spec format(term()) :: String.t()
   def format(value) do
+    # Structs print as maps: a struct's own Inspect may not accept the
+    # redacted fields.
     value
     |> sanitize()
-    |> inspect(limit: 20, printable_limit: 500)
+    |> inspect(limit: 20, printable_limit: 500, structs: false)
   end
 
   defp sanitize_binary(value) do
@@ -91,6 +128,8 @@ defmodule Arbor.MCP.Authorization.LogSanitizer do
     end
   end
 
+  defp sensitive_key?(key) when not (is_atom(key) or is_binary(key)), do: false
+
   defp sensitive_key?(key) do
     normalized =
       key
@@ -100,4 +139,6 @@ defmodule Arbor.MCP.Authorization.LogSanitizer do
 
     MapSet.member?(@sensitive_keys, normalized)
   end
+
+  defp raw_payload_key?(key), do: MapSet.member?(@raw_payload_keys, key)
 end

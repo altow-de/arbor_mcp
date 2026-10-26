@@ -65,9 +65,8 @@ defmodule Arbor.MCP.Authorization.ErrorHandler do
     description = Map.get(response, "error_description", "")
     uri = Map.get(response, "error_uri")
 
-    Logger.error(
-      "OAuth error: #{LogSanitizer.format(%{error: error, error_description: description})}"
-    )
+    # The server's description is free text and may quote what it was sent.
+    Logger.error("OAuth error: #{LogSanitizer.format(%{error: error})}")
 
     if uri do
       Logger.debug("OAuth error details: #{LogSanitizer.format(uri)}")
