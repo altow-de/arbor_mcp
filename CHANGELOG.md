@@ -173,6 +173,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The client took a request or notification without `params` for an invalid
+  message and dropped it. JSON-RPC allows leaving `params` out, and the
+  TypeScript SDK's servers send `ping` and `notifications/*/list_changed`
+  that way, so the client never answered their pings or saw their list
+  changes. Such a message now parses with empty params.
 - A tool result its connection's revision can't carry, such as a
   non-object `structuredContent` in a legacy era, raised in the server and
   reached the client as an opaque `handler_crash`. It's now a `-32603`
