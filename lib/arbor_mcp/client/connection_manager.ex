@@ -726,16 +726,26 @@ defmodule Arbor.MCP.Client.ConnectionManager do
 
     transport_state = Deadline.put_on_transport(transport_mod, transport_state, exchange_deadline)
 
+    # The same capabilities a modern client sends with every request.
+    capabilities = Keyword.get(opts, :capabilities, %{})
+
     transport_mod
-    |> exchange_initialize(transport_state, protocol_version, exchange_deadline)
+    |> exchange_initialize(transport_state, protocol_version, capabilities, exchange_deadline)
     |> restore_deadline(transport_mod, establish_deadline)
   end
 
-  defp exchange_initialize(transport_mod, transport_state, protocol_version, deadline) do
+  defp exchange_initialize(
+         transport_mod,
+         transport_state,
+         protocol_version,
+         capabilities,
+         deadline
+       ) do
     case send_initialize_request(
            transport_mod,
            transport_state,
-           protocol_version
+           protocol_version,
+           capabilities
          ) do
       {:ok, state_after_send, response_data} ->
         # Non-SSE HTTP mode - response came back immediately
@@ -780,11 +790,12 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   defp send_initialize_request(
          transport_mod,
          transport_state,
-         protocol_version
+         protocol_version,
+         capabilities
        ) do
     client_info = VersionInfo.client_info()
 
-    request = Protocol.encode_initialize(client_info, %{}, protocol_version)
+    request = Protocol.encode_initialize(client_info, capabilities, protocol_version)
 
     with {:ok, outbound_request} <- encode_for_transport(transport_mod, request) do
       case transport_mod.send_message(outbound_request, transport_state) do

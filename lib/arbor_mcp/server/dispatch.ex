@@ -48,6 +48,7 @@ defmodule Arbor.MCP.Server.Dispatch do
 
   alias Arbor.MCP.Server.DSL.Matcher
   alias Arbor.MCP.Server.Internal.DSLArguments
+  alias Arbor.MCP.Server.Runtime.{CallbackContext, Deadline}
   alias Arbor.MCP.Transport.HTTP.ToolHeaders
   alias Arbor.RPC.JSONRPC
 
@@ -118,7 +119,8 @@ defmodule Arbor.MCP.Server.Dispatch do
             request?: Map.has_key?(request, "id"),
             request_context: request_context,
             module: handler_module,
-            dispatch_opts: opts
+            dispatch_opts: opts,
+            snapshot: state
           }
 
           run_middleware(ctx, state, Keyword.get(opts, :middleware, []))
@@ -626,6 +628,49 @@ defmodule Arbor.MCP.Server.Dispatch do
 
   defp cursor(ctx), do: Map.get(ctx.params, "cursor")
 
+  # A legacy client has no input_required result. Like the TypeScript, Go and
+  # C# SDKs, the server sends each input request to it as the request it
+  # stands for (elicitation, sampling, roots), then runs the callback again
+  # with the answers in Context.input_responses/0 and the application state
+  # in Context.request_state/0, so one handler serves both eras.
+  @max_legacy_input_rounds 10
+
+  defp input_required_response(
+         %{request_context: %{era: :legacy} = request_context} = ctx,
+         input_requests,
+         application_state,
+         state
+       ) do
+    round = (request_context.mrtr_round || 0) + 1
+
+    with :ok <- legacy_round(round),
+         :ok <- snapshot_kept(ctx, state),
+         {:ok, requests} <-
+           MRTR.legacy_input_requests(request_context, input_requests, ctx.dispatch_opts),
+         # Sent from inside the request's context: over legacy HTTP it names
+         # the session stream the requests go out on.
+         {:ok, responses} <-
+           Context.with_context(request_context, fn -> legacy_inputs(requests, ctx) end) do
+      request_context = %{
+        request_context
+        | input_responses: responses,
+          request_state: application_state,
+          mrtr_round: round
+      }
+
+      do_dispatch(ctx.method, %{ctx | request_context: request_context}, state)
+    else
+      {:error, :invalid_handler_state} ->
+        {:response,
+         JSONRPC.error(ctx.id, ErrorCodes.internal_error(), "Internal error", %{
+           "type" => "invalid_handler_state"
+         }), ctx.snapshot}
+
+      {:error, reason} ->
+        {:response, error_response(ctx.id, "Input request error", reason), state}
+    end
+  end
+
   defp input_required_response(ctx, input_requests, application_state, state) do
     case MRTR.build_result(
            ctx.request_context,
@@ -637,6 +682,62 @@ defmodule Arbor.MCP.Server.Dispatch do
       {:ok, result} -> {:response, JSONRPC.response(ctx.id, result), state}
       {:error, reason} -> {:response, error_response(ctx.id, "MRTR error", reason), state}
     end
+  end
+
+  # A stateless callback must return its snapshot every time, not only after
+  # its last round; a changed state would otherwise reach the next round.
+  defp snapshot_kept(%{dispatch_opts: opts, snapshot: snapshot}, state) do
+    if Keyword.get(opts, :execution) == :stateless and state !== snapshot,
+      do: {:error, :invalid_handler_state},
+      else: :ok
+  end
+
+  defp legacy_round(round) when round <= @max_legacy_input_rounds, do: :ok
+
+  defp legacy_round(_round),
+    do:
+      {:error,
+       Error.protocol_error(
+         ErrorCodes.internal_error(),
+         "Input was requested more than #{@max_legacy_input_rounds} times"
+       )}
+
+  # In order, each under what is left of the request's deadline.
+  defp legacy_inputs(requests, ctx) do
+    # Over HTTP the session's negotiated revision must define the method;
+    # BEAM and stdio connections check that, and the client's capabilities,
+    # at the edge.
+    version = Keyword.get(ctx.dispatch_opts, :http_expected_protocol_version)
+
+    requests
+    |> Enum.sort_by(fn {id, _request} -> id end)
+    |> Enum.reduce_while({:ok, %{}}, fn {id, %{"method" => method, "params" => params}},
+                                        {:ok, responses} ->
+      with :ok <- available_input(method, version),
+           {:ok, result} <- Arbor.MCP.Server.legacy_input(method, params, input_timeout()) do
+        {:cont, {:ok, Map.put(responses, id, result)}}
+      else
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp available_input(method, version) when is_binary(version) do
+    if Methods.available?(method, version),
+      do: :ok,
+      else: {:error, {:method_unavailable, method, version}}
+  end
+
+  defp available_input(_method, _version), do: :ok
+
+  defp input_timeout do
+    remaining =
+      case CallbackContext.current() do
+        %{deadline: deadline} when is_integer(deadline) -> Deadline.remaining(deadline)
+        _outside -> 30_000
+      end
+
+    remaining |> max(1) |> min(4_294_967_295)
   end
 
   defp method_not_found(id, method) do

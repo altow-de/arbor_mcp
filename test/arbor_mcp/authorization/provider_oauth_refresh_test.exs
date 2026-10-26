@@ -357,6 +357,27 @@ defmodule Arbor.MCP.Authorization.ProviderOAuthRefreshTest do
              OAuth.handle_unauthorized(@challenge, [], rejected)
   end
 
+  test "after a failed flow, a server the metadata newly names may still be tried", context do
+    failed =
+      state(context.token_endpoint,
+        access_token: nil,
+        auth_completed: false,
+        last_rejected_issuer: "https://auth.example",
+        refresh: nil,
+        auth_config: discovery("https://new-auth.example")
+      )
+
+    # The flow runs (and stops at client registration) rather than refusing.
+    assert {:error, {:oauth_failed, _reason}, tried} =
+             OAuth.handle_unauthorized(@challenge, [], failed)
+
+    assert_received {:metadata_fetch, "new-auth.example", _path}
+
+    # Tried once, it isn't started again.
+    assert {:error, :auth_loop_detected, _state} =
+             OAuth.handle_unauthorized(@challenge, [], tried)
+  end
+
   test "a refresh that changes the granted scope files later tokens under it",
        %{bypass: bypass} = context do
     expect_refresh(bypass, {200, %{"access_token" => "new-token", "scope" => "tools:read"}})

@@ -32,6 +32,20 @@ matching client capability:
 See [Multi Round-Trip Requests](CONFIGURATION.md#multi-round-trip-requests-mcp-2026-07-28)
 for key-ring setup. The six elicitation rows below use that path.
 
+The same handler serves legacy clients. A legacy revision has no
+`input_required` result, so the server sends each input request to the client
+as the request it stands for (`elicitation/create`, `sampling/createMessage`
+or `roots/list`), then calls the callback again with the answers in
+`Arbor.MCP.Server.Context.input_responses/0` and the application state in
+`Context.request_state/0`, as the TypeScript, Go and C# SDKs do. Each request
+waits under what remains of the original request's deadline, a client error
+fails the call, and a callback that asks for input more than 10 times fails
+with `-32603`. A request is sent only if the connection's negotiated
+revision defines it and the client declared the capability (`elicitation`,
+`sampling` or `roots`) in `initialize`, so pass `capabilities:` to the client.
+Over legacy HTTP the requests go out on the session's stream, so the client
+must have one open.
+
 ### Form mode
 
 The server returns an `elicitation/create` input request with a

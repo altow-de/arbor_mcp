@@ -381,6 +381,16 @@ defmodule Arbor.MCP.Server do
     end
   end
 
+  @doc false
+  # Sends one of a handler's MRTR input requests to a legacy client as the
+  # server-to-client request it stands for, from inside the callback (see
+  # Arbor.MCP.Server.Dispatch).
+  @spec legacy_input(String.t(), map(), pos_integer()) :: {:ok, map()} | {:error, term()}
+  # The edge checks that the connection's negotiated revision and the
+  # client's declared capabilities allow the request before sending it.
+  def legacy_input(method, params, timeout),
+    do: call_control(self(), {:legacy_input, method, params, timeout}, timeout)
+
   @doc """
   Calls a custom handler callback through the runtime's bounded scheduler.
 
