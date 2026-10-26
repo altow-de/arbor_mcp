@@ -49,7 +49,7 @@ defmodule Arbor.MCP.Integration.RollbackDrillTest do
               "method" => "elicitation/create",
               "params" => %{
                 "message" => "What should we call you?",
-                "requestedSchema" => %{"type" => "object"}
+                "requestedSchema" => %{"type" => "object", "properties" => %{}}
               }
             }
           }

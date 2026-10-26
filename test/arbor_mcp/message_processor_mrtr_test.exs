@@ -24,7 +24,7 @@ defmodule Arbor.MCP.MessageProcessorMRTRTest do
               "method" => "elicitation/create",
               "params" => %{
                 "message" => "Approve HTTP operation",
-                "requestedSchema" => %{"type" => "object"}
+                "requestedSchema" => %{"type" => "object", "properties" => %{}}
               }
             }
           }

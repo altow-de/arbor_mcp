@@ -136,7 +136,7 @@ defmodule Arbor.MCP.OperationalTelemetryTest do
                 "method" => "elicitation/create",
                 "params" => %{
                   "message" => "Confirm",
-                  "requestedSchema" => %{"type" => "object"}
+                  "requestedSchema" => %{"type" => "object", "properties" => %{}}
                 }
               }
             },

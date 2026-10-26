@@ -275,6 +275,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime supervisor. List changes now go to the runtime's
   `subscriptions/listen` streams, and calls and casts return
   `{:error, :runtime_unavailable}`.
+- An elicitation a handler asks for in an `input_required` result was sent to
+  a modern client unchecked, though the legacy bridge holds the same request
+  to the protocol's ElicitRequest schema. Both eras now check it, and a
+  request that doesn't fit (a `requestedSchema` without `properties`, say) is
+  a `-32602` error naming the input request, before it reaches the client.
 
 ## [2.0.0-rc.5] — 2026-10-22
 
