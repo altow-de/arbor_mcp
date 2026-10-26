@@ -118,15 +118,34 @@ defmodule Arbor.MCP.HttpPlug.RuntimeWriter do
   # evidence that the client left, so the caller keeps waiting for its output.
   def request_keepalive(conn) do
     case HTTPWriterRegistry.enter_request_keepalive(binding(conn)) do
-      {:ok, effect, wire} ->
-        write_checked_out(conn, effect, wire, fn conn, wire ->
-          conn = if conn.state == :chunked, do: conn, else: Plug.Conn.send_chunked(conn, 200)
-          Plug.Conn.chunk(conn, wire)
-        end)
-
-      {:error, _not_entered} ->
-        {:not_entered, conn}
+      {:ok, effect, wire} -> write_request_keepalive(conn, effect, wire)
+      {:error, _not_entered} -> {:not_entered, conn}
     end
+  end
+
+  # The first comment also sends the SSE headers. When its chunk then fails,
+  # the closure carries the chunked conn: returning the earlier unsent conn
+  # would make the adapter treat the request as never answered.
+  defp write_request_keepalive(conn, effect, wire) do
+    conn = if conn.state == :chunked, do: conn, else: Plug.Conn.send_chunked(conn, 200)
+
+    case Plug.Conn.chunk(conn, wire) do
+      {:ok, conn} ->
+        HTTPWriterRegistry.complete(effect, :ok)
+        {:ok, conn}
+
+      {:error, _reason} ->
+        HTTPWriterRegistry.complete(effect, {:error, :http_write_failed})
+        {:closed, conn}
+    end
+  rescue
+    _exception ->
+      HTTPWriterRegistry.complete(effect, {:error, :http_write_uncertain})
+      raise AdmissionError
+  catch
+    _kind, _reason ->
+      HTTPWriterRegistry.complete(effect, {:error, :http_write_uncertain})
+      raise AdmissionError
   end
 
   def perform(conn, effect, wire, write) do

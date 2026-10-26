@@ -227,6 +227,25 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
     assert_released(runtime)
   end
 
+  test "a failed first keepalive returns the chunked conn and cancels the request" do
+    runtime = start_runtime([])
+    socket = stream_request(runtime, "hold", fail_keepalive: true)
+    assert_receive {:tool_started, worker}, 1_000
+    monitor = Process.monitor(worker)
+
+    # The headers went out with the first comment and only its chunk failed,
+    # as when a reset arrives between the two sends on Bandit.
+    assert_receive {:stream_headers, ^socket, 200}, 1_000
+    assert_receive {:stream_wire, ^socket, ":\r\n\r\n"}, 1_000
+    assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}, 1_000
+    assert_receive {:stream_result, ^socket, {:returned, conn}}, 1_000
+
+    # An :unset conn here makes Bandit raise Plug.Conn.NotSentError.
+    assert conn.state == :chunked
+    refute_received {:stream_wire, ^socket, _wire}
+    assert_released(runtime)
+  end
+
   defp start_runtime(opts) do
     root =
       start_supervised!(
