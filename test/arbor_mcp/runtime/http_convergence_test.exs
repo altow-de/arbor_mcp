@@ -53,7 +53,7 @@ defmodule Arbor.MCP.Server.Runtime.HTTPConvergenceTest do
               "method" => "elicitation/create",
               "params" => %{
                 "message" => "Choose a name",
-                "requestedSchema" => %{"type" => "object"}
+                "requestedSchema" => %{"type" => "object", "properties" => %{}}
               }
             }
           }

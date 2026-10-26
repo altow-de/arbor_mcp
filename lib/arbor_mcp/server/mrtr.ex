@@ -3,7 +3,7 @@ defmodule Arbor.MCP.Server.MRTR do
 
   alias Arbor.MCP.Error
   alias Arbor.MCP.Internal.VersionRegistry
-  alias Arbor.MCP.Protocol.ErrorCodes
+  alias Arbor.MCP.Protocol.{Elicitation, ErrorCodes}
   alias Arbor.MCP.Server.{RequestContext, RequestState, ResultNormalizer}
 
   @supported_methods ["tools/call", "resources/read", "prompts/get"]
@@ -188,13 +188,15 @@ defmodule Arbor.MCP.Server.MRTR do
         method = Map.get(request, "method")
         params = Map.get(request, "params", %{})
 
-        if method in @input_methods and is_map(params) do
+        with true <- method in @input_methods and is_map(params),
+             {:ok, params} <- input_params(method, params) do
           clean = %{"method" => method, "params" => params}
           {:cont, {:ok, Map.put(acc, id, clean)}}
         else
-          {:halt,
-           {:error,
-            invalid("Invalid MRTR input request", %{"inputRequestId" => id, "method" => method})}}
+          _invalid ->
+            {:halt,
+             {:error,
+              invalid("Invalid MRTR input request", %{"inputRequestId" => id, "method" => method})}}
         end
 
       {id, _request}, _acc ->
@@ -204,6 +206,13 @@ defmodule Arbor.MCP.Server.MRTR do
 
   defp normalize_input_requests(_requests),
     do: {:error, invalid("inputRequests must be an object")}
+
+  # An elicitation is held to the protocol's ElicitRequest schema in both
+  # eras, as the legacy bridge holds the requests it sends.
+  defp input_params("elicitation/create", params),
+    do: Elicitation.validate(params, System.monotonic_time(:millisecond) + 1_000)
+
+  defp input_params(_method, params), do: {:ok, params}
 
   defp validate_request_count(requests, opts) do
     maximum = Keyword.get(opts, :max_input_requests, @default_max_input_requests)

@@ -31,7 +31,7 @@ defmodule Arbor.MCP.Test.ModernStdioServer do
               "method" => "elicitation/create",
               "params" => %{
                 "message" => "Choose a stdio display name",
-                "requestedSchema" => %{"type" => "object"}
+                "requestedSchema" => %{"type" => "object", "properties" => %{}}
               }
             }
           }

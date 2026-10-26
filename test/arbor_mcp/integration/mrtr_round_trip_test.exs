@@ -32,7 +32,7 @@ defmodule Arbor.MCP.Integration.MRTRRoundTripTest do
               "method" => "elicitation/create",
               "params" => %{
                 "message" => "What should we call you?",
-                "requestedSchema" => %{"type" => "object"}
+                "requestedSchema" => %{"type" => "object", "properties" => %{}}
               }
             }
           }
