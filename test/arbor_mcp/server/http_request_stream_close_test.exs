@@ -1,7 +1,7 @@
 defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
   use ExUnit.Case, async: false
 
-  alias Arbor.MCP.Server.{Runtime, Transport}
+  alias Arbor.MCP.Server.{Context, Runtime, Transport}
   alias Arbor.MCP.Server.Runtime.{HTTPWriterProxy, HTTPWriterRegistry}
 
   defmodule Handler do
@@ -21,6 +21,18 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
 
     def handle_call_tool("fast", _arguments, test_pid),
       do: {:ok, %{content: [%{type: "text", text: "fast"}]}, test_pid}
+
+    # Progress is acknowledged only after its frame was written.
+    def handle_call_tool("progress", _arguments, test_pid) do
+      send(test_pid, {:tool_started, self()})
+      :ok = Context.report_progress(1)
+      receive do: (:next -> :ok)
+      :ok = Context.report_progress(2)
+
+      receive do
+        :release -> {:ok, %{content: [%{type: "text", text: "progressed"}]}, test_pid}
+      end
+    end
   end
 
   # A borrowed adapter that reports every write to the test process and can
@@ -62,9 +74,18 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
     end
   end
 
-  for adapter <- [:cowboy, :bandit] do
+  # Plug.Cowboy's chunk/2 never returns an error. Cowboy notices the closed
+  # connection itself and terminates the request process, and the gateway's
+  # monitor on that process cancels the request, keepalive or not. Bandit has
+  # no such signal: it finds the closed peer only when a keepalive write
+  # fails, so the Bandit variant is the end-to-end proof of keepalive
+  # detection. The StubAdapter tests below cover each keepalive outcome.
+  for {adapter, detection} <- [
+        cowboy: "Cowboy terminating the request process",
+        bandit: "a failed keepalive write"
+      ] do
     @tag :physical_http
-    test "#{adapter} cancels a blocked tool when its request SSE stream closes" do
+    test "#{adapter} cancels a blocked tool after its request SSE stream closes, through #{detection}" do
       {runtime, port} = start_server(unquote(adapter))
       conn = connect(port)
       {:ok, conn, ref} = request(conn, "hold")
@@ -100,7 +121,7 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
     end
 
     @tag :physical_http
-    test "#{adapter} keeps a connected tool running and stops comments at completion" do
+    test "#{adapter} keeps a connected tool running across keepalives and ends with its response" do
       {_runtime, port} = start_server(unquote(adapter))
       conn = connect(port)
       {:ok, conn, ref} = request(conn, "hold")
@@ -114,15 +135,17 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
       {conn, tail} = receive_until(conn, ref, &Enum.member?(&1, {:done, ref}))
       body = response_body(events ++ tail, ref)
       assert body =~ "\"text\":\"released\""
-      assert String.starts_with?(body, ":\r\n\r\n")
-      assert String.ends_with?(body, "\r\n\r\n")
+      # Only comments precede the response frame, and nothing follows it.
+      assert body =~ ~r/\A(?::\r\n\r\n)+data: [^\r\n]+\r\n\r\n\z/
       Mint.HTTP.close(conn)
 
+      # A slow machine may write a comment before even a fast response, but
+      # never one after it.
       conn = connect(port)
       {:ok, conn, ref} = request(conn, "fast")
       {conn, events} = receive_until(conn, ref, &Enum.member?(&1, {:done, ref}))
       assert response_body(events, ref) =~ "\"text\":\"fast\""
-      refute response_body(events, ref) =~ ":\r\n\r\n"
+      assert response_body(events, ref) =~ ~r/\A(?::\r\n\r\n)*data: [^\r\n]+\r\n\r\n\z/
       Mint.HTTP.close(conn)
 
       conn = connect(port)
@@ -208,6 +231,60 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
       assert plug[:request_keepalive_interval_ms] == 40
       assert plug[:subscription_keepalive_interval_ms] == 50
     end
+  end
+
+  test "keepalives interleave with progress notifications in write order" do
+    runtime = start_runtime([])
+    socket = stream_request(runtime, "progress", [])
+    assert_receive {:tool_started, worker}, 1_000
+    first = collect_wires(socket, &(wire_shape(&1) =~ ~r/1K\z/))
+    send(worker, :next)
+    second = collect_wires(socket, &(wire_shape(&1) =~ ~r/2K\z/))
+    send(worker, :release)
+    {rest, {:returned, conn}} = finish_stream(socket)
+
+    assert wire_shape(first ++ second ++ rest) =~ ~r/\AK*1K+2K+R\z/
+    assert List.last(rest) =~ "\"text\":\"progressed\""
+    assert conn.state == :chunked
+    assert_released(runtime)
+  end
+
+  test "several keepalives precede a successful response and none follow it" do
+    runtime = start_runtime([])
+    socket = stream_request(runtime, "hold", [])
+    assert_receive {:tool_started, worker}, 1_000
+    keepalives = collect_wires(socket, &(length(&1) == 3))
+    assert keepalives == List.duplicate(":\r\n\r\n", 3)
+
+    send(worker, :release)
+    {rest, {:returned, conn}} = finish_stream(socket)
+    assert wire_shape(keepalives ++ rest) =~ ~r/\AK{3,}R\z/
+    assert List.last(rest) =~ "\"text\":\"released\""
+
+    # The request process has returned, so no later write can follow.
+    assert conn.state == :chunked
+    refute_received {:stream_wire, ^socket, _wire}
+    assert_released(runtime)
+  end
+
+  test ":infinity sends no request keepalives" do
+    runtime = start_runtime([])
+
+    socket =
+      stream_request(runtime, "progress", [], request_keepalive_interval_ms: :infinity)
+
+    assert_receive {:tool_started, worker}, 1_000
+    first = collect_wires(socket, &(length(&1) == 1))
+    assert wire_shape(first) == "1"
+
+    # Ten 20 ms intervals of quiet stream would otherwise carry comments.
+    refute_receive {:stream_wire, ^socket, _wire}, 200
+
+    send(worker, :next)
+    send(worker, :release)
+    {rest, {:returned, _conn}} = finish_stream(socket)
+    assert wire_shape(first ++ rest) == "12R"
+    assert_released(runtime)
   end
 
   test "a handler timeout during an in-flight keepalive still writes the timeout error" do
@@ -363,6 +440,43 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
 
     on_exit(fn -> if Process.alive?(socket), do: Process.exit(socket, :kill) end)
     socket
+  end
+
+  # Collects one stream's writes in order until `done?` holds for them.
+  defp collect_wires(socket, done?, wires \\ []) do
+    if done?.(wires) do
+      wires
+    else
+      receive do
+        {:stream_wire, ^socket, wire} -> collect_wires(socket, done?, wires ++ [wire])
+      after
+        2_000 -> flunk("timed out waiting for request stream writes: #{inspect(wires)}")
+      end
+    end
+  end
+
+  # Collects the remaining writes; the request process sends its result last.
+  defp finish_stream(socket, wires \\ []) do
+    receive do
+      {:stream_wire, ^socket, wire} -> finish_stream(socket, wires ++ [wire])
+      {:stream_result, ^socket, result} -> {wires, result}
+    after
+      2_000 -> flunk("timed out waiting for the request to return: #{inspect(wires)}")
+    end
+  end
+
+  defp wire_shape(wires), do: Enum.map_join(wires, &wire_kind/1)
+
+  defp wire_kind(":\r\n\r\n"), do: "K"
+
+  defp wire_kind("data: " <> frame) do
+    case Jason.decode!(frame) do
+      %{"method" => "notifications/progress", "params" => %{"progress" => progress}} ->
+        Integer.to_string(progress)
+
+      %{"result" => _result} ->
+        "R"
+    end
   end
 
   defp writer_domain(runtime) do
