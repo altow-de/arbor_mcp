@@ -391,11 +391,21 @@ defmodule Arbor.MCP.Server.Handler do
               | {:error, any(), state()}
 
   @doc """
-  Handles reading a resource.
+  Handles a `resources/read` request.
+
+  The success value is one content item (`%{uri, text}` or `%{uri, blob}`),
+  a list of those items, or the whole read result `%{contents: [...]}` when
+  the handler also sets fields such as cache hints. Dispatch wraps an item
+  or a list as `%{"contents" => [...]}` and passes a contents map through.
+  The modern era adds `resultType`, `ttlMs` and `cacheScope` after the
+  callback returns.
   """
   @callback handle_read_resource(uri :: String.t(), state()) ::
-              {:ok, Arbor.MCP.Types.resource_contents() | Arbor.MCP.Server.MRTR.InputRequired.t(),
-               state()}
+              {:ok,
+               Arbor.MCP.Types.resource_contents()
+               | [Arbor.MCP.Types.resource_contents()]
+               | Arbor.MCP.Types.read_resource_result()
+               | Arbor.MCP.Server.MRTR.InputRequired.t(), state()}
               | {:error, any(), state()}
               | input_required_return()
 
@@ -410,11 +420,17 @@ defmodule Arbor.MCP.Server.Handler do
               | {:error, any(), state()}
 
   @doc """
-  Handles getting a prompt.
+  Handles a `prompts/get` request.
+
+  The success value is the whole GetPromptResult, `%{messages: [message]}`
+  with an optional `description`. Each message is `%{role, content}`.
+  Dispatch sends that map as the JSON-RPC result. The modern era adds
+  `resultType` after the callback returns.
   """
   @callback handle_get_prompt(name :: String.t(), arguments :: map(), state()) ::
-              {:ok, Arbor.MCP.Types.prompt_message() | Arbor.MCP.Server.MRTR.InputRequired.t(),
-               state()}
+              {:ok,
+               Arbor.MCP.Types.get_prompt_result()
+               | Arbor.MCP.Server.MRTR.InputRequired.t(), state()}
               | {:error, any(), state()}
               | input_required_return()
 
@@ -444,7 +460,7 @@ defmodule Arbor.MCP.Server.Handler do
   whose arguments declare `complete:` advertise it for you.
   """
   @callback handle_complete(ref :: map(), argument :: map(), state()) ::
-              {:ok, result :: map(), state()} | {:error, any(), state()}
+              {:ok, Arbor.MCP.Types.complete_result(), state()} | {:error, any(), state()}
 
   @doc """
   Like `handle_complete/3`, and also receives the request's `context`
@@ -457,7 +473,7 @@ defmodule Arbor.MCP.Server.Handler do
   @doc api: :public
   """
   @callback handle_complete(ref :: map(), argument :: map(), context :: map(), state()) ::
-              {:ok, result :: map(), state()} | {:error, any(), state()}
+              {:ok, Arbor.MCP.Types.complete_result(), state()} | {:error, any(), state()}
 
   @doc """
   Handles a sampling create message request.

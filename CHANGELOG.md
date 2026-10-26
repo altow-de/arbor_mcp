@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `Arbor.MCP.Server.Handler.handle_get_prompt/3` accepts a GetPromptResult
+  (`%{messages: [...]}`, optional `description`). The callback used to
+  require a single prompt message, so a correct `prompts/get` result failed
+  Dialyzer with `callback_type_mismatch`. `handle_read_resource/2` also
+  accepts a list of contents or the whole read result, including cache
+  hints. `handle_complete/3` and `handle_complete/4` require a CompleteResult
+  (`%{completion: %{values: [...]}}`). `Handler.Echo` returns that empty
+  completion result.
+
 ## [2.0.0-rc.6] — 2026-10-26
 
 ### Added
