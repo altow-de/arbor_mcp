@@ -251,6 +251,14 @@ unsupported modern revision, timeout, authentication failure, or broken
 transport is surfaced instead of being silently downgraded. `:modern_only`
 never falls back.
 
+Over stdio the probe is the first message a newly spawned server reads, so
+the client waits for the server to start as well as to answer. Unless
+`:era_probe_timeout` is set, that wait is bounded by `:handshake_timeout`
+(10 s by default), the time a legacy `initialize` gets, so a server that is
+slow to start connects in every mode. A server that answers nothing within
+it fails the probe with `{:transport_error, :handshake_timeout}` and is not
+taken for a legacy one.
+
 Successful modern observations are pinned by endpoint and relevant transport
 configuration. Legacy observations expire (five minutes by default) so an
 upgraded endpoint is eventually probed again. Pass `reset_era_cache: true` for
