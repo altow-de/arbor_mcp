@@ -179,10 +179,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The client took a request or notification without `params` for an invalid
+  message and dropped it. JSON-RPC allows leaving `params` out, and the
+  TypeScript SDK's servers send `ping` and `notifications/*/list_changed`
+  that way, so the client never answered their pings or saw their list
+  changes. Such a message now parses with empty params.
+- An elicitation a handler asked for could fail as
+  `invalid_elicitation_params` on a busy machine: the pinned schema it's
+  checked against was compiled again for each request within 250 ms, and
+  checking had 100 ms. The schema is now compiled once, and checking the
+  bounded request has up to a second.
 - A tool result its connection's revision can't carry, such as a
   non-object `structuredContent` in a legacy era, raised in the server and
   reached the client as an opaque `handler_crash`. It's now a `-32603`
   error with `%{"type" => "invalid_result"}`, and the server logs why.
+- In the legacy Streamable HTTP revisions a server may answer a request's
+  POST with an event stream that carries the request's notifications and its
+  own requests ahead of the response, as the TypeScript SDK's servers do for
+  progress, log messages and elicitation. The client read the whole stream
+  before parsing it and joined every event into one JSON document, so a
+  notification ahead of the response left the call waiting until it timed
+  out, and a request the server waited on was never answered. Each message
+  on the stream is now handled as it arrives, so progress reaches
+  `handle_progress/3` while the call runs, and the stream's length is no
+  longer limited by `:max_response_bytes` (each incomplete event is limited
+  by `:max_stream_buffer_bytes`). The SSE parser also reads an `id`,
+  `retry` or `event` field written without a space after the colon, as the
+  format allows; such an event id used to be ignored for resumption.
 - A notification sent before the answer to `initialize` or
   `server/discover`, such as a log message, was taken for the answer, and
   the client failed to connect. It now skips notifications until the answer
