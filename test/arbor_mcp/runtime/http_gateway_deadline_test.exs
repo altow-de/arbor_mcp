@@ -48,22 +48,24 @@ defmodule Arbor.MCP.Server.Runtime.HTTPGatewayDeadlineTest do
 
     {:ok, runtime} = Runtime.ref(root)
     assert_receive :http_handler_init
-    # Entry has to land inside the charged cutoff however slow the machine is.
-    # The timeout error is then published on the failure tail. Checkout in the
-    # gap after the cutoff, before that tail is installed, reports the
-    # invocation closed; that is not the outcome.
-    {:ok, binding} = HTTPWriterProxy.capture(runtime, timeout: 1_000)
+    # Entry is the fast step: capture, submit and dispatch must land inside
+    # the cutoff, which at 40 ms they did not on a loaded machine. The held
+    # call is the far-past step: it never returns on its own.
+    {:ok, binding} = HTTPWriterProxy.capture(runtime, timeout: 250)
     {:ok, proof} = HTTPWriterBinding.validate(binding, runtime)
+    {:ok, {domain, _}} = HTTPWriterBinding.address(binding)
     {:ok, _token} = HTTPGateway.submit(runtime, binding, %{message(7) | "method" => "hold"})
-    assert_receive {:gateway_entry, 7, _worker, entered, cutoff}, 5_000
+    assert_receive {:gateway_entry, 7, _worker, entered, cutoff}
     assert cutoff == proof.deadline
     assert entered < cutoff
 
-    if Deadline.now() < cutoff do
-      assert :empty = HTTPWriterRegistry.checkout(binding)
-    end
-
-    {effect, wire} = await_failure_frame(binding)
+    # The registry wakes this writer once the timeout error is queued on the
+    # failure tail. Checking out before then can land in the gap after the
+    # cutoff where the invocation reads as closed.
+    assert_receive {:mcp_http_output_wake, ^domain, nonce}, 2_000
+    assert Deadline.now() >= cutoff
+    assert :ok = HTTPWriterRegistry.acknowledge_wake(domain, nonce)
+    assert {:ok, effect, wire} = HTTPWriterRegistry.checkout(binding)
 
     assert %{"id" => 7, "error" => %{"code" => -32603, "message" => "Request timeout"}} =
              Jason.decode!(wire)
@@ -73,7 +75,6 @@ defmodule Arbor.MCP.Server.Runtime.HTTPGatewayDeadlineTest do
     assert {:error, :http_invocation_closed} =
              HTTPWriterRegistry.prepare(binding, "{\"result\":1}")
 
-    {:ok, {domain, _}} = HTTPWriterBinding.address(binding)
     assert %{in_flight: 1, bytes: bytes} = HTTPWriterRegistry.stats(domain)
     assert bytes > byte_size(wire)
     assert :ok = HTTPWriterRegistry.complete(effect, :ok)
@@ -81,36 +82,10 @@ defmodule Arbor.MCP.Server.Runtime.HTTPGatewayDeadlineTest do
     assert :empty = HTTPWriterRegistry.checkout(binding)
     wait(fn -> match?(%{reserved: 0}, Runtime.stats!(runtime)) end)
     assert {:ok, %{"result" => 0}} = Runtime.request(runtime, message(8))
-    refute_receive :http_handler_init, 0
+    refute_receive :http_handler_init, 5
   end
 
   defp message(id), do: %{"jsonrpc" => "2.0", "id" => id, "method" => "read"}
-
-  defp await_failure_frame(binding) do
-    {:ok, tail} = HTTPWriterRegistry.wait_deadline(binding)
-    await_failure_frame(binding, tail)
-  end
-
-  defp await_failure_frame(binding, tail) do
-    case HTTPWriterRegistry.checkout(binding) do
-      {:ok, effect, wire} ->
-        {effect, wire}
-
-      result
-      when result in [:empty, {:error, :http_invocation_closed}, {:error, :http_output_expired}] ->
-        if Deadline.now() >= tail do
-          flunk(
-            "timeout error was not published before the failure tail closed: #{inspect(result)}"
-          )
-        else
-          Process.sleep(10)
-          await_failure_frame(binding, tail)
-        end
-
-      error ->
-        flunk("HTTP checkout failed: #{inspect(error)}")
-    end
-  end
 
   defp wait(fun, remaining \\ 200)
   defp wait(_fun, 0), do: flunk("HTTP gateway state not reached")
