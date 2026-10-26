@@ -18,6 +18,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `token_verifier:`, as the TypeScript SDK's `OAuthTokenVerifier` can. The
   guard still binds such tokens to the configured issuer, audience and
   scopes.
+- The client keeps results the server marks fresh, as the TypeScript SDK's
+  client does: each `tools/list`, `prompts/list`, `resources/list` and
+  `resources/templates/list` page and each `resources/read` is answered from
+  the cache for its `ttlMs` (at most a day). `list_changed` and
+  `resources/updated` notifications drop what they make stale, including a
+  request still in flight, and reconnecting clears it. Per call,
+  `cache_mode: :refresh` or `:bypass` skips it; `response_cache: false` turns
+  it off, and `:default_cache_ttl_ms` keeps results that carry no `ttlMs`.
+- Servers take `:cache_hints`, per method, for the `ttlMs` and `cacheScope` of
+  cacheable results a handler doesn't set, such as the lists, as the
+  TypeScript SDK's `cacheHints` option does. A `resources/read` handler may
+  also return the whole result, with its own hints, instead of just the
+  contents.
+- Requests take `reset_timeout_on_progress: true`, as the TypeScript SDK's
+  `resetTimeoutOnProgress` does: `:timeout` then limits how long the request
+  may go without a progress update, each update starts it again, and
+  `:max_total_timeout` caps the whole request. The client adds a progress
+  token to a request that has none, and the HTTP transport's
+  `:request_timeout` doesn't cut such a request off.
 - `Client.call_tool/4` checks a result against the tool's `outputSchema`, as
   the TypeScript and Python SDKs do. Once `list_tools/2` has shown a tool
   with one, a successful result must carry `structuredContent` that
@@ -196,6 +215,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-object `structuredContent` in a legacy era, raised in the server and
   reached the client as an opaque `handler_crash`. It's now a `-32603`
   error with `%{"type" => "invalid_result"}`, and the server logs why.
+- In the legacy Streamable HTTP revisions a server may answer a request's
+  POST with an event stream that carries the request's notifications and its
+  own requests ahead of the response, as the TypeScript SDK's servers do for
+  progress, log messages and elicitation. The client read the whole stream
+  before parsing it and joined every event into one JSON document, so a
+  notification ahead of the response left the call waiting until it timed
+  out, and a request the server waited on was never answered. Each message
+  on the stream is now handled as it arrives, so progress reaches
+  `handle_progress/3` while the call runs, and the stream's length is no
+  longer limited by `:max_response_bytes` (each incomplete event is limited
+  by `:max_stream_buffer_bytes`). The SSE parser also reads an `id`,
+  `retry` or `event` field written without a space after the colon, as the
+  format allows; such an event id used to be ignored for resumption.
 - A notification sent before the answer to `initialize` or
   `server/discover`, such as a log message, was taken for the answer, and
   the client failed to connect. It now skips notifications until the answer

@@ -339,7 +339,7 @@ server reports progress against that token.
 {:ok, result} =
   Arbor.MCP.Client.call_tool(client, "import", %{}, progress_token: "job-42")
 
-# Client — modern HTTP delivers events to the handler
+# Client — the handler receives each update, on every transport
 @impl true
 def handle_progress(_request_id, %{"progressToken" => token, "progress" => n} = note, state) do
   _ = {token, n, Map.get(note, "total"), Map.get(note, "message")}
@@ -367,6 +367,28 @@ token:
 ```
 
 `Arbor.MCP.Client.call_tool/4` also accepts `:meta` and merges it with `:progress_token`.
+
+### Keeping a long request alive
+
+As with the TypeScript SDK's `resetTimeoutOnProgress`, a request made with
+`reset_timeout_on_progress: true` times out only once it has gone `:timeout`
+milliseconds (or the client's default) without progress, and
+`:max_total_timeout` caps it however much progress it makes. The client adds a
+progress token if the request has none.
+
+```elixir
+{:ok, result} =
+  Arbor.MCP.Client.call_tool(client, "import", %{},
+    timeout: 30_000,
+    reset_timeout_on_progress: true,
+    max_total_timeout: :timer.hours(2)
+  )
+```
+
+Without `:max_total_timeout` there is no overall limit. Over HTTP the
+transport's `:request_timeout` doesn't cut such a request off, but a modern
+request stream that carries nothing for `:stream_idle_timeout` (60 s by
+default) still closes.
 
 ## Cancellation
 

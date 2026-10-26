@@ -762,7 +762,8 @@ Supported options include:
 - `:allowed_private_hosts` (exact internal hostnames allowed to resolve to
   RFC 1918/IPv6 ULA addresses; no wildcards)
 - `:max_request_bytes`
-- `:max_response_bytes`
+- `:max_response_bytes` (a JSON response, or the events of an SSE response
+  that aren't handed to the client as they arrive)
 - `:max_stream_buffer_bytes` (maximum delimiter-free/incomplete SSE data)
 - `:security`
 - `:auth`
@@ -1516,22 +1517,38 @@ defaults when a handler omits them:
 ```
 
 `ttlMs: 0` means immediately stale; `private` prevents reuse across
-authorization contexts. A handler may return `ttl_ms` / `cache_scope` or the
-wire keys `ttlMs` / `cacheScope` to override those defaults. TTL must be a
-non-negative integer and scope must be `:public`, `:private`, `"public"`, or
-`"private"`. Only use `public` when the result is safe to share across users,
-including on authenticated endpoints. Each paginated response page carries
-its own hints, and ArborMCP removes cache hints from `input_required` results.
+authorization contexts. A `resources/read` handler may return the whole result
+with `ttl_ms` / `cache_scope` (or the wire keys `ttlMs` / `cacheScope`) to
+override those defaults, as in `{:ok, %{contents: contents, ttl_ms: 60_000},
+state}`. For the results the server builds itself, such as the lists, set
+hints per method with the `:cache_hints` server option, as with the
+TypeScript SDK's `cacheHints`; a handler's own fields take precedence:
+
+```elixir
+Arbor.MCP.Server.start_link(
+  handler: MyServer,
+  transport: :stdio,
+  cache_hints: %{
+    "tools/list" => [ttl_ms: 300_000, cache_scope: :public],
+    "resources/read" => [ttl_ms: 60_000]
+  }
+)
+```
+
+TTL must be a non-negative integer and scope must be `:public`, `:private`,
+`"public"`, or `"private"`; `:cache_hints` is checked when the server starts.
+Only use `public` when the result is safe to share across users, including on
+authenticated endpoints. Each paginated response page carries its own hints,
+and ArborMCP removes cache hints from `input_required` results.
 
 Modern clients reject missing or invalid required hints. With the default
 `:struct` response format they are available as `response.ttlMs` and
-`response.cacheScope`; `format: :map` preserves the wire keys. ArborMCP currently
-parses and validates these hints but does not store or reuse responses. This
-is the deliberate 1.0 scope: a client cache would add authorization
-partitioning, invalidation races, memory bounds, and MRTR exclusion to the
-final release candidate. Repeated calls therefore still reach the transport,
-even for a positive public TTL, and a later operation never reuses an earlier
-`requestState`. Cache storage remains a post-1.0 additive feature.
+`response.cacheScope`; `format: :map` preserves the wire keys. The client keeps
+each list page and resource read for its `ttlMs` (at most a day) and answers a
+repeat request from it; change notifications drop what they make stale. See
+"Response cache" in `Arbor.MCP.Client` for `:response_cache`,
+`:default_cache_ttl_ms` and the per-call `:cache_mode`. A retried MRTR request,
+which carries `inputResponses` or `requestState`, is never cached.
 
 Pass request-local context into a handler with `:handler_opts`. The option can
 be a static term, a one-arity function called with the `Plug.Conn`, a two-arity
