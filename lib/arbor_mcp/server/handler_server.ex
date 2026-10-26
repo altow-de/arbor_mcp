@@ -404,18 +404,16 @@ defmodule Arbor.MCP.Server.HandlerServer do
            %{"method" => method, "params" => %{}} when method in @request_notifications <-
              notification,
            :ok <- encodable(notification) do
-        cond do
-          # The connection's own logging/setLevel applies to every log
-          # message on it, whichever way the message came.
-          method == "notifications/message" and
-              not log_level_enabled?(notification["params"]["level"], state.log_level) ->
-            {:ok, state}
-
-          true ->
-            case send_message(notification, state) do
-              {:ok, state} -> {:ok, state}
-              {:error, reason} -> {{:error, reason}, state}
-            end
+        # The connection's own logging/setLevel applies to every log message
+        # on it, whichever way the message came.
+        if method == "notifications/message" and
+             not log_level_enabled?(notification["params"]["level"], state.log_level) do
+          {:ok, state}
+        else
+          case send_message(notification, state) do
+            {:ok, state} -> {:ok, state}
+            {:error, reason} -> {{:error, reason}, state}
+          end
         end
       else
         :unencodable -> {{:error, :invalid_notification}, state}
