@@ -236,8 +236,12 @@ Closing a modern request/subscription response stream is the cancellation
 signal; there is no session DELETE and no resumable `Last-Event-ID` cursor.
 For an SSE request response, the server writes comment keepalives every
 `:request_keepalive_interval_ms` (15 seconds by default). A failed write
-cancels the running handler and releases its Runtime capacity. JSON responses
-do not use keepalives, so a quiet disconnect there is detected at the next
+cancels the running handler and releases its Runtime capacity. Over TCP the
+first write after the client closes usually succeeds and the next one fails,
+so on Bandit the close is usually noticed within two intervals. Cowboy instead
+terminates the request process when it sees the connection close, which
+cancels the request without waiting for a write. JSON responses do not use
+keepalives, so on Bandit a quiet disconnect there is detected at the next
 write or the request deadline. Set the interval to `:infinity` to disable
 request stream keepalives.
 

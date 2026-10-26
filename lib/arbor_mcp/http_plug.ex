@@ -123,8 +123,11 @@ defmodule Arbor.MCP.HttpPlug do
   JSON-RPC response that closes the stream. SSE comment keepalives are sent
   every `:request_keepalive_interval_ms` milliseconds (default: `15_000`;
   set `:infinity` to disable). A failed write cancels that request's worker
-  without affecting other requests or subscriptions. JSON responses do not
-  send keepalives.
+  without affecting other requests or subscriptions. The first write after a
+  TCP peer closes usually succeeds, so a write-detected close is usually
+  noticed within two intervals; Cowboy also cancels by terminating the request
+  process when it sees the connection close. JSON responses do not send
+  keepalives.
 
   Mount subscription authorizers are composed with the Runtime service policy;
   both must authorize. Mount queue, message-byte, aggregate-byte and lifetime

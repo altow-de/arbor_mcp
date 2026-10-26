@@ -10,9 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Modern HTTP request SSE streams now send configurable comment keepalives
-  (`:request_keepalive_interval_ms`, default 15 seconds). A closed peer is
-  detected on the next write, cancelling the handler and freeing its Runtime
-  capacity. JSON responses and legacy streams are unchanged.
+  (`:request_keepalive_interval_ms`, default 15 seconds) on mounted and owned
+  HTTP servers. A failed write cancels the handler and frees its Runtime
+  capacity. Over TCP the first write after a peer closes usually succeeds and
+  the next one fails, so on Bandit a closed stream is usually noticed within
+  two intervals. Cowboy cancels the request as soon as it sees the connection
+  close, by terminating the request process. JSON responses and legacy streams
+  are unchanged.
 
 ## [2.0.0-rc.6] — 2026-10-26
 
