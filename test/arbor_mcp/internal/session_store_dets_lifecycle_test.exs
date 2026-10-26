@@ -111,26 +111,32 @@ defmodule Arbor.MCP.Internal.SessionStoreDetsLifecycleTest do
   end
 
   test "one original operation cutoff covers consecutive calls without refreshing", %{path: path} do
-    {:ok, store} = DETS.open(%{storage_path: path, storage_io_timeout_ms: 80})
-    worker = :dets.info(store.sessions, :owner)
-    :erlang.suspend_process(worker)
+    # The cutoff is whatever with_deadline charged. A lookup inside it carries
+    # that cutoff and succeeds. After that instant is in the past, the next
+    # lookup still carries it and times out. A refreshed cutoff would be
+    # about one io_timeout later and the second lookup would succeed.
+    {:ok, store} = DETS.open(%{storage_path: path, storage_io_timeout_ms: 1_000})
+    owner = store.owner
+    :erlang.trace(owner, true, [:receive])
 
     try do
-      before = System.monotonic_time(:millisecond)
+      DETS.with_deadline(store, fn ->
+        cutoff = Process.get({DETS, store.token})
+        assert is_integer(cutoff)
 
-      assert {:error, :storage_io_timeout} ==
-               storage_result(fn ->
-                 DETS.with_deadline(store, fn ->
-                   Process.sleep(35)
-                   DETS.lookup(store, :sessions, :missing)
-                 end)
-               end)
+        assert [] == DETS.lookup(store, :sessions, :missing)
+        assert_lookup_cutoff(owner, cutoff)
+        assert System.monotonic_time(:millisecond) < cutoff
 
-      elapsed = System.monotonic_time(:millisecond) - before
-      assert elapsed >= 65
-      assert elapsed < 110
+        await_deadline(cutoff)
+
+        assert {:error, :storage_io_timeout} ==
+                 storage_result(fn -> DETS.lookup(store, :sessions, :missing) end)
+
+        assert_lookup_cutoff(owner, cutoff)
+      end)
     after
-      resume_if_alive(worker)
+      if Process.alive?(owner), do: :erlang.trace(owner, false, [:receive])
     end
 
     assert_eventually(fn -> not Process.alive?(store.owner) end)
@@ -358,6 +364,23 @@ defmodule Arbor.MCP.Internal.SessionStoreDetsLifecycleTest do
 
   defp resume_if_alive(pid) do
     if Process.alive?(pid), do: :erlang.resume_process(pid)
+  end
+
+  defp assert_lookup_cutoff(owner, cutoff) do
+    assert_receive {:trace, ^owner, :receive, {:"$gen_call", _from, message}}, 5_000
+    assert elem(message, 2) == cutoff
+    assert elem(message, 3) == :lookup
+  end
+
+  defp await_deadline(deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      :ok
+    else
+      Process.sleep(min(remaining, 50))
+      await_deadline(deadline)
+    end
   end
 
   defp assert_eventually(check, remaining \\ 1_000)
