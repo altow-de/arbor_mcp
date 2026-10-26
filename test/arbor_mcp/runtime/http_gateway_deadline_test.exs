@@ -3,6 +3,7 @@ defmodule Arbor.MCP.Server.Runtime.HTTPGatewayDeadlineTest do
   alias Arbor.MCP.Server.Runtime
 
   alias Arbor.MCP.Server.Runtime.{
+    Admission,
     CallbackContext,
     Deadline,
     HTTPGateway,
@@ -54,7 +55,7 @@ defmodule Arbor.MCP.Server.Runtime.HTTPGatewayDeadlineTest do
     {:ok, binding} = HTTPWriterProxy.capture(runtime, timeout: 250)
     {:ok, proof} = HTTPWriterBinding.validate(binding, runtime)
     {:ok, {domain, _}} = HTTPWriterBinding.address(binding)
-    {:ok, _token} = HTTPGateway.submit(runtime, binding, %{message(7) | "method" => "hold"})
+    {:ok, token} = HTTPGateway.submit(runtime, binding, %{message(7) | "method" => "hold"})
     assert_receive {:gateway_entry, 7, _worker, entered, cutoff}
     assert cutoff == proof.deadline
     assert entered < cutoff
@@ -77,27 +78,35 @@ defmodule Arbor.MCP.Server.Runtime.HTTPGatewayDeadlineTest do
 
     assert %{in_flight: 1, bytes: bytes} = HTTPWriterRegistry.stats(domain)
     assert bytes > byte_size(wire)
+    gateway = trace_release(runtime)
     assert :ok = HTTPWriterRegistry.complete(effect, :ok)
-    wait(fn -> match?(%{frames: 0}, HTTPWriterRegistry.stats(domain)) end)
+    # complete/2 records the receipt and wakes the registry, whose next pass
+    # drops the frame. This round trip returns only after that pass.
+    _ = :sys.get_state(HTTPWriterRegistry.guardian(domain))
+    assert %{frames: 0} = HTTPWriterRegistry.stats(domain)
     assert :empty = HTTPWriterRegistry.checkout(binding)
-    wait(fn -> match?(%{reserved: 0}, Runtime.stats!(runtime)) end)
+    # Once the output settles, the gateway finishes the job and frees its slot
+    # with a synchronous Admission.release/2. Its return is the sync point.
+    assert_receive {:trace, ^gateway, :call, {Admission, :release, [_table, ^token]}}, 2_000
+    assert_receive {:trace, ^gateway, :return_from, {Admission, :release, 2}, _result}, 2_000
+    assert %{reserved: 0} = Runtime.stats!(runtime)
     assert {:ok, %{"result" => 0}} = Runtime.request(runtime, message(8))
     refute_receive :http_handler_init, 5
   end
 
   defp message(id), do: %{"jsonrpc" => "2.0", "id" => id, "method" => "read"}
 
-  defp wait(fun, remaining \\ 200)
-  defp wait(_fun, 0), do: flunk("HTTP gateway state not reached")
+  defp trace_release(runtime) do
+    {:ok, gateway} = HTTPGateway.address(runtime)
+    release = {Admission, :release, 2}
+    1 = :erlang.trace_pattern(release, [{:_, [], [{:return_trace}]}], [:global])
+    1 = :erlang.trace(gateway, true, [:call])
 
-  defp wait(fun, remaining) do
-    case fun.() do
-      result when result not in [nil, false] ->
-        result
+    on_exit(fn ->
+      :erlang.trace_pattern(release, false, [:global])
+      if Process.alive?(gateway), do: :erlang.trace(gateway, false, [:call])
+    end)
 
-      _ ->
-        Process.sleep(5)
-        wait(fun, remaining - 1)
-    end
+    gateway
   end
 end
