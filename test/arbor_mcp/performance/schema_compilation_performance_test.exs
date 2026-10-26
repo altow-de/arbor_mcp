@@ -8,6 +8,8 @@ defmodule Arbor.MCP.Performance.SchemaCompilationPerformanceTest do
 
   @moduletag :performance
 
+  @validation_batches 21
+
   defp log_performance(message) do
     if System.get_env("VERBOSE_PERFORMANCE_TESTS") do
       IO.puts(message)
@@ -54,43 +56,35 @@ defmodule Arbor.MCP.Performance.SchemaCompilationPerformanceTest do
       # Pre-compile the schema (this happens at compile time in real usage)
       assert {:ok, compiled_schema} = SchemaPolicy.compile(@test_schema)
 
-      for _ <- 1..20 do
-        assert :ok = SchemaPolicy.validate(@test_data, compiled_schema)
-      end
-
-      # Wall-clock microseconds move when the scheduler is busy. Compilation
-      # is the expensive step. The best sample is the one stalled the least.
-      # Validating by compiling again collapses every sample toward 1.
-      ratios =
-        for _ <- 1..5 do
-          {validate_us, results} =
+      # Measure validation performance (this happens at runtime). One batch of
+      # 100 also absorbs every scheduler stall that lands in it, so the bound
+      # applies to the median of many batches, which a few stalls cannot move.
+      per_validation =
+        for _ <- 1..@validation_batches do
+          {time_microseconds, results} =
             :timer.tc(fn ->
               for _ <- 1..100 do
                 SchemaPolicy.validate(@test_data, compiled_schema)
               end
             end)
 
+          # Verify all validations succeeded
           assert Enum.all?(results, &(&1 == :ok))
-
-          {compile_us, compiles} =
-            :timer.tc(fn ->
-              for _ <- 1..100 do
-                SchemaPolicy.compile(@test_schema)
-              end
-            end)
-
-          assert Enum.all?(compiles, &match?({:ok, _}, &1))
-          compile_us / max(validate_us, 1)
+          time_microseconds / 1000 / 100
         end
 
-      best = Enum.max(ratios)
+      sorted = Enum.sort(per_validation)
+      median = Enum.at(sorted, div(length(sorted), 2))
 
-      log_performance("\n📊 Precompiled validation vs compilation (5 x 100):")
-      log_performance("  Best compile/validate ratio: #{Float.round(best, 2)}")
-      log_performance("  Samples: #{inspect(Enum.map(ratios, &Float.round(&1, 2)))}")
+      log_performance("\n📊 Validation Performance (#{@validation_batches} x 100 iterations):")
+      log_performance("  Median per validation: #{Float.round(median, 4)} ms")
+      log_performance("  Fastest batch: #{Float.round(hd(sorted), 4)} ms per validation")
+      log_performance("  Validations per second: #{Float.round(1000 / median, 0)}")
 
-      assert best >= 10,
-             "precompiled validation was not cheaper than compilation: #{inspect(ratios)}"
+      # Assert reasonable performance (should be very fast with pre-compiled schemas)
+      assert median < 0.1,
+             "Expected sub-0.1ms per validation, got a median of #{median} ms " <>
+               "(per-batch: #{inspect(Enum.map(sorted, &Float.round(&1, 4)))})"
     end
 
     test "schema compilation is one-time cost" do
