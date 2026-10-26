@@ -67,11 +67,14 @@ defmodule Arbor.MCP.Compliance.Features.Prompts do
 
     try do
       {:ok, prompts_result} = Client.list_prompts(test_context.client)
+      assert is_list(prompts_result.prompts)
 
       if prompts_result.prompts != [] do
         prompt = hd(prompts_result.prompts)
 
         # Get the prompt with some sample arguments
+        if prompt[:arguments], do: assert(is_list(prompt.arguments))
+
         args =
           if prompt[:arguments] && prompt.arguments != [] do
             # Build args based on required arguments

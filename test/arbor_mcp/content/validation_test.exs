@@ -554,7 +554,7 @@ defmodule Arbor.MCP.Content.ValidationTest do
       assert {:threat, threats} =
                Validation.scan_security(malicious_content, [:malware, :xss, :sql_injection])
 
-      assert threats != []
+      assert is_list(threats) and threats != []
     end
 
     test "handles unknown scan types" do

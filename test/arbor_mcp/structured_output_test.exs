@@ -230,7 +230,7 @@ defmodule Arbor.MCP.StructuredOutputTest do
     test "clients can ignore outputSchema if not supported", %{client: client} do
       # List tools should work even if client doesn't understand outputSchema
       {:ok, %{tools: tools}} = Client.list_tools(client)
-      assert tools != []
+      assert is_list(tools) and tools != []
 
       # Tool calls should work normally
       {:ok, result} = Client.call_tool(client, "get_weather", %{"location" => "Paris"})

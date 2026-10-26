@@ -73,6 +73,7 @@ defmodule Arbor.MCP.Compliance.Features.Resources do
 
     try do
       {:ok, resources} = Client.list_resources(test_context.client)
+      assert is_list(resources.resources)
 
       if resources.resources != [] do
         resource = hd(resources.resources)
@@ -112,6 +113,7 @@ defmodule Arbor.MCP.Compliance.Features.Resources do
 
     try do
       {:ok, resources} = Client.list_resources(test_context.client)
+      assert is_list(resources.resources)
 
       if resources.resources != [] do
         resource_uri = hd(resources.resources).uri
