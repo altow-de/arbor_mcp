@@ -289,12 +289,12 @@ defmodule Arbor.MCP.Client.ConnectionManager do
         {:ok, discovery_as_connection_result(discovery), updated_state}
 
       {:error, probe_error, updated_state} ->
-        if legacy_fallback_evidence?(probe_error) and
-             transport_alive?(transport_mod, updated_state) do
+        with {:ok, legacy_opts} <- legacy_fallback(probe_error, opts),
+             true <- transport_alive?(transport_mod, updated_state) do
           case establish_legacy_protocol(
                  transport_mod,
                  updated_state,
-                 opts,
+                 legacy_opts,
                  era_identity
                ) do
             {:ok, _result, _state} = success ->
@@ -312,7 +312,7 @@ defmodule Arbor.MCP.Client.ConnectionManager do
                 %{probe: probe_error, initialize: initialize_error}}, latest_state}
           end
         else
-          {:error, {:era_probe_failed, probe_error}, updated_state}
+          _no_legacy_evidence -> {:error, {:era_probe_failed, probe_error}, updated_state}
         end
     end
   end
@@ -347,13 +347,43 @@ defmodule Arbor.MCP.Client.ConnectionManager do
               {:ok, discovery_as_connection_result(discovery), updated_state}
 
             {:error, probe_error, updated_state} ->
-              {:error,
-               {:initialize_and_era_probe_failed,
-                %{initialize: initialize_error, probe: probe_error}}, updated_state}
+              retry_legacy_after_probe(
+                transport_mod,
+                updated_state,
+                opts,
+                era_identity,
+                %{initialize: initialize_error, probe: probe_error}
+              )
           end
         else
           {:error, initialize_error, latest_state}
         end
+    end
+  end
+
+  # The probe after a failed initialize can name the legacy revisions the
+  # server does support. When the initialize offered another one, it is tried
+  # once more with the client's preferred revision among them; otherwise the
+  # initialize failure stands.
+  defp retry_legacy_after_probe(transport_mod, transport_state, opts, era_identity, failures) do
+    with version when is_binary(version) <- offered_legacy_version(failures.probe, opts),
+         true <- version != initialize_version(opts),
+         true <- transport_alive?(transport_mod, transport_state) do
+      case establish_legacy_protocol(
+             transport_mod,
+             transport_state,
+             Keyword.put(opts, :protocol_version, version),
+             era_identity
+           ) do
+        {:ok, _result, _state} = success ->
+          success
+
+        {:error, initialize_error, latest_state} ->
+          {:error, {:initialize_and_era_probe_failed, %{failures | initialize: initialize_error}},
+           latest_state}
+      end
+    else
+      _no_other_version -> {:error, {:initialize_and_era_probe_failed, failures}, transport_state}
     end
   end
 
@@ -365,6 +395,41 @@ defmodule Arbor.MCP.Client.ConnectionManager do
       "instructions" => Map.get(discovery, :instructions)
     }
   end
+
+  # The options for the initialize that follows a failed probe, when the
+  # failure is evidence of a legacy server.
+  defp legacy_fallback(probe_error, opts) do
+    case offered_legacy_version(probe_error, opts) do
+      nil -> if legacy_fallback_evidence?(probe_error), do: {:ok, opts}, else: :none
+      version -> {:ok, Keyword.put(opts, :protocol_version, version)}
+    end
+  end
+
+  # MCP says to retry with a version the server's UnsupportedProtocolVersionError
+  # lists. When it lists only legacy revisions (an Arbor server running
+  # `protocol_mode: :legacy_only` does), the server is legacy and that retry is
+  # an initialize offering the client's preferred revision among them. A list
+  # that also names a modern or an unknown revision is no such evidence: the
+  # server may be modern. A DiscoverResult is never taken as legacy evidence;
+  # its version mismatch arrives wrapped as :invalid_discover_result.
+  defp offered_legacy_version(
+         {:no_mutually_supported_modern_version, %{server: [_ | _] = server_versions}},
+         opts
+       ) do
+    if Enum.all?(server_versions, &(VersionRegistry.era_for(&1) == :legacy)) do
+      Enum.find(
+        [Keyword.get(opts, :protocol_version), VersionRegistry.preferred_version()] ++
+          VersionRegistry.supported_versions(),
+        &(&1 in server_versions)
+      )
+    end
+  end
+
+  defp offered_legacy_version(_probe_error, _opts), do: nil
+
+  # The revision an initialize built from `opts` offers.
+  defp initialize_version(opts),
+    do: Keyword.get(opts, :protocol_version) || VersionRegistry.preferred_version()
 
   defp legacy_fallback_evidence?({:json_rpc_error, error}) do
     not modern_specific_error?(error)

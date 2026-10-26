@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A client in the default `:prefer_modern` mode could not connect to an
+  Arbor server running `protocol_mode: :legacy_only`, the documented
+  rollback, over any transport. The server answers the `server/discover`
+  probe with an UnsupportedProtocolVersionError (-32022) whose `supported`
+  list names only legacy revisions, and the client failed with
+  `{:era_probe_failed, {:no_mutually_supported_modern_version, ...}}` instead
+  of using one of them. MCP says to continue with a listed version, and for
+  a legacy one that is `initialize`: `:prefer_modern` now falls back to it,
+  offering its preferred revision among those listed (its legacy
+  `:protocol_version` when listed), and records the legacy observation.
+  `:prefer_legacy`, whose `initialize` comes first, retries it once with
+  such a revision when the server rejected the one it offered and the probe
+  then names others. A list that also names a modern or an unknown revision
+  is not legacy evidence, `:modern_only` never falls back, and a cached
+  modern observation still never downgrades.
+
 ## [2.0.0-rc.6] — 2026-10-26
 
 ### Added
