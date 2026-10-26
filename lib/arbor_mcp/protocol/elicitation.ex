@@ -18,7 +18,7 @@ defmodule Arbor.MCP.Protocol.Elicitation do
   @validation_timeout_ms 1_000
 
   def validate(params, deadline) do
-    with remaining when remaining > 0 <- Deadline.remaining(deadline),
+    with true <- Deadline.remaining(deadline) > 0,
          {:ok, schema} <- compiled_schema(),
          {:ok, prepared} <-
            OutputCodec.prepare(params,
@@ -28,6 +28,8 @@ defmodule Arbor.MCP.Protocol.Elicitation do
              max_term_bytes: 65_536
            ),
          normalized = Jason.decode!(prepared.wire),
+         # What's left once the schema and request are ready.
+         remaining when remaining > 0 <- Deadline.remaining(deadline),
          :ok <-
            SchemaPolicy.validate(normalized, schema,
              max_instance_bytes: 65_536,
