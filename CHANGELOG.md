@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A modern `subscriptions/listen` stream over Streamable HTTP now ends with
+  its completion response when the listener closes (maximum lifetime, slow
+  consumer, revoked authorization or server close) while a keepalive or a
+  notification is being written. A keepalive that raced the close aborted the
+  response with "MCP HTTP response capacity unavailable", and a notification
+  still in flight ended the stream without the completion. Once the listener
+  has started closing, the stream stops sending keepalives, drops that
+  notification and waits for the completion.
+
 ## [2.0.0-rc.6] — 2026-10-26
 
 ### Added
