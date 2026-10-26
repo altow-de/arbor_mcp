@@ -173,6 +173,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The client took a request or notification without `params` for an invalid
+  message and dropped it. JSON-RPC allows leaving `params` out, and the
+  TypeScript SDK's servers send `ping` and `notifications/*/list_changed`
+  that way, so the client never answered their pings or saw their list
+  changes. Such a message now parses with empty params.
 - An elicitation a handler asked for could fail as
   `invalid_elicitation_params` on a busy machine: the pinned schema it's
   checked against was compiled again for each request within 250 ms, and
