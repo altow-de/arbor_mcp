@@ -57,15 +57,10 @@ Code.ensure_loaded(Arbor.MCP.Compliance.VersionGenerator)
 # Enable test mode for SSE handlers to prevent blocking in tests
 Application.put_env(:arbor_mcp, :test_mode, true)
 
-# Semantic schema tests are not deadline tests. Production still charges
-# 100ms for validation and 1s for resolution, both as wall-clock Task.yield
-# limits, so a busy scheduler reports a timeout for work that itself finished
-# quickly. Tests that are about the deadline pass an explicit override,
-# including zero, in SchemaPolicyTest.
-Application.put_env(:arbor_mcp, :json_schema,
-  resolve_timeout_ms: 30_000,
-  validation_timeout_ms: 30_000
-)
+# Keep the production validation deadline tight while allowing for scheduler
+# contention from highly concurrent test runs. Deadline behavior is tested with
+# explicit per-call overrides in SchemaPolicyTest.
+Application.put_env(:arbor_mcp, :json_schema, validation_timeout_ms: 1_000)
 
 # Don't stop the application - let tests that need it have access to it
 # Individual tests can stop/restart if needed for isolation
