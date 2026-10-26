@@ -190,6 +190,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_connection/3`'s `:cleanup_timeout` bounds the scope only. It was also
   passed to a stdio transport, where it became the server's subprocess shutdown
   budget; set `:eof_grace` or `:cleanup_timeout` in the connection spec instead.
+- **BREAKING:** An elicitation a handler asks for in an `input_required`
+  result is held to the protocol's ElicitRequest schema in both eras. A modern
+  client used to get it unchecked, while the legacy bridge refused one that
+  didn't fit. A request that doesn't fit, such as a `requestedSchema` without
+  `properties`, now fails the call with a `-32602` error naming the input
+  request, before it reaches the client. **Upgrade:** give a form
+  elicitation's `requestedSchema` its `properties` (`%{}` if there are none),
+  each a string, number, boolean or enum field.
 - **BREAKING:** A DSL tool called with invalid arguments returns an `isError`
   tool result, "Input validation error: …" naming the failing fields and rules,
   instead of a `-32602` protocol error with no details. A path shows only
@@ -296,11 +304,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its stream couldn't be answered. As with a modern request stream, the
   client process now answers the challenge, one at a time across requests,
   and the request's own task sends it again.
-- An elicitation a handler asks for in an `input_required` result was sent to
-  a modern client unchecked, though the legacy bridge holds the same request
-  to the protocol's ElicitRequest schema. Both eras now check it, and a
-  request that doesn't fit (a `requestedSchema` without `properties`, say) is
-  a `-32602` error naming the input request, before it reaches the client.
 
 ## [2.0.0-rc.5] — 2026-10-22
 
