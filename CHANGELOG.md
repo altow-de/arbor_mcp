@@ -173,6 +173,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An elicitation a handler asked for could fail as
+  `invalid_elicitation_params` on a busy machine: the pinned schema it's
+  checked against was compiled again for each request within 250 ms, and
+  checking had 100 ms. The schema is now compiled once, and checking the
+  bounded request has up to a second.
 - A tool result its connection's revision can't carry, such as a
   non-object `structuredContent` in a legacy era, raised in the server and
   reached the client as an opaque `handler_crash`. It's now a `-32603`
