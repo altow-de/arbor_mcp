@@ -193,11 +193,16 @@ defmodule Arbor.MCP.Client do
     `:prefer_modern`, or `:prefer_legacy`.
   - `:era_probe_timeout` - Dedicated timeout for the side-effect-free modern
     discovery probe exchange, send included (default: 2_000 milliseconds).
+    Over stdio the probe is the first message a newly started server reads,
+    so the wait for its answer also covers the server starting up; there the
+    default is `:handshake_timeout`, the time `initialize` gets for the same
+    first answer.
   - `:establish_timeout` - Upper bound in milliseconds (or `:infinity`) on
     establishing the connection as a whole: opening the transport, the probe,
     any legacy fallback, `initialize` and `notifications/initialized`, and
     connection retries under `:retry_policy`. Defaults to
-    `:handshake_timeout` plus `:era_probe_timeout`. On expiry `start_link/1`
+    `:handshake_timeout` plus `:era_probe_timeout`, counted as 2_000 when it
+    is not given (over stdio too). On expiry `start_link/1`
     fails with `{:error, :establish_timeout}`, and each reconnection attempt is
     bounded the same way. A failed attempt closes the transport it opened, so
     a spawned stdio server does not outlive it; ending an HTTP session it

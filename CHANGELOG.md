@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Over stdio, the modern `server/discover` probe gave a newly spawned server
+  only `:era_probe_timeout` (2 s by default) to start and answer. Under the
+  default `:prefer_modern`, and under `:modern_only`, a server that took
+  longer to start failed to connect, and so did every reconnect to it, with
+  `{:era_probe_failed, {:transport_error, :handshake_timeout}}`: a BEAM
+  started with `mix run`, `npx` or `uvx` on a cold cache, or any server on a
+  loaded host. A slow legacy server's error answer, which `:prefer_modern`
+  falls back on, came too late as well. Over stdio the probe now waits as
+  long as a legacy `initialize` does, `:handshake_timeout` (10 s by
+  default), unless `:era_probe_timeout` is given. HTTP keeps the 2 s probe,
+  and the default `:establish_timeout` is unchanged. A stdio server that
+  never answers still fails, with the same error, and a probe timeout over
+  stdio is still not taken as evidence of a legacy server. **Behavior
+  change:** such a server now fails after `:handshake_timeout` rather than
+  after 2 s.
+
 ## [2.0.0-rc.6] — 2026-10-26
 
 ### Added
