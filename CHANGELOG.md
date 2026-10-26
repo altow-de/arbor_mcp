@@ -211,8 +211,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - OAuth token errors no longer crash `LogSanitizer` on `Jason.DecodeError` or
   leak the raw token-endpoint body. Structs and exception terms are sanitized
-  without enumerating them as maps, `Jason.DecodeError.data` is redacted, and
-  non-JSON token responses are returned without the raw HTTP body.
+  without enumerating them as maps, `Jason.DecodeError.data` and exception
+  messages are redacted, and map keys that aren't atoms or strings no longer
+  crash formatting. A non-JSON token or introspection error body is replaced
+  with `"[REDACTED]"` in the returned `{:http_error, status, body}`, and OAuth
+  error logs keep only the `error` code, not `error_description` or other
+  server-supplied fields.
 - `Context.report_progress/3` and `Context.send_log_message/3` returned
   `{:error, :request_not_streaming}` over BEAM, stdio and the test transport,
   so a handler could only report progress there through
