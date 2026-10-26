@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Servers can check JWT access tokens locally against the authorization
+  server's keys instead of introspecting each one: `jwks_uri:` in
+  `:auth_config` uses the new `Arbor.MCP.Authorization.JWTVerifier`, which
+  accepts only asymmetric signatures, keeps the key set for ten minutes and
+  fetches it again when a token names an unknown key (at most once a
+  minute). Any `Arbor.MCP.Authorization.TokenVerifier` can be plugged in with
+  `token_verifier:`, as the TypeScript SDK's `OAuthTokenVerifier` can. The
+  guard still binds such tokens to the configured issuer, audience and
+  scopes.
 - The client keeps results the server marks fresh, as the TypeScript SDK's
   client does: each `tools/list`, `prompts/list`, `resources/list` and
   `resources/templates/list` page and each `resources/read` is answered from

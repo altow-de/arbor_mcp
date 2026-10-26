@@ -16,6 +16,8 @@ defmodule Arbor.MCP.Application do
         Arbor.MCP.Internal.ConsentCache,
         # Remembers protocol-era observations across individual client processes
         Arbor.MCP.Client.EraCache,
+        # Authorization servers' keys, for checking JWT access tokens locally
+        Arbor.MCP.Authorization.JWKSCache,
         # Atomically consumes OAuth state and authorization codes
         {Arbor.MCP.Authorization.OAuthTransactionStore,
          Application.get_env(:arbor_mcp, Arbor.MCP.Authorization.OAuthTransactionStore, [])},

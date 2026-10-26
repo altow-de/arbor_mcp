@@ -7,6 +7,7 @@ defmodule Arbor.MCP.Server.RequestInfoTest do
   use ExUnit.Case, async: false
   import Plug.Conn
 
+  alias Arbor.MCP.Authorization.JWT
   alias Arbor.MCP.{Client, HttpPlug}
   alias Arbor.MCP.Server.{AuthInfo, Context, Runtime}
 
@@ -131,6 +132,55 @@ defmodule Arbor.MCP.Server.RequestInfoTest do
              "tag" => "t2",
              "auth" => %{"subject" => "carol", "token" => "host-token"}
            } = structured(conn)
+  end
+
+  test "a JWT access token checked against the issuer's keys reaches the handler" do
+    key = JWT.generate_rsa_key()
+    bypass = Bypass.open()
+
+    jwks = %{
+      "keys" => [
+        key
+        |> JWT.to_public_key()
+        |> JWT.to_map()
+        |> Map.put("kid", "k1")
+      ]
+    }
+
+    Bypass.stub(bypass, "GET", "/jwks", fn conn ->
+      conn |> put_resp_content_type("application/json") |> resp(200, Jason.encode!(jwks))
+    end)
+
+    auth_config = %{
+      realm: "request-info",
+      jwks_uri: "http://localhost:#{bypass.port}/jwks",
+      oauth_http: [allow_insecure_loopback: true],
+      expected_issuer: "https://issuer.example",
+      expected_audience: "https://mcp.example"
+    }
+
+    {:ok, token} =
+      JWT.sign(
+        Map.new(claims("dana"), fn {name, value} -> {to_string(name), value} end),
+        key,
+        kid: "k1",
+        typ: "at+jwt"
+      )
+
+    opts = mount(protocol_mode: :modern_only, oauth_enabled: true, auth_config: auth_config)
+    request = whoami(10) |> put_in(["params", "_meta"], modern_meta())
+
+    conn =
+      Plug.Test.conn(:post, "/mcp", Jason.encode!(request))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
+      |> put_req_header("mcp-protocol-version", "2026-07-28")
+      |> put_req_header("mcp-method", "tools/call")
+      |> put_req_header("mcp-name", "whoami")
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> HttpPlug.call(opts)
+
+    assert %{"auth" => %{"subject" => "dana", "client_id" => "mcp-client"}} = structured(conn)
   end
 
   test "an in-process request has an id but no session, auth or headers" do
