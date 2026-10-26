@@ -53,6 +53,7 @@ defmodule Arbor.MCP.Client do
     NotificationListener,
     Pagination,
     RequestHandler,
+    ResponseCache,
     Subscription
   }
 
@@ -84,6 +85,8 @@ defmodule Arbor.MCP.Client do
     :transport_mod,
     :transport_state,
     :server_info,
+    # The server's `instructions` from initialize or server/discover, or nil.
+    :server_instructions,
     :transport_opts,
     :pending_requests,
     :pending_batches,
@@ -112,6 +115,17 @@ defmodule Arbor.MCP.Client do
     # Monitor refs of in-flight async POST tasks (Streamable HTTP transport),
     # mapped to the request id each task serves.
     async_post_tasks: %{},
+    # Progress tokens of pending requests, mapped to their request ids, so a
+    # connection-level notifications/progress reaches the request it reports on.
+    progress_requests: %{},
+    # Requests made with reset_timeout_on_progress, mapped to the timer that
+    # runs out if they go that long without progress: {timer, tag, ms}.
+    progress_timeouts: %{},
+    # Each listed tool's outputSchema, from the tools/list results this client
+    # has seen, so call_tool/4 can check structuredContent against it.
+    tool_output_schemas: %{},
+    # Results the server marked fresh for a while (see ResponseCache).
+    response_cache: nil,
     # Linked processes of a transport (or receiver) this client has since
     # dropped, and that were still alive when it did. Their exit signals are
     # expected and are ignored rather than read as a foreign link's exit.
@@ -196,6 +210,10 @@ defmodule Arbor.MCP.Client do
     `baggage` values to attach to modern requests.
   - `:health_check_interval` - Interval in milliseconds between idle health
     check pings (default: 30_000). Set to `nil` or `0` to disable.
+  - `:response_cache` - Keep results the server marks fresh (see "Response
+    cache" below; default: `true`)
+  - `:default_cache_ttl_ms` - How long to keep a cacheable result that carries
+    no `ttlMs` (default: `0`, not kept)
   - `:reliability` - Reliability features configuration (optional)
   - `:retry_policy` - Default retry policy for all client operations (optional)
   - `:reconnect` - Automatically reconnect when the transport closes
@@ -219,6 +237,28 @@ defmodule Arbor.MCP.Client do
 
   Explicit `disconnect/1` or `stop/2` calls never trigger reconnection.
   Passing `reconnect: false` disables the behavior entirely.
+
+  ## Response cache
+
+  Like the TypeScript SDK's client, the client keeps each `tools/list`,
+  `prompts/list`, `resources/list` and `resources/templates/list` page (by
+  cursor) and each `resources/read` (by URI) for as long as its `ttlMs` says
+  it stays fresh (2026-07-28 "Caching"), at most a day, and answers a repeat
+  request from it. A result without `ttlMs`, as from a legacy server, is kept
+  for `:default_cache_ttl_ms`; an interim result such as `input_required`
+  never is. Application `_meta` on a request is part of what it's kept under.
+  A `list_changed` notification drops the lists it names and a
+  `resources/updated` notification drops that resource, even while a request
+  for them is in flight; reconnecting drops everything, and a client that
+  isn't connected doesn't answer from it. The cache holds at most 512
+  results, 16 MiB in all and none over 1 MiB. It belongs to one client, which
+  is one authorization context, so a `cacheScope: "private"` result is never
+  shared; a client whose credentials change to another user's should pass
+  `response_cache: false`.
+
+  Pass `cache_mode: :refresh` to ask the server again and keep the new
+  result, or `cache_mode: :bypass` to ask without using or changing the
+  cache. A cache hit emits `[:arbor_mcp, :client, :cache, :hit]`.
 
   ## Health Checks
 
@@ -379,10 +419,12 @@ defmodule Arbor.MCP.Client do
   passed in a connection spec remain borrowed. This helper accepts connection
   specs, rather than existing client PIDs.
 
-  `:establish_timeout` (default 12_000) and `:cleanup_timeout` (default 1_000)
-  are positive finite milliseconds. Establishment uses one cutoff across the
+  `:establish_timeout` (default 12_000) and `:cleanup_timeout` (default 1_000,
+  or a stdio server's shutdown budget plus 500 when that is longer: 3_000 with
+  the stdio defaults) are positive finite milliseconds. Establishment uses one cutoff across the
   native constructor and protocol handshake. Cleanup uses a separate single
-  cutoff. `:max_scope_workers` bounds owned reverse-request workers (default 256).
+  cutoff; it bounds the scope only, so set a stdio server's `:eof_grace` or
+  `:cleanup_timeout` in the connection spec. `:max_scope_workers` bounds owned reverse-request workers (default 256).
   Helper names must be local atoms. A stdio child requires a typed cleanup receipt;
   a legacy HTTP session DELETE remains explicitly unconfirmed even after local
   resources close. Arbitrary unregistered custom transport effects are outside
@@ -409,7 +451,8 @@ defmodule Arbor.MCP.Client do
   it does not send a protocol ping on an existing client. Returns `:ok` only
   after scoped cleanup succeeds. The server and host listener remain borrowed.
   `:establish_timeout` (default 12_000 ms) and `:cleanup_timeout` (default
-  1_000 ms) are finite budgets from `with_connection/3`.
+  1_000 ms, longer for stdio as in `with_connection/3`) are finite budgets from
+  `with_connection/3`.
   """
   @spec probe(connection_spec(), keyword()) :: :ok | {:error, term()}
   def probe(spec, opts \\ []) do
@@ -487,6 +530,8 @@ defmodule Arbor.MCP.Client do
 
   - `:timeout` - Request timeout (default: 5000)
   - `:format` - Return format (:map or :struct, default: :struct)
+  - `:cache_mode` - `:use`, `:refresh` or `:bypass` (see "Response cache"
+    in the module docs; default: `:use`)
   """
   @spec list_tools(t(), keyword() | timeout()) ::
           {:ok, Arbor.MCP.Response.t() | map()} | {:error, term()}
@@ -549,9 +594,21 @@ defmodule Arbor.MCP.Client do
   @doc """
   Calls a tool with the given arguments.
 
+  Calls on one client run concurrently on every transport. When a call times
+  out, the client cancels it on the server, as the MCP spec asks: it sends
+  `notifications/cancelled`, or over modern Streamable HTTP closes the
+  request's connection. Servers no longer stop work on their own after 10 s,
+  so pass a `:timeout` that fits the tool.
+
   ## Options
 
   - `:timeout` - Request timeout (default: 30000)
+  - `:reset_timeout_on_progress` - When `true`, `:timeout` is how long the
+    call may go without a progress update, as with the TypeScript SDK's
+    `resetTimeoutOnProgress`; a progress token is added if the call has none
+    (default: `false`)
+  - `:max_total_timeout` - With `:reset_timeout_on_progress`, the longest the
+    call may take however much progress it makes (default: no limit)
   - `:format` - Return format (:map or :struct, default: :struct)
   """
   @spec call_tool(t(), String.t(), map(), keyword() | timeout()) ::
@@ -636,7 +693,7 @@ defmodule Arbor.MCP.Client do
   end
 
   @doc """
-  Lists available resources.
+  Lists available resources. Takes `:cache_mode`, as `list_tools/2` does.
   """
   @spec list_resources(t(), keyword() | timeout()) ::
           {:ok, Arbor.MCP.Response.t() | map()} | {:error, term()}
@@ -678,7 +735,7 @@ defmodule Arbor.MCP.Client do
   Lists available resource templates.
 
   Sends a `resources/templates/list` request to the server to retrieve the list of
-  available resource templates.
+  available resource templates. Takes `:cache_mode`, as `list_tools/2` does.
   """
   @spec list_resource_templates(t(), keyword() | timeout()) ::
           {:ok, Arbor.MCP.Response.t() | map()} | {:error, term()}
@@ -694,7 +751,7 @@ defmodule Arbor.MCP.Client do
   end
 
   @doc """
-  Reads a resource by URI.
+  Reads a resource by URI. Takes `:cache_mode`, as `list_tools/2` does.
   """
   @spec read_resource(t(), String.t(), keyword() | timeout()) ::
           {:ok, Arbor.MCP.Response.t() | map()} | {:error, term()}
@@ -886,7 +943,7 @@ defmodule Arbor.MCP.Client do
   end
 
   @doc """
-  Lists available prompts.
+  Lists available prompts. Takes `:cache_mode`, as `list_tools/2` does.
   """
   @spec list_prompts(t(), keyword() | timeout()) ::
           {:ok, Arbor.MCP.Response.t() | map()} | {:error, term()}
@@ -1008,6 +1065,19 @@ defmodule Arbor.MCP.Client do
   def server_info(client) do
     case get_status(client) do
       {:ok, %{server_info: info}} -> {:ok, info}
+      _ -> {:error, :not_connected}
+    end
+  end
+
+  @doc """
+  Gets the instructions the server gave for using it (`instructions` in its
+  initialize or server/discover result), or `nil` when it gave none. Clients
+  typically add them to a model's context.
+  """
+  @spec instructions(t()) :: {:ok, String.t() | nil} | {:error, any()}
+  def instructions(client) do
+    case get_status(client) do
+      {:ok, %{server_instructions: instructions}} -> {:ok, instructions}
       _ -> {:error, :not_connected}
     end
   end
@@ -1317,7 +1387,8 @@ defmodule Arbor.MCP.Client do
       initialized: false,
       default_retry_policy: Keyword.get(opts, :retry_policy, []),
       default_timeout: Keyword.get(opts, :timeout, 5_000),
-      async_post_tasks: %{}
+      async_post_tasks: %{},
+      response_cache: ResponseCache.new(opts)
     }
   end
 
@@ -1366,7 +1437,14 @@ defmodule Arbor.MCP.Client do
           %{transport: updated_state.transport_mod}
         )
 
-        final_state = %{updated_state | connection_status: :ready, initialized: true}
+        final_state = %{
+          updated_state
+          | connection_status: :ready,
+            initialized: true,
+            tool_output_schemas: %{},
+            response_cache: ResponseCache.clear(updated_state.response_cache)
+        }
+
         {:ok, schedule_next_health_check(final_state)}
 
       {:error, reason} ->
@@ -1717,10 +1795,14 @@ defmodule Arbor.MCP.Client do
     {:reply, cleanup_result, new_state}
   end
 
+  def handle_call({:tool_output_schema, name}, _from, state),
+    do: {:reply, Map.get(state.tool_output_schemas, name), state}
+
   def handle_call(:get_status, _from, state) do
     status = %{
       connection_status: state.connection_status,
       server_info: state.server_info,
+      server_instructions: state.server_instructions,
       server_capabilities: state.server_capabilities,
       protocol_version: state.protocol_version,
       transport: state.transport_mod,
@@ -1739,7 +1821,8 @@ defmodule Arbor.MCP.Client do
         state
         | protocol_version: version,
           server_capabilities: discovery.capabilities,
-          server_info: discovery.server_info
+          server_info: discovery.server_info,
+          server_instructions: discovery.instructions
       }
 
       {:reply, :ok, updated_state}
@@ -1761,28 +1844,7 @@ defmodule Arbor.MCP.Client do
       | cancelled_requests: MapSet.put(state.cancelled_requests, request_id)
     }
 
-    # Modern streamable HTTP cancels an ordinary request by closing only that
-    # request's response stream. Other transports retain the protocol
-    # cancellation notification.
-    updated_state =
-      case updated_state do
-        %{transport_mod: HTTP, transport_state: %HTTP{protocol_era: :modern}} ->
-          RequestHandler.close_request_stream(request_id, updated_state)
-
-        %{transport_mod: LegacySSE} ->
-          retired_state = RequestHandler.close_request_stream(request_id, updated_state)
-
-          {:noreply, notified_state} =
-            RequestHandler.handle_cast_notification(method, params, retired_state)
-
-          notified_state
-
-        _other ->
-          {:noreply, notified_state} =
-            RequestHandler.handle_cast_notification(method, params, updated_state)
-
-          notified_state
-      end
+    updated_state = cancel_on_wire(request_id, method, params, updated_state)
 
     # Check if this request is still pending and complete it with :cancelled error
     case Map.get(state.pending_requests, request_id) do
@@ -1849,6 +1911,15 @@ defmodule Arbor.MCP.Client do
     RequestHandler.parse_transport_message(message, state)
   end
 
+  # A notification or request on a legacy POST's event stream (see
+  # Arbor.MCP.Transport.HTTP.PostStream). Acknowledged on receipt, so a slow
+  # handler doesn't hold up the stream, and at most one more message from it
+  # waits here meanwhile.
+  def handle_info({:http_post_stream_message, task, ref, message}, state) do
+    send(task, {:http_post_stream_ack, ref})
+    RequestHandler.parse_transport_message(message, state)
+  end
+
   def handle_info(
         {:modern_http_stream_message, stream_pid, request_id, message},
         %{
@@ -1867,18 +1938,42 @@ defmodule Arbor.MCP.Client do
     result
   end
 
+  # One of this client's legacy POST tasks got a 401 or 403, as a modern
+  # request stream can: answered here, in turn with every other challenge,
+  # and the task sends its request again with the token.
   def handle_info(
-        {:modern_http_stream_auth_updated, stream_pid, request_id, changes},
+        {:http_post_auth_challenge, task, ref, challenge},
+        %{transport_mod: HTTP, transport_state: %HTTP{} = transport_state} = state
+      )
+      when is_pid(task) and is_map(challenge) do
+    if own_post_task?(state, task) do
+      {result, transport_state} = answer_stream_challenge(transport_state, challenge)
+      send(task, {:http_post_auth_result, ref, result})
+      {:noreply, %{state | transport_state: transport_state}}
+    else
+      send(task, {:http_post_auth_result, ref, {:error, :stream_retired}})
+      {:noreply, state}
+    end
+  end
+
+  # A modern request stream got a 401 or 403. Answering here, one challenge at
+  # a time, means concurrent streams run one refresh or OAuth flow between
+  # them, and a stream whose token another one already replaced just retries
+  # with the new token.
+  def handle_info(
+        {:modern_http_stream_auth_challenge, stream_pid, request_id, ref, challenge},
         %{
           transport_mod: HTTP,
           transport_state: %HTTP{} = transport_state
         } = state
       )
-      when is_map(changes) do
+      when is_map(challenge) do
     if HTTP.stream_owner?(transport_state, request_id, stream_pid) do
-      transport_state = merge_modern_stream_auth_state(transport_state, changes)
+      {result, transport_state} = answer_stream_challenge(transport_state, challenge)
+      send(stream_pid, {:modern_http_stream_auth_result, ref, result})
       {:noreply, %{state | transport_state: transport_state}}
     else
+      send(stream_pid, {:modern_http_stream_auth_result, ref, {:error, :stream_retired}})
       {:noreply, state}
     end
   end
@@ -2000,7 +2095,7 @@ defmodule Arbor.MCP.Client do
     if current_async_post?(state, meta) do
       state = merge_async_transport_state(state, meta)
       state = finish_async_post(state, meta)
-      handle_async_post_result(result, Map.get(meta, :request_id), state)
+      handle_async_post_result(result, meta, state)
     else
       {:noreply, state}
     end
@@ -2009,7 +2104,7 @@ defmodule Arbor.MCP.Client do
   # Legacy 2-tuple shape (no metadata) kept for compatibility.
   def handle_info({:async_post_result, result}, state) do
     if is_nil(Lifetime.current()),
-      do: handle_async_post_result(result, nil, state),
+      do: handle_async_post_result(result, %{}, state),
       else: {:noreply, state}
   end
 
@@ -2026,8 +2121,17 @@ defmodule Arbor.MCP.Client do
 
   def handle_info({:async_post_task, ref, pid, request_id}, state)
       when is_reference(ref) and is_pid(pid) do
-    tasks = Map.put(state.async_post_tasks || %{}, ref, {pid, request_id})
-    {:noreply, %{state | async_post_tasks: tasks}}
+    if Process.alive?(pid) or down_queued?(ref) do
+      tasks = Map.put(state.async_post_tasks || %{}, ref, {pid, request_id})
+      {:noreply, %{state | async_post_tasks: tasks}}
+    else
+      # A task starts its POST only after this registration was queued, so
+      # its result and :DOWN come later. One already gone, with no :DOWN
+      # left to come, was refused a worker before it could send anything;
+      # that :DOWN came first and found nothing registered.
+      error = RequestHandler.not_sent_error(:client_worker_unavailable, state)
+      {:noreply, fail_unsent_post(state, request_id, error)}
+    end
   end
 
   def handle_info({:async_post_task, ref, request_id}, state) when is_reference(ref) do
@@ -2228,12 +2332,21 @@ defmodule Arbor.MCP.Client do
   # Default-timeout enforcement for requests made without an explicit
   # :timeout option (scheduled by RequestHandler). Stale timers for requests
   # that already completed find no pending entry and are ignored.
+  # A request made with reset_timeout_on_progress went its timeout without
+  # progress, and times out as it would at its deadline.
+  def handle_info({:progress_timeout, request_id, tag}, state) do
+    case RequestHandler.progress_timed_out(request_id, tag, state) do
+      {:timed_out, state} -> handle_info({:request_timeout, request_id}, state)
+      {:stale, state} -> {:noreply, state}
+    end
+  end
+
   def handle_info({:request_timeout, request_id}, state) do
     case Map.get(state.pending_requests, request_id) do
       {from, :single, _method} ->
         GenServer.reply(from, {:error, :timeout})
 
-        state = RequestHandler.close_request_stream(request_id, state)
+        state = cancel_timed_out(request_id, state)
 
         {:noreply,
          prune_legacy_posts(%{
@@ -2244,7 +2357,7 @@ defmodule Arbor.MCP.Client do
       {from, :single} ->
         GenServer.reply(from, {:error, :timeout})
 
-        state = RequestHandler.close_request_stream(request_id, state)
+        state = cancel_timed_out(request_id, state)
 
         {:noreply,
          prune_legacy_posts(%{
@@ -2449,20 +2562,71 @@ defmodule Arbor.MCP.Client do
     %{state | async_post_tasks: tasks}
   end
 
-  defp handle_async_post_result({:ok, _new_ts, response_data}, _request_id, state) do
-    # POST response contains data — parse it as a transport message
-    RequestHandler.parse_transport_message(response_data, state)
+  defp handle_async_post_result({:ok, _new_ts, response_data}, meta, state) do
+    state = cache_tool_list(state, Map.get(meta, :tool_list), response_data)
+    RequestHandler.handle_post_response(response_data, Map.get(meta, :request_id), state)
   end
 
-  defp handle_async_post_result({:ok, _new_ts}, _request_id, state) do
+  defp handle_async_post_result({:ok, _new_ts}, _meta, state) do
     # POST returned but no inline data — result will come via SSE stream
     {:noreply, state}
   end
 
-  defp handle_async_post_result({:error, reason}, request_id, state) do
-    Logger.error("Async POST failed", reason: LogSummary.describe(reason))
-    {:noreply, fail_async_post_request(state, request_id, reason)}
+  # The server asked the task's POST to authenticate. Re-sending from this
+  # process runs at most one authentication at a time, and later challenges
+  # reuse the credentials it obtained. A POST that carried no request (a
+  # notification, a batch, a reply to a server request) is re-sent too; a
+  # request whose caller has given up is not.
+  defp handle_async_post_result({:error, {:reauthenticate, message}}, meta, state) do
+    request_id = Map.get(meta, :request_id)
+
+    if is_nil(request_id) or Map.has_key?(state.pending_requests, request_id),
+      do: resend_authenticated(message, meta, state),
+      else: {:noreply, state}
   end
+
+  # The caller receives the failure, as from a synchronous send, so it is not
+  # logged as an error here.
+  defp handle_async_post_result({:error, reason}, meta, state) do
+    Logger.debug("Async POST failed", reason: LogSummary.describe(reason))
+
+    {:noreply,
+     fail_async_post_request(state, Map.get(meta, :request_id), reason, Map.get(meta, :deadline))}
+  end
+
+  defp resend_authenticated(message, meta, state) do
+    request_id = Map.get(meta, :request_id)
+    deadline = Map.get(meta, :deadline)
+    previous = Deadline.on_transport(HTTP, state.transport_state)
+    transport = Deadline.put_on_transport(HTTP, state.transport_state, deadline)
+    restore = &%{state | transport_state: Deadline.put_on_transport(HTTP, &1, previous)}
+
+    case HTTP.send_authenticated(message, transport) do
+      {:ok, transport, response_data} ->
+        RequestHandler.handle_post_response(response_data, request_id, restore.(transport))
+
+      {:ok, transport} ->
+        {:noreply, restore.(transport)}
+
+      {:error, reason, transport} ->
+        Logger.debug("Authenticated resend failed", reason: LogSummary.describe(reason))
+        {:noreply, fail_async_post_request(restore.(transport), request_id, reason, deadline)}
+
+      {:error, reason} ->
+        Logger.debug("Authenticated resend failed", reason: LogSummary.describe(reason))
+        {:noreply, fail_async_post_request(state, request_id, reason, deadline)}
+    end
+  end
+
+  defp cache_tool_list(
+         %{transport_mod: HTTP, transport_state: %HTTP{} = transport} = state,
+         kind,
+         data
+       )
+       when kind in [:first, :cursor],
+       do: %{state | transport_state: HTTP.cache_tool_list(transport, kind, data)}
+
+  defp cache_tool_list(state, _kind, _data), do: state
 
   # Merge the durable transport-state changes computed by an async POST task
   # (session id rotation, OAuth token/auth state, SSE retry metadata) into the
@@ -2480,6 +2644,51 @@ defmodule Arbor.MCP.Client do
       %{state | transport_state: Map.merge(state.transport_state, changes)}
     else
       state
+    end
+  end
+
+  defp own_post_task?(state, task) do
+    Enum.any?(state.async_post_tasks || %{}, fn
+      {_ref, {pid, _request_id}} -> pid == task
+      _other -> false
+    end)
+  end
+
+  defp answer_stream_challenge(%HTTP{access_token: current} = transport_state, challenge)
+       when is_binary(current) and current != :erlang.map_get(:token, challenge) do
+    # Another stream replaced the rejected token. That answers a 401; a 403
+    # needs the challenged scopes, which a refresh alone doesn't add.
+    if challenge.status == 401 or
+         scopes_granted?(transport_state.auth_provider_state, challenge.scopes),
+       do: {{:ok, current}, transport_state},
+       else: run_stream_challenge(transport_state, challenge)
+  end
+
+  defp answer_stream_challenge(%HTTP{auth_provider: nil} = transport_state, _challenge),
+    do: {{:error, :no_auth_provider}, transport_state}
+
+  defp answer_stream_challenge(transport_state, challenge),
+    do: run_stream_challenge(transport_state, challenge)
+
+  defp scopes_granted?(%{granted_scopes: granted}, [_ | _] = scopes) when is_list(granted),
+    do: Enum.all?(scopes, &(&1 in granted))
+
+  defp scopes_granted?(_provider_state, _scopes), do: false
+
+  defp run_stream_challenge(%HTTP{auth_provider: provider} = transport_state, challenge) do
+    callback = if challenge.status == 401, do: :handle_unauthorized, else: :handle_forbidden
+    args = [challenge.www_authenticate, challenge.scopes, transport_state.auth_provider_state]
+
+    case apply(provider, callback, args) do
+      {:ok, token, provider_state} when is_binary(token) ->
+        changes = %{access_token: token, auth_provider_state: provider_state}
+        {{:ok, token}, merge_modern_stream_auth_state(transport_state, changes)}
+
+      {:error, reason, provider_state} ->
+        {{:error, reason}, %{transport_state | auth_provider_state: provider_state}}
+
+      other ->
+        {{:error, {:invalid_provider_response, other}}, transport_state}
     end
   end
 
@@ -2539,15 +2748,75 @@ defmodule Arbor.MCP.Client do
   # Fail the pending request an async POST task was serving. Batch members,
   # notifications (nil id), and already-completed requests are left to the
   # normal timeout/cleanup path.
-  defp fail_async_post_request(state, request_id, reason) do
+  # Modern streamable HTTP cancels an ordinary request by closing only that
+  # request's connection. Other transports send the protocol cancellation
+  # notification.
+  defp cancel_on_wire(request_id, method, params, state) do
+    case state do
+      %{transport_mod: HTTP, transport_state: %HTTP{protocol_era: :modern}} ->
+        RequestHandler.close_request_stream(request_id, state)
+
+      %{transport_mod: LegacySSE} ->
+        retired_state = RequestHandler.close_request_stream(request_id, state)
+
+        {:noreply, notified_state} =
+          RequestHandler.handle_cast_notification(method, params, retired_state)
+
+        notified_state
+
+      _other ->
+        # Over legacy HTTP this POSTs from its own task, so a cancellation the
+        # server is slow to accept cannot hold the client.
+        RequestHandler.send_notification_async(method, params, state)
+    end
+  end
+
+  # The spec asks a sender to cancel a request it stops waiting for, so the
+  # server can stop the work; servers no longer cut it off after 10 s.
+  defp cancel_timed_out(request_id, state) do
+    case Protocol.encode_cancelled(request_id, "Request timed out") do
+      {:ok, %{"method" => method, "params" => params}} ->
+        cancel_on_wire(request_id, method, params, state)
+
+      {:error, :cannot_cancel_initialize} ->
+        RequestHandler.close_request_stream(request_id, state)
+    end
+  end
+
+  # A POST that failed at or after its caller's deadline is the caller's
+  # timeout, answered as a synchronous send was, and is cancelled on the
+  # server: the client's own timeout timer finds nothing left to cancel.
+  defp down_queued?(ref) do
+    {:messages, messages} = Process.info(self(), :messages)
+    Enum.any?(messages, &match?({:DOWN, ^ref, :process, _pid, _reason}, &1))
+  end
+
+  defp fail_unsent_post(state, request_id, error) do
+    case request_id && Map.get(state.pending_requests, request_id) do
+      {from, :single, _method} -> GenServer.reply(from, {:error, error})
+      {from, :single} -> GenServer.reply(from, {:error, error})
+      _other -> :ok
+    end
+
+    %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+  end
+
+  defp fail_async_post_request(state, request_id, reason, deadline \\ nil) do
+    timed_out? =
+      reason != :deadline_expired and is_integer(deadline) and Deadline.expired?(deadline)
+
+    error = if timed_out?, do: :timeout, else: RequestHandler.send_error(reason, state)
+
     case request_id && Map.get(state.pending_requests, request_id) do
       {from, :single, _method} ->
-        GenServer.reply(from, {:error, {:transport_error, reason}})
-        %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+        GenServer.reply(from, {:error, error})
+        state = %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+        if timed_out?, do: cancel_timed_out(request_id, state), else: state
 
       {from, :single} ->
-        GenServer.reply(from, {:error, {:transport_error, reason}})
-        %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+        GenServer.reply(from, {:error, error})
+        state = %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+        if timed_out?, do: cancel_timed_out(request_id, state), else: state
 
       _ ->
         state
@@ -3084,7 +3353,10 @@ defmodule Arbor.MCP.Client do
               initialized: true,
               reconnect_attempts: 0,
               cleanup_result: :ok,
-              health_check_id: nil
+              health_check_id: nil,
+              # A new connection may be to a changed server.
+              tool_output_schemas: %{},
+              response_cache: ResponseCache.clear(connected_state.response_cache)
           })
 
         notify_subscription_processes(reconnected_state, :client_subscription_reconnect)
@@ -3289,13 +3561,22 @@ defmodule Arbor.MCP.Client do
         %{"type" => "ref/resource", "uri" => "file:///"},
         %{"name" => "path", "value" => "/src"}
       )
+
+      # Pass the values of the other arguments (protocol 2025-06-18 and later)
+      {:ok, result} = Arbor.MCP.Client.complete(
+        client,
+        %{"type" => "ref/prompt", "name" => "code_generator"},
+        %{"name" => "framework", "value" => "ph"},
+        context: %{"arguments" => %{"language" => "elixir"}}
+      )
   """
   @spec complete(t(), map(), map(), keyword()) :: {:ok, map()} | {:error, any()}
   def complete(client, ref, argument, opts \\ []) do
     params =
       ref
       |> RequestParams.completion(argument)
-      |> RequestParams.with_opts_meta(opts)
+      |> Arbor.MCP.Internal.Maps.put_present("context", Keyword.get(opts, :context))
+      |> RequestParams.with_opts_meta(Keyword.delete(opts, :context))
 
     make_request(client, "completion/complete", params, opts, 5_000)
   end

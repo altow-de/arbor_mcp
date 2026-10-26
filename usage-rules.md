@@ -101,6 +101,11 @@ defmodule MyApp.EchoServer do
 end
 ```
 
+- Servers run callbacks concurrently by default. Set handler state up in
+  `init/1` or `handle_initialize/2`; other callbacks must return it unchanged,
+  so keep counters, caches and other mutable data in a GenServer, Agent or ETS
+  table. Only when callbacks must thread state should the server start with
+  `execution: :stateful`, which runs them one at a time.
 - Follow `docs/DSL_GUIDE.md` for tool, resource, template and prompt
   syntax and callback result forms. Use public result constructors rather than
   calling result-normalization or argument-preparation implementation helpers.

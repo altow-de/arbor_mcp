@@ -8,7 +8,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
   require Logger
   alias Arbor.MCP.Client.{ConnectionScope, Lifetime}
-  alias Arbor.MCP.Client.{Deadline, InputDispatcher, MRTR, NotificationListener}
+  alias Arbor.MCP.Client.{Deadline, InputDispatcher, MRTR, NotificationListener, ResponseCache}
   alias Arbor.MCP.Error
   alias Arbor.MCP.Internal.{Maps, Protocol, RequestParams, VersionRegistry}
   alias Arbor.RPC.{JSONRPC, LogSummary}
@@ -47,13 +47,54 @@ defmodule Arbor.MCP.Client.RequestHandler do
   def handle_request(method, params, from, state, meta \\ %{timeout: :caller_enforced}) do
     case undeliverable(from, meta) do
       nil ->
-        id = Protocol.generate_id()
-        send_built_request(method, params, id, from, state, meta)
+        case cached_result(method, params, meta, state) do
+          {:ok, result} ->
+            {:reply, {:ok, result}, state}
+
+          :miss ->
+            id = Protocol.generate_id()
+            send_built_request(method, params, id, from, state, meta)
+        end
 
       cause ->
         {:reply, {:error, not_sent_error(cause, state)}, state}
     end
   end
+
+  # A result the server said is still fresh is answered without asking it
+  # again (see ResponseCache), unless the call asked to refresh or bypass it.
+  # Only while connected: a disconnected client says so.
+  defp cached_result(method, params, meta, state) do
+    with :use <- Map.get(meta, :cache_mode, :use),
+         :ready <- Map.get(state, :connection_status),
+         %ResponseCache{} = cache <- Map.get(state, :response_cache),
+         {:ok, result} <- ResponseCache.lookup(cache, ResponseCache.key(method, params), now()) do
+      :telemetry.execute([:arbor_mcp, :client, :cache, :hit], %{}, %{method: method})
+      {:ok, result}
+    else
+      _miss_or_not_used -> :miss
+    end
+  end
+
+  # Remembers what a cacheable request in flight will answer.
+  defp track_cacheable(state, id, request, meta) do
+    case {Map.get(meta, :cache_mode, :use), Map.get(state, :response_cache)} do
+      {mode, %ResponseCache{} = cache} when mode != :bypass ->
+        key = ResponseCache.key(request["method"], request["params"])
+        pending? = &Map.has_key?(state.pending_requests, &1)
+        %{state | response_cache: ResponseCache.track(cache, id, key, pending?)}
+
+      _bypassed_or_none ->
+        state
+    end
+  end
+
+  defp cache_result(%{response_cache: %ResponseCache{} = cache} = state, id, reply),
+    do: %{state | response_cache: ResponseCache.store(cache, id, reply, now())}
+
+  defp cache_result(state, _id, _reply), do: state
+
+  defp now, do: System.monotonic_time(:millisecond)
 
   # Liveness and monotonic time are only comparable on the caller's own node.
   defp undeliverable({caller, _tag}, meta) when is_pid(caller) and node(caller) == node() do
@@ -231,6 +272,28 @@ defmodule Arbor.MCP.Client.RequestHandler do
   end
 
   defp send_request(request, method, id, from, state, meta) do
+    if progress_token_in_use?(request, state),
+      do: {:reply, {:error, not_sent_error(:duplicate_progress_token, state)}, state},
+      else: send_unique_request(request, method, id, from, state, meta)
+  end
+
+  # Progress names its request only by token, so a token that a pending
+  # request already carries would route that request's progress here.
+  defp progress_token_in_use?(request, state) do
+    case get_in(request, ["params", "_meta", "progressToken"]) do
+      nil ->
+        false
+
+      token ->
+        case Map.get(Map.get(state, :progress_requests) || %{}, token) do
+          nil -> false
+          owner -> Map.has_key?(state.pending_requests, owner)
+        end
+    end
+  end
+
+  defp send_unique_request(request, method, id, from, state, meta) do
+    state = mark_tool_listing(state, method, id, request)
     {deadline, meta} = request_send_context(from, state, meta)
 
     result =
@@ -245,14 +308,17 @@ defmodule Arbor.MCP.Client.RequestHandler do
     case result do
       {:ok, updated_state, response_data} ->
         # Non-SSE HTTP returns response immediately
+        updated_state = track_cacheable(updated_state, id, request, meta)
         inline_request_response(response_data, method, id, updated_state)
 
       {:ok, updated_state} ->
         # SSE and streaming transports - track pending request
         maybe_schedule_request_timeout(id, meta, updated_state)
+        updated_state = track_cacheable(updated_state, id, request, meta)
+        updated_state = start_progress_timeout(id, meta, updated_state)
         pending_requests = Map.put(updated_state.pending_requests, id, {from, :single, method})
         new_state = %{updated_state | pending_requests: pending_requests}
-        {:noreply, new_state}
+        {:noreply, remember_progress_token(request, id, new_state)}
 
       {:error, :not_connected} ->
         {:reply, {:error, :not_connected}, state}
@@ -296,7 +362,16 @@ defmodule Arbor.MCP.Client.RequestHandler do
           %{method: method, request_id: id}
         )
 
-        {:reply, validate_result(result, updated_state, method), updated_state}
+        reply = validate_result(result, updated_state, method)
+
+        updated_state =
+          if match?({:ok, _result}, reply),
+            do: remember_tool_schemas(updated_state, method, id, reply),
+            else: updated_state
+
+        updated_state = cache_result(updated_state, id, reply)
+
+        {:reply, reply, updated_state}
 
       {:error, error_data, _id} ->
         :telemetry.execute(
@@ -327,9 +402,12 @@ defmodule Arbor.MCP.Client.RequestHandler do
         do: Deadline.after_ms(state.default_timeout || 5_000),
         else: deadline
 
-    deadline
-    |> Deadline.earliest(transport.deadline)
-    |> Deadline.earliest(Deadline.after_ms(transport.timeouts.request))
+    deadline = Deadline.earliest(deadline, transport.deadline)
+
+    # A request that its progress keeps alive runs to its own deadline.
+    if meta[:progress_timeout],
+      do: deadline,
+      else: Deadline.earliest(deadline, Deadline.after_ms(transport.timeouts.request))
   end
 
   defp remote_relative_deadline(%{timeout: ms}) when is_integer(ms) and ms >= 0,
@@ -433,6 +511,14 @@ defmodule Arbor.MCP.Client.RequestHandler do
     if byte_size(encoded) <= limit, do: :ok, else: {:error, :request_too_large}
   end
 
+  @doc false
+  # The caller's error for a send that failed after it was handed to the
+  # transport, including one made from an async HTTP task: the same shape
+  # whether the send was synchronous or not.
+  def send_error(:deadline_expired, state), do: not_sent_error(:deadline_expired, state)
+  def send_error(:caller_gone, state), do: not_sent_error(:caller_gone, state)
+  def send_error(reason, state), do: send_failure(reason, state)
+
   # The transport's reason is kept as a term, so a caller can tell a request
   # that never left (see Arbor.MCP.Client.delivery_outcome/1) from one that may
   # have; `message` is kept for callers that read the text.
@@ -490,11 +576,23 @@ defmodule Arbor.MCP.Client.RequestHandler do
     if stream_requested? do
       open_request_stream(request, state, transport_state)
     else
-      send_message(request, state)
+      send_http_request(request, state)
     end
   end
 
+  defp send_request_message(request, %{transport_mod: HTTP, transport_state: %HTTP{}} = state),
+    do: send_http_request(request, state)
+
   defp send_request_message(request, state), do: send_message(request, state)
+
+  # Each request POSTs from its own task, so one slow request does not hold
+  # the client: other requests and server messages proceed meanwhile.
+  defp send_http_request(request, state) do
+    with {:ok, encoded} <- encode_for_transport(HTTP, request),
+         {:ok, transport_state} <- HTTP.send_async(encoded, state.transport_state) do
+      {:ok, %{state | transport_state: transport_state}}
+    end
+  end
 
   defp open_request_stream(request, state, transport_state) do
     with {:ok, encoded} <- encode_for_transport(HTTP, request),
@@ -527,11 +625,77 @@ defmodule Arbor.MCP.Client.RequestHandler do
   # caller-side timeout authoritative.
   defp maybe_schedule_request_timeout(id, %{timeout: caller_timeout}, _state)
        when is_integer(caller_timeout) do
-    Process.send_after(self(), {:request_timeout, id}, caller_timeout + @caller_timeout_grace)
+    # A request without a total limit has the longest timer Erlang allows.
+    after_ms = min(caller_timeout + @caller_timeout_grace, 4_294_967_295)
+    Process.send_after(self(), {:request_timeout, id}, after_ms)
     :ok
   end
 
   defp maybe_schedule_request_timeout(_id, _meta, _state), do: :ok
+
+  # With reset_timeout_on_progress, a request also times out once it has
+  # gone :progress_timeout ms without progress (see Internal.Request); each
+  # progress update starts that again. Its deadline still caps it. The tag
+  # tells the current timer from one a reset replaced.
+  defp start_progress_timeout(id, %{progress_timeout: ms}, state)
+       when is_integer(ms) and ms >= 0 do
+    tag = make_ref()
+    timer = Process.send_after(self(), {:progress_timeout, id, tag}, ms)
+
+    # Settled requests' timers are dropped here too, so the map never holds
+    # more than the pending requests that asked for one.
+    {timers, settled} =
+      Map.split_with(progress_timeouts(state), fn {request_id, _timer} ->
+        Map.has_key?(state.pending_requests, request_id)
+      end)
+
+    Enum.each(settled, fn {_request_id, {old_timer, _tag, _ms}} ->
+      Process.cancel_timer(old_timer)
+    end)
+
+    Map.put(state, :progress_timeouts, Map.put(timers, id, {timer, tag, ms}))
+  end
+
+  defp start_progress_timeout(_id, _meta, state), do: state
+
+  defp reset_progress_timeout(request_id, state) do
+    with {timer, _tag, ms} <- Map.get(progress_timeouts(state), request_id),
+         true <- Map.has_key?(state.pending_requests, request_id) do
+      Process.cancel_timer(timer)
+      start_progress_timeout(request_id, %{progress_timeout: ms}, state)
+    else
+      _no_timer_or_settled -> state
+    end
+  end
+
+  @doc false
+  # A settled request's timer is dropped when it runs out, so the map holds
+  # only timers still due.
+  @spec progress_timed_out(term(), reference(), map()) :: {:timed_out | :stale, map()}
+  def progress_timed_out(request_id, tag, state) do
+    timers = progress_timeouts(state)
+
+    case Map.get(timers, request_id) do
+      {_timer, ^tag, _ms} ->
+        {:timed_out, Map.put(state, :progress_timeouts, Map.delete(timers, request_id))}
+
+      _replaced_or_gone ->
+        {:stale, state}
+    end
+  end
+
+  defp progress_timeouts(state), do: Map.get(state, :progress_timeouts) || %{}
+
+  defp cancel_progress_timeout(state, request_id) do
+    case Map.pop(progress_timeouts(state), request_id) do
+      {{timer, _tag, _ms}, timers} ->
+        Process.cancel_timer(timer)
+        Map.put(state, :progress_timeouts, timers)
+
+      {nil, _timers} ->
+        state
+    end
+  end
 
   @doc """
   Handles batch MCP requests.
@@ -673,31 +837,8 @@ defmodule Arbor.MCP.Client.RequestHandler do
       {:error, error, id} ->
         handle_single_response({:error, error, id}, state)
 
-      {:notification, "notifications/subscriptions/acknowledged", params} ->
-        route_subscription_acknowledgment(params, state)
-
-      {:notification, method, params}
-      when method in [
-             "notifications/tools/list_changed",
-             "notifications/prompts/list_changed",
-             "notifications/resources/list_changed",
-             "notifications/resources/updated"
-           ] ->
-        route_change_notification(method, params, state)
-
-      {:notification, "notifications/tasks" = method, params} ->
-        route_task_subscription_event(method, params, state)
-
-      {:notification, "notifications/cancelled", params} ->
-        Logger.info("Received notification: notifications/cancelled")
-        handle_cancellation_notification(params, state)
-
-      {:notification, method, _params} ->
-        Logger.info("Received unsupported notification",
-          method_hash: LogSummary.fingerprint(method)
-        )
-
-        {:noreply, state}
+      {:notification, method, params} ->
+        route_notification(method, params, state)
 
       {:request, method, params, id} ->
         handle_server_request(method, params, id, state)
@@ -724,6 +865,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
         state
       )
       when is_map(params) do
+    state = reset_progress_timeout(request_id, state)
     dispatch_request_notification(:handle_progress, request_id, params, state)
   end
 
@@ -778,7 +920,24 @@ defmodule Arbor.MCP.Client.RequestHandler do
           transport_state: %HTTP{protocol_era: :modern} = transport_state
         } = state
       ) do
-    %{state | transport_state: HTTP.close_stream(transport_state, request_id)}
+    # Closing the connection is how modern HTTP cancels a request, whether
+    # its response is a stream or a pending POST. The POST task is forgotten
+    # first, so neither its exit nor a late result reaches the client.
+    {posts, tasks} =
+      Map.split_with(state.async_post_tasks || %{}, fn {_monitor, entry} ->
+        match?({_pid, ^request_id}, entry)
+      end)
+
+    for {monitor, {pid, _id}} <- posts do
+      Process.demonitor(monitor, [:flush])
+      Process.exit(pid, :kill)
+    end
+
+    %{
+      state
+      | async_post_tasks: tasks,
+        transport_state: HTTP.close_stream(transport_state, request_id)
+    }
   end
 
   def close_request_stream(request_id, %{transport_mod: LegacySSE} = state) do
@@ -834,6 +993,33 @@ defmodule Arbor.MCP.Client.RequestHandler do
     Enum.reduce(responses, {:noreply, state}, fn response, {:noreply, current_state} ->
       handle_single_response(response, current_state)
     end)
+  end
+
+  @doc false
+  # An HTTP POST's response answers the request that POST carried, whatever
+  # id its body echoes (a server may answer an invalid request with a null
+  # id), as when the POST was synchronous, and is dropped once that request
+  # has settled (timed out or cancelled), never routed to another one.
+  # Anything else, such as a batch, a notification or a server request, or
+  # the response to a POST that carried no request, is routed as usual.
+  def handle_post_response(response_data, nil, state),
+    do: parse_transport_message(response_data, state)
+
+  def handle_post_response(response_data, request_id, state) do
+    case Protocol.parse_message(response_data) do
+      {kind, payload, _echoed_id} when kind in [:result, :error] ->
+        if pending_single?(state.pending_requests, request_id),
+          do: handle_single_response({kind, payload, request_id}, state),
+          else: {:noreply, state}
+
+      _other ->
+        parse_transport_message(response_data, state)
+    end
+  end
+
+  defp pending_single?(pending, request_id) do
+    match?({_from, :single, _method}, Map.get(pending, request_id)) or
+      match?({_from, :single}, Map.get(pending, request_id))
   end
 
   @doc """
@@ -980,7 +1166,11 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
           GenServer.reply(from, response_data)
           new_pending_requests = Map.delete(pending_requests, response_id)
+
           %{state | pending_requests: new_pending_requests}
+          |> remember_tool_schemas(method, response_id, response_data)
+          |> cache_result(response_id, response_data)
+          |> cancel_progress_timeout(response_id)
 
         {:ok, {from, :single}} ->
           :telemetry.execute(
@@ -1006,6 +1196,147 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
     {:noreply, new_state}
   end
+
+  defp route_notification("notifications/subscriptions/acknowledged", params, state),
+    do: route_subscription_acknowledgment(params, state)
+
+  defp route_notification(method, params, state)
+       when method in [
+              "notifications/tools/list_changed",
+              "notifications/prompts/list_changed",
+              "notifications/resources/list_changed",
+              "notifications/resources/updated"
+            ],
+       do: route_change_notification(method, params, forget_changed(state, method, params))
+
+  defp route_notification("notifications/tasks" = method, params, state),
+    do: route_task_subscription_event(method, params, state)
+
+  defp route_notification("notifications/cancelled", params, state) do
+    Logger.info("Received notification: notifications/cancelled")
+    handle_cancellation_notification(params, state)
+  end
+
+  defp route_notification("notifications/progress", params, state) when is_map(params),
+    do: route_progress(params, state)
+
+  # A connection-level log message belongs to no request.
+  defp route_notification("notifications/message", params, state) when is_map(params),
+    do: dispatch_request_notification(:handle_log_message, nil, params, state)
+
+  defp route_notification(method, _params, state) do
+    Logger.info("Received unsupported notification",
+      method_hash: LogSummary.fingerprint(method)
+    )
+
+    {:noreply, state}
+  end
+
+  # Over every transport but a modern request stream, progress arrives on the
+  # connection and names its request only by the token that request carried.
+  defp route_progress(params, state) do
+    progress_requests = Map.get(state, :progress_requests) || %{}
+
+    case Map.get(progress_requests, params["progressToken"]) do
+      nil ->
+        Logger.debug("Progress for an unknown token")
+        {:noreply, state}
+
+      request_id ->
+        if Map.has_key?(state.pending_requests, request_id) do
+          state = reset_progress_timeout(request_id, state)
+          dispatch_request_notification(:handle_progress, request_id, params, state)
+        else
+          {:noreply, forget_progress_token(state, params["progressToken"])}
+        end
+    end
+  end
+
+  defp remember_progress_token(request, id, state) do
+    case get_in(request, ["params", "_meta", "progressToken"]) do
+      token when is_binary(token) or is_integer(token) ->
+        # Settled requests' tokens are dropped here, so the map never holds
+        # more than the pending requests that asked for progress.
+        live =
+          (Map.get(state, :progress_requests) || %{})
+          |> Map.filter(fn {_token, id} -> Map.has_key?(state.pending_requests, id) end)
+
+        Map.put(state, :progress_requests, Map.put(live, token, id))
+
+      _none ->
+        state
+    end
+  end
+
+  # Each tools/list page records its tools' output schemas; a tool listed
+  # without one has none to check.
+  # A first-page listing (no cursor) replaces what earlier listings recorded,
+  # so a removed or changed tool isn't checked against an old schema; later
+  # pages add to it.
+  defp mark_tool_listing(state, "tools/list", id, request) do
+    if get_in(request, ["params", "cursor"]),
+      do: state,
+      else: Map.update(state, :tool_listings, MapSet.new([id]), &MapSet.put(&1, id))
+  end
+
+  defp mark_tool_listing(state, _method, _id, _request), do: state
+
+  defp remember_tool_schemas(state, "tools/list", id, response_data) do
+    {fresh?, listings} =
+      state
+      |> Map.get(:tool_listings, MapSet.new())
+      |> then(&{MapSet.member?(&1, id), MapSet.delete(&1, id)})
+
+    state = Map.put(state, :tool_listings, listings)
+    known = if fresh?, do: %{}, else: Map.get(state, :tool_output_schemas) || %{}
+
+    with %{} = result <- list_result(response_data),
+         tools when is_list(tools) <- field(result, "tools", :tools) do
+      schemas =
+        Enum.reduce(tools, known, fn tool, acc ->
+          case {field(tool, "name", :name), field(tool, "outputSchema", :outputSchema)} do
+            {name, schema} when is_binary(name) and is_map(schema) -> Map.put(acc, name, schema)
+            {name, _none} when is_binary(name) -> Map.delete(acc, name)
+            _other -> acc
+          end
+        end)
+
+      Map.put(state, :tool_output_schemas, schemas)
+    else
+      _other -> state
+    end
+  end
+
+  defp remember_tool_schemas(state, _method, _id, _response_data), do: state
+
+  # Both paths hand over the response already parsed and validated.
+  defp list_result({:ok, %{} = result}), do: result
+  defp list_result(_rejected), do: nil
+
+  # In-process transports deliver maps that may still have atom keys.
+  defp field(%{} = map, key, atom), do: Map.get(map, key) || Map.get(map, atom)
+  defp field(_other, _key, _atom), do: nil
+
+  defp forget_changed(state, method, params) do
+    state = forget_tool_schemas(state, method)
+
+    case Map.get(state, :response_cache) do
+      %ResponseCache{} = cache ->
+        %{state | response_cache: ResponseCache.invalidate(cache, method, params)}
+
+      nil ->
+        state
+    end
+  end
+
+  # A changed tool list may change a schema; validate again once relisted.
+  defp forget_tool_schemas(state, "notifications/tools/list_changed"),
+    do: Map.put(state, :tool_output_schemas, %{})
+
+  defp forget_tool_schemas(state, _method), do: state
+
+  defp forget_progress_token(state, token),
+    do: Map.update(state, :progress_requests, %{}, &Map.delete(&1, token))
 
   defp dispatch_request_notification(callback, request_id, params, state) do
     :telemetry.execute(
@@ -1097,6 +1428,24 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
         state
     end
+  end
+
+  @doc false
+  # Sends a notification over HTTP from its own POST task, so a slow server
+  # cannot hold the client; other transports send it as usual.
+  def send_notification_async(method, params, %{transport_mod: HTTP} = state) do
+    with %HTTP{} <- state.transport_state,
+         {:ok, notification} <- build_request(method, params, nil, state),
+         {:ok, state} <- send_http_request(notification, state) do
+      state
+    else
+      _not_sent -> state
+    end
+  end
+
+  def send_notification_async(method, params, state) do
+    {:noreply, state} = handle_cast_notification(method, params, state)
+    state
   end
 
   @doc """

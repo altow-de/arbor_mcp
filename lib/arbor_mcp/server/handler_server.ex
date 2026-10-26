@@ -4,9 +4,10 @@ defmodule Arbor.MCP.Server.HandlerServer do
 
   `start_link/1` returns an owned runtime supervisor. Its protocol edge handles
   validation, reverse requests and subscriptions; the runtime alone initializes,
-  executes and terminates the handler. Stateful callbacks run serially in
-  supervised tasks. Pass the supervisor or `Runtime.ref/1` reference to clients
-  and public `Arbor.MCP.Server` helpers.
+  executes and terminates the handler. Callbacks run in supervised tasks,
+  concurrently by default or one at a time with `execution: :stateful`. Pass
+  the supervisor or `Runtime.ref/1` reference to clients and public
+  `Arbor.MCP.Server` helpers.
 
   Custom callbacks use `Arbor.MCP.Server.call/3` and `Arbor.MCP.Server.cast/2`.
   Direct `GenServer` callers must explicitly resolve `Runtime.edge/1`; direct
@@ -51,7 +52,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
 
   alias Arbor.MCP.Error.ProtocolError
   alias Arbor.MCP.Internal.{MessageValidator, VersionRegistry}
-  alias Arbor.MCP.Protocol.ErrorCodes
+  alias Arbor.MCP.Protocol.{ErrorCodes, Methods}
   alias Arbor.RPC.{JSONRPC, LogSummary}
 
   alias Arbor.MCP.Server.{
@@ -69,7 +70,8 @@ defmodule Arbor.MCP.Server.HandlerServer do
     Initialization,
     OutputController,
     Ref,
-    ShutdownGuard
+    ShutdownGuard,
+    WorkClass
   }
 
   alias Arbor.MCP.Server.Subscriptions.Origin
@@ -83,6 +85,8 @@ defmodule Arbor.MCP.Server.HandlerServer do
   # JSON-RPC batches were removed from the spec in 2025-06-18 and have not
   # come back since, so every version from 2025-06-18 onwards rejects them.
   @batch_removed_in "2025-06-18"
+  # What Context sends for a callback through the connection's edge.
+  @request_notifications ["notifications/progress", "notifications/message"]
 
   @type handler_module :: module()
   @type state :: %{
@@ -237,6 +241,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
                    wire_ids: wire_ids(message),
                    uncancellable_ids: uncancellable_ids(message),
                    batch?: is_list(message),
+                   snapshot: WorkClass.snapshot?(message),
                    timeout: ingress_timeout(runtime, opts),
                    admission_deadline: Keyword.get(opts, :admission_deadline, :infinity)
                  ) do
@@ -325,6 +330,8 @@ defmodule Arbor.MCP.Server.HandlerServer do
           require_replay_protection: Keyword.get(opts, :require_replay_protection, false),
           pending_requests: %{},
           pending_timers: %{},
+          # Monitors of the callbacks waiting on server-to-client requests.
+          reverse_monitors: %{},
           max_reverse_requests: Keyword.get(opts, :max_control_queue, 32),
           invocations: %{},
           ingress: %{},
@@ -381,6 +388,33 @@ defmodule Arbor.MCP.Server.HandlerServer do
   end
 
   @impl GenServer
+  # A callback's own progress or log notification (Context.report_progress/3,
+  # send_log_message/3), queued on the connection ahead of its result, as
+  # the callback waits for this acknowledgment before going on. Only while
+  # its request is current: not once cancelled, nor for an earlier
+  # connection.
+  def handle_info({:ex_mcp_request_notification, sender, ref, notification, token}, state)
+      when is_pid(sender) do
+    {reply, state} =
+      with %{kind: :rpc, id: id, connection: connection} <- Map.get(state.invocations, token),
+           true <- connection == state.connection,
+           false <- :ets.member(Ref.table(state.runtime), {:wire_cancel, token, id}),
+           %{"method" => method, "params" => %{}} when method in @request_notifications <-
+             notification,
+           :ok <- encodable(notification) do
+        case send_message(notification, state) do
+          {:ok, state} -> {:ok, state}
+          {:error, reason} -> {{:error, reason}, state}
+        end
+      else
+        :unencodable -> {{:error, :invalid_notification}, state}
+        _not_current_or_invalid -> {{:error, :request_closed}, state}
+      end
+
+    send(sender, {:ex_mcp_request_notification_ack, ref, reply})
+    {:noreply, state}
+  end
+
   def handle_info({{:runtime_edge_reply, token}, result}, state) do
     Admission.terminal(Ref.table(state.runtime), token, {:ok, result})
     RuntimeIngress.discard_ingress(state.runtime, token)
@@ -420,6 +454,21 @@ defmodule Arbor.MCP.Server.HandlerServer do
     end
   end
 
+  def handle_info({:DOWN, monitor, :process, _worker, _reason}, state)
+      when is_map_key(:erlang.map_get(:reverse_monitors, state), monitor) do
+    {id, monitors} = Map.pop(state.reverse_monitors, monitor)
+    state = %{state | reverse_monitors: monitors}
+
+    case Map.get(state.pending_requests, id) do
+      {from, :server_request} ->
+        GenServer.reply(from, {:error, :request_cancelled})
+        {:noreply, drop_reverse(id, state)}
+
+      _settled ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:DOWN, monitor, :process, _peer, _reason}, %{peer_monitor: monitor} = state) do
     if stdio?(state) do
       ShutdownGuard.request_stop(Ref.table(state.runtime), {:shutdown, :stdio_writer_down})
@@ -442,7 +491,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
 
     {:noreply,
      %{
-       state
+       forget_requesters(state)
        | stdio_eof: deadline,
          pending_requests: %{},
          pending_timers: %{},
@@ -668,7 +717,8 @@ defmodule Arbor.MCP.Server.HandlerServer do
       reservation.terminal ->
         fail_published(token, reservation, state)
 
-      (state.batch_active || state.initializing || state.stdio_active) &&
+      (state.batch_active || state.initializing ||
+         (state.stdio_active && not Map.get(reservation, :snapshot, false))) &&
           reservation.kind not in [:edge_control, :edge_response] ->
         state
 
@@ -765,8 +815,65 @@ defmodule Arbor.MCP.Server.HandlerServer do
       end
   end
 
+  defp legacy_control("elicitation/create", params, timeout), do: {:elicit, params, timeout}
+
+  defp legacy_control("sampling/createMessage", params, timeout),
+    do: {:create_message, params, timeout}
+
+  defp legacy_control("roots/list", _params, timeout), do: {:list_roots, timeout}
+
+  @input_capabilities %{
+    "elicitation/create" => "elicitation",
+    "sampling/createMessage" => "sampling",
+    "roots/list" => "roots"
+  }
+
+  # Unknown when the client never sent initialize capabilities.
+  defp client_capable?(_method, nil), do: true
+
+  defp client_capable?(method, capabilities) when is_map(capabilities),
+    do: Map.has_key?(capabilities, Map.fetch!(@input_capabilities, method))
+
+  # A callback cancelled while it waits for the client leaves nobody to
+  # answer, so its request is dropped then, not when its timeout ends.
+  defp watch_requester({_edge, {:runtime_edge_reply, token}}, id, state) do
+    # The edge-control request was submitted by the callback's own worker.
+    case Admission.current(Ref.table(state.runtime), token) do
+      {:ok, %{caller: worker}} when is_pid(worker) and worker != self() ->
+        monitors = Map.put(Map.get(state, :reverse_monitors, %{}), Process.monitor(worker), id)
+        Map.put(state, :reverse_monitors, monitors)
+
+      _untracked ->
+        state
+    end
+  end
+
+  defp watch_requester(_from, _id, state), do: state
+
+  defp forget_requesters(state) do
+    for {monitor, _id} <- Map.get(state, :reverse_monitors, %{}),
+        do: Process.demonitor(monitor, [:flush])
+
+    Map.put(state, :reverse_monitors, %{})
+  end
+
+  # A settled request needs its callback watched no longer.
+  defp unwatch_requester(id, state) do
+    monitors = Map.get(state, :reverse_monitors, %{})
+
+    case Enum.find(monitors, fn {_monitor, request_id} -> request_id == id end) do
+      {monitor, _id} ->
+        Process.demonitor(monitor, [:flush])
+        Map.put(state, :reverse_monitors, Map.delete(monitors, monitor))
+
+      nil ->
+        state
+    end
+  end
+
   defp drop_reverse(id, state) do
     if timer = state.pending_timers[id], do: Process.cancel_timer(timer)
+    state = unwatch_requester(id, state)
 
     %{
       state
@@ -868,7 +975,12 @@ defmodule Arbor.MCP.Server.HandlerServer do
     }
 
     state = put_in(state.ingress[token], ingress)
-    state = if stdio?(state), do: %{state | stdio_active: token}, else: state
+
+    state =
+      if hold_stdio?(state, requests, batch?),
+        do: %{state | stdio_active: token},
+        else: state
+
     state = if batch?, do: %{state | batch_active: token}, else: state
 
     if state.initializing do
@@ -976,6 +1088,17 @@ defmodule Arbor.MCP.Server.HandlerServer do
     else
       process_mcp_request(request, state)
     end
+  end
+
+  # Log data is the callback's own: a term JSON can't carry is refused, not
+  # left to crash the edge when it's written.
+  defp encodable(notification) do
+    case Jason.encode(notification) do
+      {:ok, _json} -> :ok
+      {:error, _reason} -> :unencodable
+    end
+  rescue
+    _exception -> :unencodable
   end
 
   defp complete_invocation(token, result, state) do
@@ -1206,7 +1329,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
       end
 
     %{
-      state
+      forget_requesters(state)
       | transport_state: transport_state,
         connection: connection,
         peer_monitor: if(peer, do: Process.monitor(peer), else: nil),
@@ -1326,6 +1449,24 @@ defmodule Arbor.MCP.Server.HandlerServer do
 
   def handle_call({:create_message, params}, from, state),
     do: reverse_request("sampling/createMessage", params, 5_000, from, state)
+
+  # A handler's MRTR input request, sent to a legacy client (see Dispatch).
+  def handle_call({:legacy_input, method, params, timeout}, from, state) do
+    cond do
+      is_binary(state.protocol_version) and not Methods.available?(method, state.protocol_version) ->
+        {:reply, {:error, {:method_unavailable, method, state.protocol_version}}, state}
+
+      not client_capable?(method, Map.get(state, :client_capabilities)) ->
+        {:reply, {:error, {:client_capability_missing, method}}, state}
+
+      true ->
+        handle_call(legacy_control(method, params, timeout), from, state)
+    end
+  end
+
+  def handle_call({:create_message, params, timeout}, from, state)
+      when is_integer(timeout) and timeout > 0 and timeout <= 4_294_967_295,
+      do: reverse_request("sampling/createMessage", params, timeout, from, state)
 
   def handle_call({:elicit, params, timeout}, from, state) do
     cond do
@@ -1470,12 +1611,13 @@ defmodule Arbor.MCP.Server.HandlerServer do
         {:ok, state} ->
           timer = Process.send_after(self(), {:request_timeout, id}, timeout)
 
-          {:noreply,
-           %{
-             state
-             | pending_requests: Map.put(state.pending_requests, id, {from, :server_request}),
-               pending_timers: Map.put(state.pending_timers, id, timer)
-           }}
+          state = %{
+            state
+            | pending_requests: Map.put(state.pending_requests, id, {from, :server_request}),
+              pending_timers: Map.put(state.pending_timers, id, timer)
+          }
+
+          {:noreply, watch_requester(from, id, state)}
 
         {:error, reason} ->
           {:reply, {:error, reason}, state}
@@ -1682,10 +1824,14 @@ defmodule Arbor.MCP.Server.HandlerServer do
   # Runs the shared dispatcher against the handler module and folds the new
   # handler state back into the server state.
   defp dispatch(request, state) do
-    state = maybe_pin_connection_era(request, state)
+    state = request |> maybe_pin_connection_era(state) |> remember_client_capabilities(request)
+
+    token = state.current_ingress
 
     dispatch_opts = [
       protocol_mode: effective_protocol_mode(state),
+      # Context.report_progress/3 and send_log_message/3 write through here.
+      request_notification_target: {:arbor_mcp_edge, self(), token},
       instructions: state.instructions,
       request_state: state.request_state,
       endpoint: state.endpoint,
@@ -1694,8 +1840,6 @@ defmodule Arbor.MCP.Server.HandlerServer do
       replay_cache: state.replay_cache,
       require_replay_protection: state.require_replay_protection
     ]
-
-    token = state.current_ingress
 
     case RuntimeIngress.dispatch_reserved(
            state.runtime,
@@ -1739,6 +1883,24 @@ defmodule Arbor.MCP.Server.HandlerServer do
 
   defp maybe_pin_connection_era(_request, state), do: state
 
+  defp remember_client_capabilities(state, %{"method" => "initialize", "params" => params})
+       when is_map(params) do
+    # An in-process client may send them with atom keys.
+    case Map.get(params, "capabilities") || Map.get(params, :capabilities) do
+      %{} = capabilities ->
+        Map.put(
+          state,
+          :client_capabilities,
+          Map.new(capabilities, fn {k, v} -> {to_string(k), v} end)
+        )
+
+      _none ->
+        state
+    end
+  end
+
+  defp remember_client_capabilities(state, _request), do: state
+
   defp pin_candidate(%RequestContext{era: :modern}), do: :modern
   defp pin_candidate(%RequestContext{era: :legacy, method: "initialize"}), do: :legacy
   defp pin_candidate(_context), do: nil
@@ -1778,6 +1940,14 @@ defmodule Arbor.MCP.Server.HandlerServer do
   defp protocol_version_from_result(_result), do: nil
 
   defp stdio?(state), do: state.transport == Arbor.MCP.Server.Stdio.Writer
+
+  # A stateful runtime holds each stdio request until its response is written,
+  # so no later state change can follow an output whose delivery is uncertain.
+  # Stateless runtimes and snapshot work (ping) have no state to protect.
+  defp hold_stdio?(state, requests, batch?) do
+    stdio?(state) and not (not batch? and WorkClass.snapshot?(hd(requests))) and
+      match?({:ok, %{config: %{execution: :stateful}}}, Admission.route(Ref.table(state.runtime)))
+  end
 
   defp stdio_drained?(state) do
     table = Ref.table(state.runtime)
@@ -2003,23 +2173,31 @@ defmodule Arbor.MCP.Server.HandlerServer do
   defp to_string_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
   defp to_string_reason(_reason), do: "invalid_subscription"
 
+  # A connection whose era isn't pinned yet hasn't finished `initialize` or
+  # its first modern request, and a client still establishing it would take a
+  # list change for the answer it's waiting for. It lists afresh once ready.
   defp publish_or_send(method, params, state) do
-    if modern_connection?(state) do
-      _counts =
-        Subscriptions.publish(
-          method,
-          params,
-          subscription_publication_options(state)
-        )
+    cond do
+      modern_connection?(state) ->
+        _counts =
+          Subscriptions.publish(
+            method,
+            params,
+            subscription_publication_options(state)
+          )
 
-      {:noreply, state}
-    else
-      notification = %{"jsonrpc" => "2.0", "method" => method, "params" => params}
+        {:noreply, state}
 
-      case send_message(notification, state) do
-        {:ok, new_state} -> {:noreply, new_state}
-        {:error, _reason} -> {:noreply, state}
-      end
+      state.connection_era == :legacy ->
+        notification = %{"jsonrpc" => "2.0", "method" => method, "params" => params}
+
+        case send_message(notification, state) do
+          {:ok, new_state} -> {:noreply, new_state}
+          {:error, _reason} -> {:noreply, state}
+        end
+
+      true ->
+        {:noreply, state}
     end
   end
 

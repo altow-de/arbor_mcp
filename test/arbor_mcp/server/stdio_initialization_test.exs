@@ -106,7 +106,9 @@ defmodule Arbor.MCP.Server.StdioInitializationTest do
       init_timeout_ms: init_timeout,
       shutdown_timeout_ms: 50,
       transport: :stdio,
-      endpoint: "stdio"
+      endpoint: "stdio",
+      # The fixture's "inc" tool counts in handler state.
+      execution: :stateful
     ]
 
     caller =

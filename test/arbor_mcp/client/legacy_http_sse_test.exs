@@ -10,6 +10,8 @@ defmodule Arbor.MCP.Client.LegacyHttpSseTest do
     use Arbor.MCP.Server.Handler
     use Arbor.MCP.Server.DSL, name: "legacy-sse", version: "1.0.0"
 
+    alias Arbor.MCP.Server.Context
+
     tool "echo", "Echo a message" do
       input_schema(%{
         type: "object",
@@ -21,6 +23,20 @@ defmodule Arbor.MCP.Client.LegacyHttpSseTest do
 
       run(fn %{"message" => message}, state ->
         {:ok, %{content: [%{"type" => "text", "text" => "Echo: #{message}"}]}, state}
+      end)
+    end
+
+    # Works for 800 ms, reporting progress every 100 ms.
+    tool "slow", "Report progress for a while" do
+      input_schema(%{type: "object"})
+
+      run(fn _args, state ->
+        for step <- 1..8 do
+          Process.sleep(100)
+          _ = Context.report_progress(step, 8)
+        end
+
+        {:ok, %{content: [%{"type" => "text", "text" => "done"}]}, state}
       end)
     end
   end
@@ -101,6 +117,34 @@ defmodule Arbor.MCP.Client.LegacyHttpSseTest do
     assert_received {:http_request, "POST", "/message"}
     refute_received {:http_request, "GET", "/mcp"}
     assert_borrowed_listener_survives(runtime, port)
+  end
+
+  # The transport's :request_timeout used to cut every request off.
+  test "progress keeps a request alive past the transport's request timeout", %{port: port} do
+    {:ok, client} =
+      Client.start_link(
+        transport: :sse,
+        url: "http://127.0.0.1:#{port}",
+        request_timeout: 300,
+        health_check_interval: nil
+      )
+
+    on_exit(fn ->
+      try do
+        if Process.alive?(client), do: Client.disconnect(client)
+      catch
+        :exit, _reason -> :ok
+      end
+    end)
+
+    assert {:ok, %{"content" => [%{"text" => "done"}]}} =
+             Client.call_tool(client, "slow", %{},
+               format: :map,
+               timeout: 400,
+               reset_timeout_on_progress: true
+             )
+
+    assert {:error, :timeout} = Client.call_tool(client, "slow", %{}, format: :map, timeout: 400)
   end
 
   test "sse_path override hits the configured GET path, not the MCP endpoint", %{runtime: runtime} do

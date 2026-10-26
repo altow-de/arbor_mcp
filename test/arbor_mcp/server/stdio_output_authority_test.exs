@@ -113,7 +113,10 @@ defmodule Arbor.MCP.Server.Stdio.OutputAuthorityTest do
         max_output_frames: 1,
         max_output_bytes: 1_536,
         max_output_frame_bytes: 2_048,
-        max_output_term_bytes: 2_048
+        max_output_term_bytes: 2_048,
+        # "inc" counts in handler state; without this every response would be
+        # an invalid_handler_state error instead of the sized success frame.
+        execution: :stateful
       ],
       extra
     )

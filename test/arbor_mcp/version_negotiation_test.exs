@@ -106,7 +106,9 @@ defmodule Arbor.MCP.VersionNegotiationTest do
       {:ok, server} =
         Server.start_link(
           handler: TestVersionHandler,
-          transport: :test
+          transport: :test,
+          # handle_initialize stores the client info in handler state.
+          execution: :stateful
         )
 
       {:ok, client} =

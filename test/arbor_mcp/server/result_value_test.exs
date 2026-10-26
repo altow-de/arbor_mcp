@@ -154,7 +154,8 @@ defmodule Arbor.MCP.Server.ResultValueTest do
   end
 
   test "modern runtime output preserves scalar false, explicit null and arrays with state commits" do
-    root = start_supervised!({HandlerServer, handler: Handler, transport: :test})
+    root =
+      start_supervised!({HandlerServer, handler: Handler, transport: :test, execution: :stateful})
 
     for {tool, value, id} <- [{"boolean", false, 1}, {"null", nil, 2}, {"array", [], 3}] do
       assert {:ok, %{"result" => result}} = Runtime.request(root, request(tool, id, :modern))
@@ -166,9 +167,11 @@ defmodule Arbor.MCP.Server.ResultValueTest do
   end
 
   test "legacy scalar result rejection happens before state commit; objects still work" do
-    root = start_supervised!({HandlerServer, handler: Handler, transport: :test})
+    # The rejection is a JSON-RPC error the handler can act on, not a crash.
+    root =
+      start_supervised!({HandlerServer, handler: Handler, transport: :test, execution: :stateful})
 
-    assert {:error, %{"error" => %{"data" => %{"type" => "handler_crash"}}}} =
+    assert {:ok, %{"error" => %{"code" => -32603, "data" => %{"type" => "invalid_result"}}}} =
              Runtime.request(root, request("boolean", 1, :legacy))
 
     assert Server.call(root, :read) == 0
@@ -180,7 +183,9 @@ defmodule Arbor.MCP.Server.ResultValueTest do
   end
 
   test "malformed nested scalar result data cannot commit state through runtime output" do
-    root = start_supervised!({HandlerServer, handler: Handler, transport: :test})
+    root =
+      start_supervised!({HandlerServer, handler: Handler, transport: :test, execution: :stateful})
+
     assert {:error, _reason} = Runtime.request(root, request("opaque_array", 1, :modern))
     assert Server.call(root, :read) == 0
   end

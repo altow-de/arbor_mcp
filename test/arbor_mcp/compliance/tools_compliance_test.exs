@@ -343,7 +343,9 @@ defmodule Arbor.MCP.ToolsComplianceTest do
     {:ok, server} =
       Server.start_link(
         transport: :test,
-        handler: TestToolsServer
+        handler: TestToolsServer,
+        # The handler records rate limits and call history in its state.
+        execution: :stateful
       )
 
     # Start client

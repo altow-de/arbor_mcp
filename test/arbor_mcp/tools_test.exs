@@ -267,7 +267,9 @@ defmodule Arbor.MCP.ToolsTest do
     {:ok, server} =
       Server.start_link(
         transport: :test,
-        handler: TestToolsHandler
+        handler: TestToolsHandler,
+        # The handler counts calls in its state.
+        execution: :stateful
       )
 
     # Start test transport client

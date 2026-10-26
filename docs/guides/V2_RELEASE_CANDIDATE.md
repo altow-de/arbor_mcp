@@ -105,6 +105,136 @@ and expected a successful response. All three native child cleanup receipts
 were confirmed, but the MCP BEAM lane did not confirm its public cleanup path.
 The stable 48-hour qualification remains open.
 
+## Upgrading from 2.0.0-rc.5
+
+The next candidate, not yet published, makes servers handle the requests on a
+connection concurrently, as the other MCP SDKs do, and lets the caller decide how
+long a request runs. Six changes can break existing code. The
+[changelog](../../CHANGELOG.md) lists the rest, including the client changes.
+
+### Request callbacks no longer change handler state by default
+
+A server now runs up to 64 callbacks at once (`execution: :stateless,
+max_concurrency: 64`). `init/1` and `handle_initialize/2` can still set up
+handler state, and initializations commit one at a time. Every other callback
+gets a snapshot of that state and must return it unchanged: tools, resources,
+prompts, completion, logging, subscriptions, and custom `handle_call/3` and
+`handle_cast/2` reached through `Arbor.MCP.Server.call/3` and `cast/2`.
+
+A callback that returns a changed state fails its request. The peer receives
+JSON-RPC error `-32603` with `%{"type" => "invalid_handler_state"}`, and the
+server logs a warning naming the handler the first time:
+
+```text
+[warning] MyApp.MCPServer returned a changed handler state from a callback that
+may not change it, so the request failed. ...
+```
+
+To keep the previous behavior, start the server with `execution: :stateful`.
+Callbacks then run one at a time, in arrival order, and each commits the state
+it returns:
+
+```elixir
+# Supervised runtime, for example mounted in Phoenix
+{Arbor.MCP.Server.Runtime,
+ handler: MyApp.MCPServer, transport: :mounted_http, execution: :stateful}
+
+# Plain handler or stdio server
+Arbor.MCP.Server.start_link(handler: MyApp.MCPServer, transport: :stdio, execution: :stateful)
+
+# DSL module
+MyApp.MCPServer.start_link(transport: :beam, execution: :stateful)
+```
+
+To run concurrently instead, keep the changing data where concurrent callbacks
+can share it, such as a GenServer, an Agent, an ETS table or your database, and
+return the state unchanged:
+
+```elixir
+@impl true
+def init(_args) do
+  {:ok, counter} = Agent.start_link(fn -> 0 end)
+  {:ok, %{counter: counter}}
+end
+
+@impl true
+def handle_call_tool("increment", _args, state) do
+  count = Agent.get_and_update(state.counter, &{&1 + 1, &1 + 1})
+  {:ok, %{content: [%{type: "text", text: Integer.to_string(count)}]}, state}
+end
+```
+
+`execution: :stateful` accepts only `max_concurrency: 1`; raise
+`max_concurrency` on a stateless server instead. A stateful server still answers
+`ping` while a callback runs.
+
+### Responses can arrive in completion order
+
+On a stateless server, a slow tool's response can follow the response to a later,
+faster request, on every transport including stdio. Each response carries its
+request's id, JSON-RPC allows any order, and ArborMCP's client and the official
+SDKs match responses by id. A hand-written client or test that reads responses
+in order must match them by id instead. A stateful server still answers requests
+in arrival order, except `ping`, which it answers at once.
+
+### The server's request deadline defaults to one hour
+
+`request_timeout_ms` was 10 s, so a tool that ran longer failed with
+`handler_timeout` while the client was still waiting. It is now one hour, as a
+safety net: the caller's timeout decides how long work runs. ArborMCP's client
+cancels a request when it stops waiting, with `notifications/cancelled`, or over
+modern Streamable HTTP by closing the request's connection. Set
+`request_timeout_ms` to keep a tighter server-side bound. A stdio server's
+default EOF drain is unchanged at 15 s.
+
+### Invalid DSL tool arguments return a tool error
+
+A DSL tool called with arguments that fail its schema used to answer with a
+`-32602` protocol error and no details. It now returns a successful result with
+`isError: true` and text such as `Input validation error: ...` naming the failing
+fields and rules, as SEP-1303 and the other MCP SDKs do, so a model can correct
+its call. Rejected values are never included. Code that matched the error tuple
+from `Client.call_tool/4` now receives
+`{:ok, %Arbor.MCP.Response{is_error: true}}`.
+
+### Resource-template values are percent-decoded
+
+`resource_template "files://{name}"` used to hand its `read` function the
+value as it appeared in the URI, so `files://a%20b` gave `"a%20b"`. Values are
+now percent-decoded (`"a b"`), and a handler that decoded them itself would
+decode twice. Templates also match every RFC 6570 operator now: `{+path}` and
+`{#frag}` span slashes, and `{/a,b}`, `{.ext}`, `{;params}` and `{?query}` work.
+As in Python's MCPServer, a decoded value doesn't match if it contains a NUL
+byte, climbs out of its starting point with `..`, or is an absolute path; the
+read then fails as an unknown resource.
+
+### Elicitations are checked in both eras
+
+An elicitation a handler asks for in an `input_required` result is now checked
+against the protocol's ElicitRequest schema on modern connections too, as it
+already was on legacy ones. A form elicitation's `requestedSchema` must be an
+object with `properties`, each a string, number, integer, boolean, or single- or
+multi-select enum field. One that isn't, most often `%{"type" => "object"}` with
+no `properties`, fails the call with `-32602` and
+`%{"inputRequestId" => id, "method" => "elicitation/create"}`, and the client
+is never asked:
+
+```elixir
+# Fails the call:
+%{"message" => "Name?", "requestedSchema" => %{"type" => "object"}}
+
+# Fits, with fields or without:
+%{
+  "message" => "Name?",
+  "requestedSchema" => %{
+    "type" => "object",
+    "properties" => %{"name" => %{"type" => "string"}}
+  }
+}
+
+%{"message" => "Continue?", "requestedSchema" => %{"type" => "object", "properties" => %{}}}
+```
+
 ## Limits to exercise in downstream tests
 
 - **JSON object member order:** object keys in protocol replies have no promised

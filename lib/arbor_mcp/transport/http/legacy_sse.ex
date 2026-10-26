@@ -170,6 +170,13 @@ defmodule Arbor.MCP.Transport.HTTP.LegacySSE do
     end
   end
 
+  # The request's own deadline decides how long its POST may wait; the
+  # client caps it at :request_timeout unless progress keeps it alive.
+  defp response_timeout(%{deadline: deadline}) when is_integer(deadline),
+    do: max(deadline - System.monotonic_time(:millisecond), 1)
+
+  defp response_timeout(state), do: state.timeouts.request
+
   @impl true
   def send_message(message, %__MODULE__{} = state) do
     body = encode_body(message)
@@ -186,7 +193,7 @@ defmodule Arbor.MCP.Transport.HTTP.LegacySSE do
       with {:ok, transport_opts} <- transport_opts(state.post_url, state.security) do
         BoundedClient.request(:post, state.post_url, headers, "application/json", body,
           connect_timeout: state.timeouts.connect,
-          request_timeout: state.timeouts.request,
+          request_timeout: response_timeout(state),
           max_request_bytes: state.max_request_bytes,
           max_response_bytes: state.max_response_bytes,
           transport_opts: transport_opts,

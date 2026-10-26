@@ -117,6 +117,8 @@ defmodule Arbor.MCP.HttpPlugTest do
       }
     }
 
+    def tool, do: @tool
+
     @impl true
     def handle_list_tools(_cursor, state), do: {:ok, [@tool], nil, state}
 
@@ -124,6 +126,34 @@ defmodule Arbor.MCP.HttpPlugTest do
     def handle_call_tool(_name, arguments, state) do
       {:ok, %{"content" => [%{"type" => "text", "text" => inspect(arguments)}]}, state}
     end
+  end
+
+  # The routed tool is on the second tools/list page.
+  defmodule PagedHeaderToolServer do
+    use Arbor.MCP.Server.Handler
+
+    @filler %{"name" => "filler", "inputSchema" => %{"type" => "object"}}
+
+    @impl true
+    def handle_list_tools(nil, state), do: {:ok, [@filler], "page-2", state}
+    def handle_list_tools("page-2", state), do: {:ok, [HeaderToolServer.tool()], nil, state}
+
+    @impl true
+    def handle_call_tool(_name, arguments, state) do
+      {:ok, %{"content" => [%{"type" => "text", "text" => inspect(arguments)}]}, state}
+    end
+  end
+
+  # A tools/list whose cursor never ends.
+  defmodule EndlessToolServer do
+    use Arbor.MCP.Server.Handler
+
+    @impl true
+    def handle_list_tools(_cursor, state),
+      do: {:ok, [%{"name" => "filler", "inputSchema" => %{"type" => "object"}}], "more", state}
+
+    @impl true
+    def handle_call_tool(_name, _arguments, state), do: {:ok, %{"content" => []}, state}
   end
 
   describe "HTTP Plug behavior" do
@@ -1081,7 +1111,7 @@ defmodule Arbor.MCP.HttpPlugTest do
       result = Jason.decode!(conn.resp_body)["result"]
       assert result["resultType"] == "complete"
       assert result["supportedVersions"] == ["2026-07-28"]
-      assert result["capabilities"]["tools"] == %{}
+      assert result["capabilities"]["tools"] == %{"listChanged" => true}
       assert result["ttlMs"] >= 0
       assert result["cacheScope"] in ["public", "private"]
     end
@@ -1340,6 +1370,38 @@ defmodule Arbor.MCP.HttpPlugTest do
 
       assert mismatched.status == 400
       assert Jason.decode!(mismatched.resp_body)["error"]["code"] == -32020
+    end
+
+    test "validates x-mcp-header values for a tool on a later tools/list page" do
+      request =
+        modern_request(
+          "tools/call",
+          %{"name" => "routed_tool", "arguments" => %{"region" => "us-west1", "limit" => 42}},
+          109
+        )
+
+      post = fn handler, headers ->
+        Enum.reduce(
+          headers,
+          put_modern_headers(conn(:post, "/", Jason.encode!(request)), request),
+          fn {name, value}, conn ->
+            put_req_header(conn, name, value)
+          end
+        )
+        |> put_req_header("content-type", "application/json")
+        |> call_http(mount_opts(handler: handler, sse_enabled: false))
+      end
+
+      matching = [{"mcp-param-region", "us-west1"}, {"mcp-param-limit", "42"}]
+      assert %{status: 200} = post.(PagedHeaderToolServer, matching)
+
+      mismatched = [{"mcp-param-region", "eu-central1"}, {"mcp-param-limit", "42"}]
+      assert %{status: 400} = conn = post.(PagedHeaderToolServer, mismatched)
+      assert Jason.decode!(conn.resp_body)["error"]["code"] == -32020
+
+      # A list that never ends fails closed instead of skipping the check.
+      assert %{status: 400} = conn = post.(EndlessToolServer, matching)
+      assert Jason.decode!(conn.resp_body)["error"]["code"] == -32020
     end
 
     test "does not expose Mcp-Param values through server logs or telemetry" do

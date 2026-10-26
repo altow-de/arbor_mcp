@@ -330,7 +330,14 @@ defmodule Arbor.MCP.Server.Runtime.InputByteCleanupTest do
   defp runtime(opts \\ []) do
     options =
       Keyword.merge(
-        [handler: Handler, dispatcher: Handler, request_timeout_ms: 5_000, max_queue: 2],
+        [
+          handler: Handler,
+          dispatcher: Handler,
+          request_timeout_ms: 5_000,
+          max_queue: 2,
+          # The lane bounds below count one running callback plus max_queue.
+          execution: :stateful
+        ],
         opts
       )
 

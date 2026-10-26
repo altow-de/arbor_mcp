@@ -99,7 +99,7 @@ defmodule Arbor.MCP.Server.ResultNormalizer do
       result =
         result
         |> Map.put("resultType", result_type)
-        |> normalize_cache_hints(request_context, result_type)
+        |> normalize_cache_hints(request_context, result_type, Keyword.get(opts, :cache_hints))
 
       meta =
         case Map.get(result, "_meta") do
@@ -147,9 +147,13 @@ defmodule Arbor.MCP.Server.ResultNormalizer do
   defp tool_sort_key(%{"name" => name} = tool) when is_binary(name), do: {0, name, tool}
   defp tool_sort_key(tool), do: {1, "", tool}
 
-  defp normalize_cache_hints(result, %{method: method}, "complete") do
+  # A field the handler left off comes from the server's :cache_hints for
+  # the method, else the conservative default.
+  defp normalize_cache_hints(result, %{method: method}, "complete", hints) do
     if CacheableResult.cacheable_method?(method) do
-      result
+      hint = Map.get(hints || %{}, method, %{})
+
+      Map.merge(hint, result)
       |> normalize_ttl_ms(method)
       |> normalize_cache_scope(method)
     else
@@ -157,7 +161,7 @@ defmodule Arbor.MCP.Server.ResultNormalizer do
     end
   end
 
-  defp normalize_cache_hints(result, %{method: method}, _result_type) do
+  defp normalize_cache_hints(result, %{method: method}, _result_type, _hints) do
     if CacheableResult.cacheable_method?(method) do
       Map.drop(result, ["ttlMs", "cacheScope"])
     else
@@ -165,7 +169,7 @@ defmodule Arbor.MCP.Server.ResultNormalizer do
     end
   end
 
-  defp normalize_cache_hints(result, _request_context, _result_type), do: result
+  defp normalize_cache_hints(result, _request_context, _result_type, _hints), do: result
 
   defp normalize_ttl_ms(%{"ttlMs" => ttl_ms} = result, _method)
        when is_integer(ttl_ms) and ttl_ms >= 0,

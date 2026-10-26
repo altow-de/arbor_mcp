@@ -57,7 +57,9 @@ defmodule Arbor.MCP.LoggingSetLevelTest do
         Server.start_link(
           transport: :test,
           handler: TestHandler,
-          handler_args: []
+          handler_args: [],
+          # The handler stores the log level in its state.
+          execution: :stateful
         )
 
       {:ok, client} =

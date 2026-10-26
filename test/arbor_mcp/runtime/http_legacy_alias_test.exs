@@ -422,7 +422,9 @@ defmodule Arbor.MCP.Server.Runtime.HTTPLegacyAliasTest do
             handler: Handler,
             handler_args: [observer: self()],
             request_timeout_ms: 2_000,
-            services: [sessions: []]
+            services: [sessions: []],
+            # The handler counts in its state, one callback at a time.
+            execution: :stateful
           ],
           runtime_opts
         )

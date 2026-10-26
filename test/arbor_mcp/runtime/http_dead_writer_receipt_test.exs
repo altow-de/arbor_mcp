@@ -236,19 +236,19 @@ defmodule Arbor.MCP.Runtime.HTTPDeadWriterReceiptTest do
 
   defp entered(opts \\ []) do
     root =
-      start_supervised!(
-        {Runtime,
-         Keyword.merge(
-           [
-             handler: Arbor.MCP.Runtime.HTTPDeadWriterReceiptTest.Handler,
-             dispatcher: Arbor.MCP.Runtime.HTTPDeadWriterReceiptTest.Dispatcher,
-             handler_args: [observer: self()],
-             request_timeout_ms: 5_000,
-             output_timeout_ms: 5_000
-           ],
-           opts
-         )}
-      )
+      start_supervised!({Runtime,
+       Keyword.merge(
+         [
+           handler: Arbor.MCP.Runtime.HTTPDeadWriterReceiptTest.Handler,
+           dispatcher: Arbor.MCP.Runtime.HTTPDeadWriterReceiptTest.Dispatcher,
+           handler_args: [observer: self()],
+           request_timeout_ms: 5_000,
+           output_timeout_ms: 5_000,
+           # The handler counts calls in its state, one callback at a time.
+           execution: :stateful
+         ],
+         opts
+       )})
 
     {:ok, runtime} = Runtime.ref(root)
     writer = socket(runtime, true)

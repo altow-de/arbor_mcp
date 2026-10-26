@@ -267,7 +267,7 @@ defmodule Arbor.MCP.Content.SchemaReplacementTest do
     assert {:ok, missing, _} = BoundaryHandler.handle_call_tool("default", %{}, %{count: 0})
     assert missing.structuredContent == %{count: 7}
 
-    assert {:error, %Arbor.MCP.Error.ProtocolError{code: -32602}, %{count: 0}} =
+    assert {:ok, %{isError: true, content: [%{text: "Input validation error" <> _}]}, %{count: 0}} =
              BoundaryHandler.handle_call_tool("default", %{"count" => "7"}, %{count: 0})
 
     assert {:ok, numeric, _} =

@@ -287,13 +287,16 @@ defmodule Arbor.MCP.Server.RuntimeCharacterizationTest do
       {:ok, server_a} =
         RuntimeDSL.start_link(
           transport: :test,
-          handler_args: [token: "a"]
+          handler_args: [token: "a"],
+          # "inc" counts in handler state.
+          execution: :stateful
         )
 
       {:ok, server_b} =
         RuntimeDSL.start_link(
           transport: :test,
-          handler_args: [token: "b"]
+          handler_args: [token: "b"],
+          execution: :stateful
         )
 
       {:ok, client_a} =
@@ -342,7 +345,9 @@ defmodule Arbor.MCP.Server.RuntimeCharacterizationTest do
       HandlerServer.start_link(
         transport: :test,
         handler: handler,
-        handler_args: handler_args
+        handler_args: handler_args,
+        # The handler counts in its state, one callback at a time.
+        execution: :stateful
       )
 
     {:ok, client} =

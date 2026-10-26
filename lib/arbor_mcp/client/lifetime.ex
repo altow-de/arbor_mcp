@@ -11,7 +11,8 @@ defmodule Arbor.MCP.Client.Lifetime do
 
   def install(opts) do
     with {:ok, limit} <- limit(opts, :max_client_workers, 256, 4_096),
-         {:ok, cleanup} <- limit(opts, :client_cleanup_timeout, 1_000, @max_timer),
+         {:ok, cleanup} <-
+           limit(opts, :client_cleanup_timeout, Deadline.cleanup_timeout(opts), @max_timer),
          token = make_ref(),
          epoch = make_ref(),
          {:ok, observer} <-

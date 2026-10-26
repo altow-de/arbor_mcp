@@ -23,7 +23,7 @@ defmodule Arbor.MCP.Server.MRTRDispatchTest do
               "method" => "elicitation/create",
               "params" => %{
                 "message" => "Choose a display name",
-                "requestedSchema" => %{"type" => "object"}
+                "requestedSchema" => %{"type" => "object", "properties" => %{}}
               }
             }
           }
@@ -55,7 +55,7 @@ defmodule Arbor.MCP.Server.MRTRDispatchTest do
               "method" => "elicitation/create",
               "params" => %{
                 "message" => "Choose a display name",
-                "requestedSchema" => %{"type" => "object"}
+                "requestedSchema" => %{"type" => "object", "properties" => %{}}
               }
             }
           }
