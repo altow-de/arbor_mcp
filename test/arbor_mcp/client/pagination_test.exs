@@ -9,7 +9,18 @@ defmodule Arbor.MCP.Client.PaginationTest do
 
     def handle_call({:request, method, params, control}, _from, state) do
       send(state.owner, {:page_request, method, params, control})
-      if state[:delay], do: Process.sleep(state.delay)
+
+      # A delay per page, in order.
+      state =
+        case Map.get(state, :delays, []) do
+          [delay | delays] ->
+            Process.sleep(delay)
+            Map.put(state, :delays, delays)
+
+          [] ->
+            state
+        end
+
       [result | rest] = state.pages
       {:reply, result, %{state | pages: rest}}
     end
@@ -90,10 +101,12 @@ defmodule Arbor.MCP.Client.PaginationTest do
           {:ok, %{"tools" => [], "nextCursor" => "next"}},
           {:ok, %{"tools" => []}}
         ],
-        delay: 45
+        delays: [20, 1_000]
       )
 
-    assert {:error, :timeout} = Client.all_tools(client, timeout: 70)
+    # The first page answers well inside the deadline, however slow the
+    # machine; the second never does.
+    assert {:error, :timeout} = Client.all_tools(client, timeout: 250)
     assert_receive {:page_request, _, _, first}
     assert_receive {:page_request, _, _, second}
     assert first.deadline == second.deadline
