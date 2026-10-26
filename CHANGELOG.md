@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- An ArborMCP client never received anything on an ArborMCP server's legacy
+  Streamable HTTP GET stream: list changes, log messages and progress sent
+  there were lost, and a callback's `Server.list_roots/2`, sampling or
+  elicitation request timed out. The server opens the stream with a
+  `connected` event, which reached the client process before the receiver
+  that reads the stream had started, and the stream waited for an
+  acknowledgement that never came and closed five seconds later. An event now
+  goes to the receiver once it takes over. The client also skips events that
+  aren't MCP `message` events, such as `connected`, where it logged them as
+  unparseable, and keeps its session when the server closes the GET stream,
+  which an ArborMCP server does at its `:request_timeout_ms`: it opens the
+  stream again with `Last-Event-ID`, where it used to reconnect, start a new
+  session and fail every pending request.
+
 ## [2.0.0-rc.6] — 2026-10-26
 
 ### Added
