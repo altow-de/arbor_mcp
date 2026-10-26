@@ -173,6 +173,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A tool result its connection's revision can't carry, such as a
+  non-object `structuredContent` in a legacy era, raised in the server and
+  reached the client as an opaque `handler_crash`. It's now a `-32603`
+  error with `%{"type" => "invalid_result"}`, and the server logs why.
 - A notification sent before the answer to `initialize` or
   `server/discover`, such as a log message, was taken for the answer, and
   the client failed to connect. It now skips notifications until the answer
