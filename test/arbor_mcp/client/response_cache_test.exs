@@ -126,6 +126,14 @@ defmodule Arbor.MCP.Client.ResponseCacheTest do
     refute_received {:listed, _, _}
   end
 
+  test "a disconnected client says so rather than answering from the cache" do
+    {client, _server} = connect(:modern_only, client: [reconnect: false])
+    assert {:ok, _} = list(client)
+    :ok = Client.disconnect(client)
+
+    assert {:error, _not_connected} = list(client)
+  end
+
   test "response_cache: false keeps nothing" do
     {client, _server} = connect(:modern_only, client: [response_cache: false])
     assert {:ok, _} = list(client)

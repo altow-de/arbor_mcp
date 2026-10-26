@@ -135,9 +135,10 @@ defmodule Arbor.MCP.Server.Dispatch do
   end
 
   # A handler returns the contents, or the whole result when it sets more,
-  # such as cache hints. No content item has a "contents" field.
+  # such as cache hints. Every content item has a uri; a result has none.
   defp read_result(%{} = result)
-       when is_map_key(result, :contents) or is_map_key(result, "contents"),
+       when (is_map_key(result, :contents) or is_map_key(result, "contents")) and
+              not is_map_key(result, :uri) and not is_map_key(result, "uri"),
        do: result
 
   defp read_result(contents), do: %{"contents" => List.wrap(contents)}

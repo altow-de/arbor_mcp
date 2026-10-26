@@ -242,11 +242,16 @@ defmodule Arbor.MCP.Client do
   cursor) and each `resources/read` (by URI) for as long as its `ttlMs` says
   it stays fresh (2026-07-28 "Caching"), at most a day, and answers a repeat
   request from it. A result without `ttlMs`, as from a legacy server, is kept
-  for `:default_cache_ttl_ms`. A `list_changed` notification drops the lists
-  it names and a `resources/updated` notification drops that resource, even
-  while a request for them is in flight; reconnecting drops everything. The
-  cache holds at most 512 results and belongs to one client, so a
-  `cacheScope: "private"` result is never shared.
+  for `:default_cache_ttl_ms`; an interim result such as `input_required`
+  never is. Application `_meta` on a request is part of what it's kept under.
+  A `list_changed` notification drops the lists it names and a
+  `resources/updated` notification drops that resource, even while a request
+  for them is in flight; reconnecting drops everything, and a client that
+  isn't connected doesn't answer from it. The cache holds at most 512
+  results, 16 MiB in all and none over 1 MiB. It belongs to one client, which
+  is one authorization context, so a `cacheScope: "private"` result is never
+  shared; a client whose credentials change to another user's should pass
+  `response_cache: false`.
 
   Pass `cache_mode: :refresh` to ask the server again and keep the new
   result, or `cache_mode: :bypass` to ask without using or changing the
