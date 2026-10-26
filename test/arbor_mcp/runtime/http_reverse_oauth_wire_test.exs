@@ -299,6 +299,8 @@ defmodule Arbor.MCP.Qualification.HTTPReverseOAuthWireTest do
         init_timeout_ms: 1_000,
         shutdown_timeout_ms: 1_000,
         request_timeout_ms: @root_ms,
+        # The handler counts calls in its state, one callback at a time.
+        execution: :stateful,
         max_concurrency: 1,
         max_queue: Keyword.get(options, :max_queue, 0),
         services: [sessions: [options: [session_ttl_ms: 10_000]]],

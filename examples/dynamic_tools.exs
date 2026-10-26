@@ -327,7 +327,7 @@ defmodule Arbor.MCP.Examples.DynamicTools.Demo do
   alias Arbor.MCP.Transport.Test
 
   def run do
-    {:ok, root} = HandlerServer.start_link(handler: DynamicTools, transport: :test)
+    {:ok, root} = HandlerServer.start_link(handler: DynamicTools, transport: :test, execution: :stateful)
 
     try do
       {:ok, transport} = Test.connect(server: root)

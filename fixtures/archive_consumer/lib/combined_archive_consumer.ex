@@ -164,7 +164,13 @@ defmodule CombinedArchiveConsumer do
   defp verify_independent_lifetimes do
     alias Arbor.ACP.Agent.Transport.Memory
 
-    {:ok, runtime} = Runtime.start_link(handler: RuntimeHandler, dispatcher: RuntimeHandler)
+    {:ok, runtime} =
+      Runtime.start_link(
+        handler: RuntimeHandler,
+        dispatcher: RuntimeHandler,
+        execution: :stateful
+      )
+
     {:ok, peer} = Memory.new_pair()
     {:ok, agent} = Arbor.ACP.Agent.start_link(handler: NativeAgent, transport: {:memory, peer})
     {:ok, client} = Arbor.ACP.Client.start_link(transport_mod: Memory, peer: peer, role: :client)
@@ -187,7 +193,12 @@ defmodule CombinedArchiveConsumer do
       {:ok, %{"stopReason" => "end_turn"}} =
         Arbor.ACP.Client.prompt(client, "consumer-session", "after MCP stop")
 
-      {:ok, sibling} = Runtime.start_link(handler: RuntimeHandler, dispatcher: RuntimeHandler)
+      {:ok, sibling} =
+        Runtime.start_link(
+          handler: RuntimeHandler,
+          dispatcher: RuntimeHandler,
+          execution: :stateful
+        )
 
       try do
         :ok = Arbor.ACP.Client.disconnect(client)

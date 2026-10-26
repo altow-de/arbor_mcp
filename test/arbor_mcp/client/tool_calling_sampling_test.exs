@@ -415,7 +415,7 @@ defmodule Arbor.MCP.Client.ToolCallingSamplingTest do
 
       params = %{
         "message" => "Choose a project",
-        "requestedSchema" => %{"type" => "object"}
+        "requestedSchema" => %{"type" => "object", "properties" => %{}}
       }
 
       {:noreply, state} =

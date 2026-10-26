@@ -243,12 +243,21 @@ stop the old Client and start a new Client against the retained server. Calling
 `Client.connect/2` does not reconnect an existing Client PID. HTTP sessions have
 separate request-ID retention and expiration.
 
+### Requests fail with `invalid_handler_state`
+
+Servers run callbacks concurrently by default (`execution: :stateless`), so a
+callback other than `init/1` and `handle_initialize/2` must return the handler
+state unchanged. The runtime logs a warning naming the handler the first time
+one doesn't. Keep counters, caches and
+other mutable data in a process or ETS table, or start the server with
+`execution: :stateful` to run callbacks one at a time and commit their state.
+See the [runtime guide](RUNTIME_GUIDE.md).
+
 ### Increasing concurrency fails validation
 
-Stateful callbacks are serialized. More than one callback worker requires
-`execution: :stateless`, and those callbacks must return unchanged initialized
-state. Queue capacity and input/output byte limits are independent of concurrency.
-See the [runtime guide](RUNTIME_GUIDE.md).
+`execution: :stateful` runs one callback at a time and accepts only
+`max_concurrency: 1`. Raise `max_concurrency` on a stateless runtime instead.
+Queue capacity and input/output byte limits are independent of concurrency.
 
 ### Stopping a client does not stop its server
 

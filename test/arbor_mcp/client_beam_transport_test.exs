@@ -245,7 +245,9 @@ defmodule Arbor.MCP.ClientBeamTransportTest do
         HandlerServer.start_link(
           transport: :beam,
           handler: CalculatorHandler,
-          handler_args: %{counter: 0}
+          handler_args: %{counter: 0},
+          # "counter" increments handler state; the test expects 1..100 in order.
+          execution: :stateful
         )
 
       on_exit(fn -> stop_if_alive(server_pid) end)

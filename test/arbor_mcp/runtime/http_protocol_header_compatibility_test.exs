@@ -91,9 +91,15 @@ defmodule Arbor.MCP.Server.Runtime.HTTPProtocolHeaderCompatibilityTest do
         assert compatible_context.protocol_version == nil
         assert compatible_context.principal_id == "principal"
         assert compatible_context.tenant_id == "tenant"
-        # Only the actual request ID and request-owned notification target differ.
-        assert Map.drop(Map.from_struct(compatible_context), [:request_id, :notification_target]) ==
-                 Map.drop(Map.from_struct(matching_context), [:request_id, :notification_target])
+        # Only the actual request ID, the request's own headers and its
+        # notification target differ.
+        assert List.keyfind(compatible_context.request_headers, "mcp-protocol-version", 0) ==
+                 {"mcp-protocol-version", header}
+
+        per_request = [:request_id, :request_headers, :notification_target]
+
+        assert Map.drop(Map.from_struct(compatible_context), per_request) ==
+                 Map.drop(Map.from_struct(matching_context), per_request)
 
         unchanged_session(service, lease, before)
       end
@@ -316,6 +322,8 @@ defmodule Arbor.MCP.Server.Runtime.HTTPProtocolHeaderCompatibilityTest do
              handler: Handler,
              handler_args: [observer: self()],
              request_timeout_ms: 2_000,
+             # The handler stores its initialization and counts in its state.
+             execution: :stateful,
              max_concurrency: 1,
              max_queue: 1,
              max_http_io_frames: 2,

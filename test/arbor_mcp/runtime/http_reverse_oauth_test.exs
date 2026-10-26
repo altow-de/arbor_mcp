@@ -192,12 +192,14 @@ defmodule Arbor.MCP.Server.Runtime.HTTPReverseOAuthTest do
   end
 
   defp host(mount_options \\ []) do
+    # The handler changes its state, one callback at a time.
     root =
       start_supervised!(
         {Runtime,
          handler: Handler,
          handler_args: [observer: self()],
          request_timeout_ms: 2_000,
+         execution: :stateful,
          max_concurrency: 1,
          max_queue: 0,
          services: [sessions: []]},

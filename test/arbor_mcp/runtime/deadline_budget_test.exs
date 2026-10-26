@@ -143,6 +143,7 @@ defmodule Arbor.MCP.Server.Runtime.DeadlineBudgetTest do
   end
 
   defp start_runtime do
+    # Accepted work commits handler state, one callback at a time.
     root =
       start_supervised!(
         {Runtime,
@@ -150,7 +151,8 @@ defmodule Arbor.MCP.Server.Runtime.DeadlineBudgetTest do
          dispatcher: Handler,
          handler_args: [test_pid: self()],
          max_queue: 1,
-         request_timeout_ms: 2_000}
+         request_timeout_ms: 2_000,
+         execution: :stateful}
       )
 
     {:ok, runtime} = Runtime.ref(root)

@@ -170,7 +170,9 @@ defmodule Arbor.MCP.ResourcesTest do
     {:ok, server} =
       Server.start_link(
         transport: :test,
-        handler: TestResourcesHandler
+        handler: TestResourcesHandler,
+        # The handler records subscriptions in its state.
+        execution: :stateful
       )
 
     # Start client connecting to the server

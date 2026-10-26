@@ -1,10 +1,11 @@
 defmodule Arbor.MCP.Client.RequestDeliveryTest do
   @moduledoc """
-  A synchronous HTTP client sends one request at a time from its own process,
-  so a request can wait in its mailbox behind a slow one. It must not be sent
-  once its caller has given up (the caller's deadline passed, or the caller
-  exited), and a failed send must keep the transport's reason as a term so
-  `Arbor.MCP.Client.delivery_outcome/1` can tell "not sent" from "unknown".
+  The HTTP client POSTs each request from its own task, so a request does not
+  wait behind a slow one. A request that does wait in the client's mailbox
+  must not be sent once its caller has given up (the caller's deadline passed,
+  or the caller exited), and a failed send must keep the transport's reason as
+  a term so `Arbor.MCP.Client.delivery_outcome/1` can tell "not sent" from
+  "unknown".
   """
 
   use ExUnit.Case, async: false
@@ -37,15 +38,25 @@ defmodule Arbor.MCP.Client.RequestDeliveryTest do
     %{bypass: bypass, client: client}
   end
 
-  describe "a request queued behind a slow one" do
+  test "a request does not wait behind a slow one", %{client: client} do
+    slow = Task.async(fn -> Client.call_tool(client, "slow", %{}, timeout: 10_000) end)
+    assert_receive {:tool_call_started, "slow", handler}, 2_000
+
+    assert {:ok, _result} = Client.call_tool(client, "quick", %{}, timeout: 2_000)
+
+    send(handler, :release)
+    assert {:ok, _result} = Task.await(slow)
+  end
+
+  describe "a request queued in a busy client" do
     test "is not sent once its caller's deadline has passed", %{client: client} do
-      slow = Task.async(fn -> Client.call_tool(client, "slow", %{}, timeout: 10_000) end)
-      assert_receive {:tool_call_started, "slow", handler}, 2_000
-
-      assert {:error, _timeout} = Client.call_tool(client, "late", %{}, timeout: 100)
-
-      send(handler, :release)
-      assert {:ok, _result} = Task.await(slow)
+      :ok = :sys.suspend(client)
+      late = Task.async(fn -> Client.call_tool(client, "late", %{}, timeout: 100) end)
+      wait_until(fn -> queued_request?(client, late.pid) end, timeout: 2_000)
+      # Genuinely about timing: the deadline passes while the request waits.
+      Process.sleep(150)
+      :ok = :sys.resume(client)
+      assert {:error, _timeout} = Task.await(late)
 
       # The client has dequeued (and dropped) the late request by now.
       _ = :sys.get_state(client)
@@ -53,18 +64,14 @@ defmodule Arbor.MCP.Client.RequestDeliveryTest do
     end
 
     test "is not sent once its caller has exited", %{client: client} do
-      slow = Task.async(fn -> Client.call_tool(client, "slow", %{}, timeout: 10_000) end)
-      assert_receive {:tool_call_started, "slow", handler}, 2_000
-
+      :ok = :sys.suspend(client)
       {caller, monitor} = spawn_monitor(fn -> Client.call_tool(client, "orphan", %{}) end)
 
       # Kill the caller only once its request is queued in the busy client.
       wait_until(fn -> queued_request?(client, caller) end, timeout: 2_000)
       Process.exit(caller, :kill)
       assert_receive {:DOWN, ^monitor, :process, ^caller, :killed}, 2_000
-
-      send(handler, :release)
-      assert {:ok, _result} = Task.await(slow)
+      :ok = :sys.resume(client)
 
       _ = :sys.get_state(client)
       refute_received {:tool_call_started, "orphan", _handler}

@@ -58,6 +58,10 @@ end
 
 if System.get_env("MCP_ENV") != "test" do
   IO.puts(:stderr, "Starting STDIO hello server.")
-  {:ok, _server} = StdioHelloServer.start_link(transport: :stdio, stdio_startup_delay: 10)
+  {:ok, _server} = StdioHelloServer.start_link(
+      transport: :stdio,
+      stdio_startup_delay: 10,
+      execution: :stateful
+    )
   Process.sleep(:infinity)
 end

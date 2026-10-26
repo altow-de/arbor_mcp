@@ -12,6 +12,7 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   alias Arbor.MCP.Internal.{Protocol, VersionInfo, VersionRegistry}
   alias Arbor.MCP.Reliability.Retry
   alias Arbor.MCP.Testing.MockTransport
+
   alias Arbor.MCP.Transport.{HTTP, Local, ReliabilityWrapper, Stdio, Test}
   alias Arbor.MCP.Transport.HTTP.LegacySSE
   alias Arbor.RPC.LogSummary
@@ -121,6 +122,7 @@ defmodule Arbor.MCP.Client.ConnectionManager do
         |> Map.put(:server_capabilities, result["capabilities"])
         |> Map.put(:protocol_version, result["protocolVersion"])
         |> Map.put(:server_info, result["serverInfo"])
+        |> Map.put(:server_instructions, result["instructions"])
 
       ConnectionScope.established()
       {:ok, new_state}
@@ -359,7 +361,8 @@ defmodule Arbor.MCP.Client.ConnectionManager do
     %{
       "protocolVersion" => discovery.protocol_version,
       "capabilities" => discovery.server_capabilities,
-      "serverInfo" => discovery.server_info
+      "serverInfo" => discovery.server_info,
+      "instructions" => Map.get(discovery, :instructions)
     }
   end
 
@@ -723,16 +726,26 @@ defmodule Arbor.MCP.Client.ConnectionManager do
 
     transport_state = Deadline.put_on_transport(transport_mod, transport_state, exchange_deadline)
 
+    # The same capabilities a modern client sends with every request.
+    capabilities = Keyword.get(opts, :capabilities, %{})
+
     transport_mod
-    |> exchange_initialize(transport_state, protocol_version, exchange_deadline)
+    |> exchange_initialize(transport_state, protocol_version, capabilities, exchange_deadline)
     |> restore_deadline(transport_mod, establish_deadline)
   end
 
-  defp exchange_initialize(transport_mod, transport_state, protocol_version, deadline) do
+  defp exchange_initialize(
+         transport_mod,
+         transport_state,
+         protocol_version,
+         capabilities,
+         deadline
+       ) do
     case send_initialize_request(
            transport_mod,
            transport_state,
-           protocol_version
+           protocol_version,
+           capabilities
          ) do
       {:ok, state_after_send, response_data} ->
         # Non-SSE HTTP mode - response came back immediately
@@ -742,10 +755,10 @@ defmodule Arbor.MCP.Client.ConnectionManager do
 
       {:ok, state_after_send} ->
         # SSE mode or other transports - need to receive separately
-        case receive_handshake_message(
+        case await_handshake_message(
                transport_mod,
                state_after_send,
-               Deadline.remaining(deadline)
+               deadline
              ) do
           {:ok, response_data, state_after_receive} ->
             response_data
@@ -777,11 +790,12 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   defp send_initialize_request(
          transport_mod,
          transport_state,
-         protocol_version
+         protocol_version,
+         capabilities
        ) do
     client_info = VersionInfo.client_info()
 
-    request = Protocol.encode_initialize(client_info, %{}, protocol_version)
+    request = Protocol.encode_initialize(client_info, capabilities, protocol_version)
 
     with {:ok, outbound_request} <- encode_for_transport(transport_mod, request) do
       case transport_mod.send_message(outbound_request, transport_state) do
@@ -808,6 +822,21 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   # mailbox) are called in-process with the timeout; transports with only the
   # blocking receive_message/1 are wrapped in a task that is shut down on
   # expiry. On timeout the connection attempt fails with :handshake_timeout.
+  # A server may send notifications, such as a log message or a list
+  # change, before it answers. They aren't the answer and say nothing about
+  # the protocol era, so keep waiting for one until the deadline.
+  defp await_handshake_message(transport_mod, transport_state, deadline) do
+    case receive_handshake_message(transport_mod, transport_state, Deadline.remaining(deadline)) do
+      {:ok, message, new_state} ->
+        if match?({:notification, _method, _params}, Protocol.parse_message(message)),
+          do: await_handshake_message(transport_mod, new_state, deadline),
+          else: {:ok, message, new_state}
+
+      error ->
+        error
+    end
+  end
+
   defp receive_handshake_message(transport_mod, transport_state, timeout) do
     result =
       if function_exported?(transport_mod, :receive_message, 2) do

@@ -112,13 +112,17 @@ defmodule Arbor.MCP.Server.Runtime.HTTPSubscriptionStreamTest do
 
   defp runtime(extra) do
     root =
-      start_supervised!(
-        {Runtime,
-         Keyword.merge(
-           [handler: Handler, handler_args: [test: self()], request_timeout_ms: 1_000],
-           extra
-         )}
-      )
+      start_supervised!({Runtime,
+       Keyword.merge(
+         [
+           handler: Handler,
+           handler_args: [test: self()],
+           request_timeout_ms: 1_000,
+           # "publish" counts in handler state; its publication commits with it.
+           execution: :stateful
+         ],
+         extra
+       )})
 
     {:ok, runtime} = Runtime.ref(root)
     runtime

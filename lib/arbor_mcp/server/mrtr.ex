@@ -3,7 +3,7 @@ defmodule Arbor.MCP.Server.MRTR do
 
   alias Arbor.MCP.Error
   alias Arbor.MCP.Internal.VersionRegistry
-  alias Arbor.MCP.Protocol.ErrorCodes
+  alias Arbor.MCP.Protocol.{Elicitation, ErrorCodes}
   alias Arbor.MCP.Server.{RequestContext, RequestState, ResultNormalizer}
 
   @supported_methods ["tools/call", "resources/read", "prompts/get"]
@@ -119,6 +119,23 @@ defmodule Arbor.MCP.Server.MRTR do
     end
   end
 
+  @doc false
+  # Validates a handler's input requests for a legacy client, which gets
+  # them as server-to-client requests rather than an input_required result.
+  @spec legacy_input_requests(RequestContext.t(), map(), keyword()) ::
+          {:ok, map()} | {:error, Error.ProtocolError.t()}
+  def legacy_input_requests(%RequestContext{method: method}, input_requests, opts) do
+    if method in @supported_methods do
+      with {:ok, requests} <- normalize_input_requests(input_requests),
+           :ok <- validate_request_count(requests, opts),
+           :ok <- validate_size(requests, opts),
+           do: {:ok, requests}
+    else
+      {:error,
+       invalid("input_required is only valid for tools/call, resources/read, and prompts/get")}
+    end
+  end
+
   @spec build_result(RequestContext.t(), map(), map(), term(), keyword()) ::
           {:ok, map()} | {:error, Error.ProtocolError.t()}
   def build_result(context, params, input_requests, application_state, opts \\ []) do
@@ -171,13 +188,15 @@ defmodule Arbor.MCP.Server.MRTR do
         method = Map.get(request, "method")
         params = Map.get(request, "params", %{})
 
-        if method in @input_methods and is_map(params) do
+        with true <- method in @input_methods and is_map(params),
+             {:ok, params} <- input_params(method, params) do
           clean = %{"method" => method, "params" => params}
           {:cont, {:ok, Map.put(acc, id, clean)}}
         else
-          {:halt,
-           {:error,
-            invalid("Invalid MRTR input request", %{"inputRequestId" => id, "method" => method})}}
+          _invalid ->
+            {:halt,
+             {:error,
+              invalid("Invalid MRTR input request", %{"inputRequestId" => id, "method" => method})}}
         end
 
       {id, _request}, _acc ->
@@ -187,6 +206,13 @@ defmodule Arbor.MCP.Server.MRTR do
 
   defp normalize_input_requests(_requests),
     do: {:error, invalid("inputRequests must be an object")}
+
+  # An elicitation is held to the protocol's ElicitRequest schema in both
+  # eras, as the legacy bridge holds the requests it sends.
+  defp input_params("elicitation/create", params),
+    do: Elicitation.validate(params, System.monotonic_time(:millisecond) + 1_000)
+
+  defp input_params(_method, params), do: {:ok, params}
 
   defp validate_request_count(requests, opts) do
     maximum = Keyword.get(opts, :max_input_requests, @default_max_input_requests)

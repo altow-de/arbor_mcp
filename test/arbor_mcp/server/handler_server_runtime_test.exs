@@ -708,7 +708,16 @@ defmodule Arbor.MCP.Server.HandlerServerRuntimeTest do
 
   defp start_pair(opts \\ []) do
     opts =
-      Keyword.merge([transport: :test, handler: Handler, handler_args: [test_pid: self()]], opts)
+      Keyword.merge(
+        [
+          transport: :test,
+          handler: Handler,
+          handler_args: [test_pid: self()],
+          # The handler counts in its state, one callback at a time.
+          execution: :stateful
+        ],
+        opts
+      )
 
     root =
       start_supervised!(

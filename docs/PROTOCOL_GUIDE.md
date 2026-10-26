@@ -32,6 +32,20 @@ matching client capability:
 See [Multi Round-Trip Requests](CONFIGURATION.md#multi-round-trip-requests-mcp-2026-07-28)
 for key-ring setup. The six elicitation rows below use that path.
 
+The same handler serves legacy clients. A legacy revision has no
+`input_required` result, so the server sends each input request to the client
+as the request it stands for (`elicitation/create`, `sampling/createMessage`
+or `roots/list`), then calls the callback again with the answers in
+`Arbor.MCP.Server.Context.input_responses/0` and the application state in
+`Context.request_state/0`, as the TypeScript, Go and C# SDKs do. Each request
+waits under what remains of the original request's deadline, a client error
+fails the call, and a callback that asks for input more than 10 times fails
+with `-32603`. A request is sent only if the connection's negotiated
+revision defines it and the client declared the capability (`elicitation`,
+`sampling` or `roots`) in `initialize`, so pass `capabilities:` to the client.
+Over legacy HTTP the requests go out on the session's stream, so the client
+must have one open.
+
 ### Form mode
 
 The server returns an `elicitation/create` input request with a
@@ -203,7 +217,7 @@ use `Arbor.MCP.Client.notify/3` with the `elicitationId` from
     "elicitationId" => elicitation_id
   })
 
-# Server
+# Server, started with execution: :stateful so callbacks can update state
 @impl true
 def handle_elicitation_complete(elicitation_id, state) do
   {:ok, Map.put(state, :last_elicitation, elicitation_id)}
@@ -325,14 +339,14 @@ server reports progress against that token.
 {:ok, result} =
   Arbor.MCP.Client.call_tool(client, "import", %{}, progress_token: "job-42")
 
-# Client — modern HTTP delivers events to the handler
+# Client — the handler receives each update, on every transport
 @impl true
 def handle_progress(_request_id, %{"progressToken" => token, "progress" => n} = note, state) do
   _ = {token, n, Map.get(note, "total"), Map.get(note, "message")}
   {:ok, state}
 end
 
-# Server — request-scoped, writes notifications/progress on the owning stream
+# Server — request-scoped, on every transport
 @impl true
 def handle_call_tool("import", _args, state) do
   if Arbor.MCP.Server.Context.progress_token() do
@@ -344,8 +358,7 @@ def handle_call_tool("import", _args, state) do
 end
 ```
 
-On BEAM, stdio, and other non-stream helpers you can still publish by
-token:
+Outside a callback, or for another request's token, publish by token:
 
 ```elixir
 :ok = Arbor.MCP.Server.notify_progress(server, "job-42", 50)
@@ -353,6 +366,28 @@ token:
 ```
 
 `Arbor.MCP.Client.call_tool/4` also accepts `:meta` and merges it with `:progress_token`.
+
+### Keeping a long request alive
+
+As with the TypeScript SDK's `resetTimeoutOnProgress`, a request made with
+`reset_timeout_on_progress: true` times out only once it has gone `:timeout`
+milliseconds (or the client's default) without progress, and
+`:max_total_timeout` caps it however much progress it makes. The client adds a
+progress token if the request has none.
+
+```elixir
+{:ok, result} =
+  Arbor.MCP.Client.call_tool(client, "import", %{},
+    timeout: 30_000,
+    reset_timeout_on_progress: true,
+    max_total_timeout: :timer.hours(2)
+  )
+```
+
+Without `:max_total_timeout` there is no overall limit. Over HTTP the
+transport's `:request_timeout` doesn't cut such a request off, but a modern
+request stream that carries nothing for `:stream_idle_timeout` (60 s by
+default) still closes.
 
 ## Cancellation
 

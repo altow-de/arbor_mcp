@@ -120,13 +120,17 @@ defmodule Arbor.MCP.Server.Runtime.OutputIntegrationTest do
 
   defp pair(opts \\ []) do
     root =
-      start_supervised!(
-        {HandlerServer,
-         Keyword.merge(
-           [handler: Handler, handler_args: [test_pid: self()], transport: :test],
-           opts
-         )}
-      )
+      start_supervised!({HandlerServer,
+       Keyword.merge(
+         [
+           handler: Handler,
+           handler_args: [test_pid: self()],
+           transport: :test,
+           # The handler counts in its state, one callback at a time.
+           execution: :stateful
+         ],
+         opts
+       )})
 
     module = if opts[:transport] == :beam, do: Local, else: Test
     {:ok, transport} = module.connect(server: root)

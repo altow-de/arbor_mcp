@@ -115,7 +115,12 @@ defmodule Arbor.MCP.Content.SchemaDialectTest do
     alias Arbor.MCP.Server.HandlerServer
     alias Arbor.MCP.Transport.Test
 
-    root = start_supervised!({HandlerServer, handler: DynamicTools, transport: :test})
+    # The DynamicTools catalog lives in handler state.
+    root =
+      start_supervised!(
+        {HandlerServer, handler: DynamicTools, transport: :test, execution: :stateful}
+      )
+
     {:ok, transport} = Test.connect(server: root)
     schema = %{"type" => "array", "prefixItems" => [%{"type" => "integer"}], "items" => false}
 
@@ -127,9 +132,10 @@ defmodule Arbor.MCP.Content.SchemaDialectTest do
 
     bulk = %{single | "name" => "bulk"}
 
+    # The connection has no era until its first request, so no list change
+    # is sent to it.
     for entries <- [[{single, {Actions, :value}, %{}}], [{bulk, {Actions, :value}, %{}}]] do
       assert {:ok, :ok} = Server.call(root, {:register, entries, :reject})
-      assert_receive {:transport_message, _changed}
     end
 
     for name <- ["single", "bulk"], value <- [[7], [7, 8]] do

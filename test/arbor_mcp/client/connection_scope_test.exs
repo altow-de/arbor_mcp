@@ -9,6 +9,7 @@ defmodule Arbor.MCP.Client.ConnectionScopeTest do
   alias Arbor.MCP.Server.{HandlerServer, Runtime}
   alias Arbor.MCP.Testing.MockServer
   alias Arbor.RPC.Subprocess
+  alias Arbor.RPC.Subprocess.Receipt
 
   defmodule Transport do
     @behaviour Arbor.MCP.Transport
@@ -510,7 +511,32 @@ defmodule Arbor.MCP.Client.ConnectionScopeTest do
 
     refute Process.alive?(client)
     assert {:ok, receipt} = Subprocess.cleanup_receipt(child)
-    assert :ok = Arbor.RPC.Subprocess.Receipt.result(receipt)
+    assert :ok = Receipt.result(receipt)
+  end
+
+  test "a scope's cleanup_timeout bounds the scope, not the stdio server's shutdown" do
+    python = System.find_executable("python3") || flunk("python3 required for child fixture")
+
+    script = """
+    import json, sys
+    for line in sys.stdin:
+        request = json.loads(line)
+        if request.get("method") == "initialize":
+            result = {"protocolVersion": "2025-11-25", "serverInfo": {"name": "scope-child", "version": "1"}, "capabilities": {}}
+            print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+    """
+
+    assert {:ok, child} =
+             Client.with_connection(
+               {:stdio, command: [python, "-u", "-c", script]},
+               [protocol_mode: :legacy_only, health_check_interval: nil, cleanup_timeout: 1_500],
+               fn client -> :sys.get_state(client).transport_state.subprocess end
+             )
+
+    # The server keeps the stdio defaults: a 2 s EOF grace within 2.5 s.
+    assert %Subprocess{cleanup_timeout: 2_500} = child
+    assert {:ok, receipt} = Subprocess.cleanup_receipt(child)
+    assert :ok = Receipt.result(receipt)
   end
 
   test "unsupported infinite budgets and existing clients fail before effects" do

@@ -12,7 +12,12 @@ defmodule Arbor.MCP.Server.DSL.ComponentsTest do
 
   defmodule Leaf do
     use Arbor.MCP.Server.Handler
-    use Arbor.MCP.Server.DSL, name: "leaf", version: "99"
+
+    use Arbor.MCP.Server.DSL,
+      name: "leaf",
+      version: "99",
+      instructions: "leaf only",
+      capabilities: [logging: %{}]
 
     alias Arbor.MCP.Server.DSL.ComponentsTest.Formatting, as: LocalFormatting
 
@@ -207,7 +212,7 @@ defmodule Arbor.MCP.Server.DSL.ComponentsTest do
     state = %{count: 3, test_pid: self()}
 
     for args <- [%{"count" => 0}, %{"count" => "2"}, %{"label" => "a"}] do
-      assert {:error, %Arbor.MCP.Error.ProtocolError{code: -32602}, ^state} =
+      assert {:ok, %{isError: true, content: [%{text: "Input validation error" <> _}]}, ^state} =
                Host.handle_call_tool("shared", args, state)
     end
 
@@ -261,15 +266,19 @@ defmodule Arbor.MCP.Server.DSL.ComponentsTest do
   test "host initialization info and capabilities do not inherit component server options" do
     assert Host.__server_info__() == %{"name" => "host", "version" => "2"}
 
-    assert Host.__server_capabilities__() == %{
-             "tools" => %{},
-             "resources" => %{},
-             "prompts" => %{}
-           }
+    capabilities = %{
+      "tools" => %{"listChanged" => true},
+      "resources" => %{"listChanged" => true},
+      "prompts" => %{"listChanged" => true}
+    }
+
+    assert Host.__server_capabilities__() == capabilities
+    assert Host.__server_instructions__() == nil
 
     assert {:ok, result, state} = Host.handle_initialize(%{}, %{count: 0})
     assert result["serverInfo"] == %{"name" => "host", "version" => "2"}
-    assert result["capabilities"] == %{"tools" => %{}, "resources" => %{}, "prompts" => %{}}
+    assert result["capabilities"] == capabilities
+    refute Map.has_key?(result, "instructions")
     assert state.count == 0
   end
 
@@ -500,7 +509,12 @@ defmodule Arbor.MCP.Server.DSL.ComponentsTest do
   end
 
   defp start_host(transport) do
-    root = start_supervised!({Host, transport: transport, handler_args: [test_pid: self()]})
+    # Host and component callbacks count in the shared handler state.
+    root =
+      start_supervised!(
+        {Host, transport: transport, handler_args: [test_pid: self()], execution: :stateful}
+      )
+
     module = if transport == :beam, do: Local, else: Test
     {:ok, connection} = module.connect(server: root)
     {root, connection}

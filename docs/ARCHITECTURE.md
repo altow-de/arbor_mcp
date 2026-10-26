@@ -41,9 +41,10 @@ end
 ```
 
 `Arbor.MCP.Server.Runtime` supervises the handler scheduler, scoped services,
-transport edge and owned work. Stateful callbacks run serially in supervised
-workers; explicit stateless mode permits bounded concurrency without state
-updates. Admission reserves count and byte capacity before queuing payloads.
+transport edge and owned work. Callbacks run in supervised workers, by default
+concurrently and without state updates (`execution: :stateless`); stateful mode
+runs them one at a time and commits each returned state. Admission reserves
+count and byte capacity before queuing payloads.
 
 `Arbor.MCP.Server.HandlerServer.start_link/1` and the DSL-generated
 `start_link/1` return a Runtime supervisor PID. HandlerServer is the BEAM/test

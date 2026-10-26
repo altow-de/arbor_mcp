@@ -555,7 +555,7 @@ defmodule Arbor.MCP.Integration.ConcurrentClientsTest do
 
       runtime =
         start_supervised!(
-          {Runtime, handler: ErrorProneHandler, transport: :mounted_http},
+          {Runtime, handler: ErrorProneHandler, transport: :mounted_http, execution: :stateful},
           id: make_ref()
         )
 

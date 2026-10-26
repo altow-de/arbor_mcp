@@ -320,7 +320,9 @@ defmodule Arbor.MCP.ProgressMetaComprehensiveTest do
       {:ok, server} =
         Server.start_link(
           transport: :test,
-          handler: ComprehensiveHandler
+          handler: ComprehensiveHandler,
+          # The handler records what it receives in its state.
+          execution: :stateful
         )
 
       {:ok, client} =
@@ -463,7 +465,9 @@ defmodule Arbor.MCP.ProgressMetaComprehensiveTest do
       {:ok, server} =
         Server.start_link(
           transport: :test,
-          handler: ComprehensiveHandler
+          handler: ComprehensiveHandler,
+          # The handler records what it receives in its state.
+          execution: :stateful
         )
 
       {:ok, client} =
@@ -565,7 +569,9 @@ defmodule Arbor.MCP.ProgressMetaComprehensiveTest do
       {:ok, server} =
         Server.start_link(
           transport: :test,
-          handler: ComprehensiveHandler
+          handler: ComprehensiveHandler,
+          # The handler records what it receives in its state.
+          execution: :stateful
         )
 
       {:ok, client} =
@@ -613,45 +619,22 @@ defmodule Arbor.MCP.ProgressMetaComprehensiveTest do
       assert {:ok, _} = result
     end
 
-    test "duplicate progress tokens across requests", %{client: client} do
-      # Progress notifications are sent through the transport
+    # Progress tokens MUST be unique across active requests (MCP progress
+    # utility), so a pending request's token is refused; see
+    # Arbor.MCP.Client.ConnectionNotificationsTest. Once that request has
+    # finished, its token can be used again.
+    test "a progress token can be reused once its request finished", %{client: client} do
+      token = "reused-token"
 
-      # Same token for multiple requests (not recommended but should work)
-      token = "duplicate-token"
-
-      # Start two operations with same token
-      task1 =
-        Task.async(fn ->
-          Client.call_tool(
-            client,
-            "progress_tool",
-            %{
-              "duration" => 200,
-              "steps" => 2
-            },
-            meta: %{"progressToken" => token}
-          )
-        end)
-
-      task2 =
-        Task.async(fn ->
-          Client.call_tool(
-            client,
-            "progress_tool",
-            %{
-              "duration" => 200,
-              "steps" => 2
-            },
-            meta: %{"progressToken" => token}
-          )
-        end)
-
-      # Wait for both operations to complete
-      # Progress notifications would be sent but not received by test process
-
-      # Both tasks should complete
-      assert {:ok, _} = Task.await(task1)
-      assert {:ok, _} = Task.await(task2)
+      for _call <- 1..2 do
+        assert {:ok, _} =
+                 Client.call_tool(
+                   client,
+                   "progress_tool",
+                   %{"duration" => 50, "steps" => 2},
+                   meta: %{"progressToken" => token}
+                 )
+      end
     end
   end
 
@@ -660,7 +643,9 @@ defmodule Arbor.MCP.ProgressMetaComprehensiveTest do
       {:ok, server} =
         Server.start_link(
           transport: :test,
-          handler: ComprehensiveHandler
+          handler: ComprehensiveHandler,
+          # The handler records what it receives in its state.
+          execution: :stateful
         )
 
       {:ok, client} =

@@ -63,7 +63,9 @@ defmodule Arbor.MCP.WirePrivacyTest do
             handler_args: [test_pid: self()],
             stdio_input: input,
             stdio_output: output,
-            stdio_startup_delay: 0
+            stdio_startup_delay: 0,
+            # The fixture's "inc" tool counts in handler state.
+            execution: :stateful
           )
 
         Process.unlink(root)

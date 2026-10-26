@@ -1273,7 +1273,7 @@ defmodule Arbor.MCP.Server.Runtime.OutputController do
 
   defp failure_response(proof) do
     reason =
-      if proof.reason in [:request_cancelled, :handler_timeout],
+      if proof.reason in [:request_cancelled, :handler_timeout, :invalid_handler_state],
         do: proof.reason,
         else: :output_failed
 

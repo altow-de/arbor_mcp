@@ -337,19 +337,19 @@ defmodule Arbor.MCP.Server.Runtime.HTTPLegacyAliasWireTest do
 
   defp host(extra \\ []) do
     root =
-      start_supervised!(
-        {Runtime,
-         Keyword.merge(
-           [
-             name: HTTPLegacyAliasWireTest.Root,
-             handler: Handler,
-             handler_args: [observer: self()],
-             request_timeout_ms: 2_000,
-             services: [sessions: [options: [session_ttl_ms: 5_000]]]
-           ],
-           extra
-         )}
-      )
+      start_supervised!({Runtime,
+       Keyword.merge(
+         [
+           name: HTTPLegacyAliasWireTest.Root,
+           handler: Handler,
+           handler_args: [observer: self()],
+           request_timeout_ms: 2_000,
+           services: [sessions: [options: [session_ttl_ms: 5_000]]],
+           # The handler counts in its state, one callback at a time.
+           execution: :stateful
+         ],
+         extra
+       )})
 
     {:ok, runtime} = Runtime.ref(root)
     ref = make_ref()
