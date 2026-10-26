@@ -445,17 +445,20 @@ defmodule Arbor.MCP.Transport.HTTP do
           1_000 -> exit(:client_generation_retired)
         end
 
-        result = perform_async(message, request_state, parent)
+        {result, sent_state} = perform_async(message, request_state, parent)
 
         # Report the durable transport-state fields this POST changed
         # (session rotation, SSE metadata) so the client can merge them into
-        # its copy of the transport state instead of discarding.
+        # its copy of the transport state instead of discarding. They're
+        # measured from the state the POST was last sent with, so a token
+        # the client handed this task (and has since perhaps replaced) isn't
+        # merged back.
         meta = %{
           request_id: request_id,
           task_pid: self(),
           deadline: request_state.deadline,
           tool_list: tool_list_page(message),
-          state_changes: result_state_changes(request_state, result)
+          state_changes: result_state_changes(sent_state, result)
         }
 
         Lifetime.deliver(parent, {:async_post_result, result, meta})
@@ -466,8 +469,16 @@ defmodule Arbor.MCP.Transport.HTTP do
     send(task_pid, {nonce, :run})
 
     # Return without response data — it will arrive via :async_post_result
-    # or via the GET SSE stream (for SSE-formatted POST responses)
-    {:ok, %{state | auth_provider_state: request_state.auth_provider_state}}
+    # or via the GET SSE stream (for SSE-formatted POST responses). The
+    # token the provider gave is kept with its state, so a challenge to it
+    # isn't mistaken for one to an older token.
+    {:ok,
+     %{
+       state
+       | auth_provider_state: request_state.auth_provider_state,
+         access_token: request_state.access_token,
+         headers: request_state.headers
+     }}
   end
 
   # A POST task does not authenticate: with several in flight, each would run
@@ -484,7 +495,7 @@ defmodule Arbor.MCP.Transport.HTTP do
       {:ok, response} ->
         case {extract_auth_status(response), state.auth_provider} do
           {:ok, _provider} ->
-            handle_http_response(response, state, message)
+            {handle_http_response(response, state, message), state}
 
           # As a modern request stream does: the client process answers the
           # challenge, one at a time across its requests, and this task sends
@@ -496,18 +507,18 @@ defmodule Arbor.MCP.Transport.HTTP do
                 perform_async(message, apply_token_to_state(state, token), parent, attempts + 1)
 
               {:error, reason} ->
-                {:error, {:authentication_failed, reason}}
+                {{:error, {:authentication_failed, reason}}, state}
             end
 
           {_challenge, provider} when not is_nil(provider) ->
-            handle_http_response(response, state, message)
+            {handle_http_response(response, state, message), state}
 
           {_challenge, nil} ->
-            {:error, {:reauthenticate, message}}
+            {{:error, {:reauthenticate, message}}, state}
         end
 
       {:error, reason} ->
-        {:error, reason}
+        {{:error, reason}, state}
     end
   end
 

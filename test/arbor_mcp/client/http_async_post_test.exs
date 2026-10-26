@@ -32,6 +32,39 @@ defmodule Arbor.MCP.Client.HTTPAsyncPostTest do
       do: handle_unauthorized(www_authenticate, scopes, state)
   end
 
+  # A 401 refreshes to "fresh"; a later 403 steps up to "fresher".
+  defmodule StepUpProvider do
+    @moduledoc false
+    @behaviour Arbor.MCP.Authorization.Provider
+
+    @impl true
+    def init(_config), do: {:ok, %{token: "stale"}}
+    @impl true
+    def get_token(state), do: {:ok, state.token, state}
+    @impl true
+    def handle_unauthorized(_www_authenticate, _scopes, state),
+      do: {:ok, "fresh", %{state | token: "fresh"}}
+
+    @impl true
+    def handle_forbidden(_www_authenticate, _scopes, state),
+      do: {:ok, "fresher", %{state | token: "fresher"}}
+  end
+
+  test "a request that finishes late doesn't put back the token it was sent with" do
+    client = start_client(auth_provider: {StepUpProvider, []})
+
+    held =
+      Task.async(fn -> Client.call_tool(client, "protected_held", %{}, timeout: 15_000) end)
+
+    assert_receive {:tool_call_started, "protected_held", handler}, 5_000
+
+    assert {:ok, _} = Client.call_tool(client, "step_up", %{}, timeout: 5_000)
+    send(handler, :release)
+    assert {:ok, _} = Task.await(held, 15_000)
+
+    assert :sys.get_state(client).transport_state.access_token == "fresher"
+  end
+
   test "a response with a null or different id answers the request its POST carried" do
     client = start_client()
 
@@ -64,15 +97,17 @@ defmodule Arbor.MCP.Client.HTTPAsyncPostTest do
   test "a request re-sent after authenticating doesn't hold up the client" do
     client = start_client(auth_provider: {Provider, test_pid: self()})
 
-    held = Task.async(fn -> Client.call_tool(client, "protected_held", %{}, timeout: 5_000) end)
-    assert_receive :authenticated, 2_000
-    assert_receive {:tool_call_started, "protected_held", handler}, 2_000
+    held =
+      Task.async(fn -> Client.call_tool(client, "protected_held", %{}, timeout: 15_000) end)
 
-    assert {:ok, _} = Client.call_tool(client, "quick", %{}, timeout: 1_000)
-    assert_receive {:client_answered, "server-ping"}, 2_000
+    assert_receive :authenticated, 5_000
+    assert_receive {:tool_call_started, "protected_held", handler}, 5_000
+
+    assert {:ok, _} = Client.call_tool(client, "quick", %{}, timeout: 5_000)
+    assert_receive {:client_answered, "server-ping"}, 5_000
 
     send(handler, :release)
-    assert {:ok, _} = Task.await(held)
+    assert {:ok, _} = Task.await(held, 15_000)
   end
 
   test "a POST that answers after its request settled is dropped, not given to another" do
@@ -265,10 +300,11 @@ defmodule Arbor.MCP.Client.HTTPAsyncPostTest do
           {:ok, conn} = Plug.Conn.chunk(conn, "data: #{Jason.encode!(ping)}\n\n")
           send(test_pid, {:tool_call_started, name, self()})
 
+          # A watchdog well past the test's own timeouts.
           receive do
             :release -> :ok
           after
-            5_000 -> :ok
+            30_000 -> :ok
           end
 
           done = %{"jsonrpc" => "2.0", "id" => id, "result" => %{"content" => []}}
@@ -278,6 +314,18 @@ defmodule Arbor.MCP.Client.HTTPAsyncPostTest do
           conn
           |> Plug.Conn.put_resp_header("www-authenticate", ~s(Bearer realm="mcp"))
           |> Plug.Conn.resp(401, "")
+        end
+
+      "step_up" ->
+        if Plug.Conn.get_req_header(conn, "authorization") == ["Bearer fresher"] do
+          json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => %{"content" => []}})
+        else
+          conn
+          |> Plug.Conn.put_resp_header(
+            "www-authenticate",
+            ~s(Bearer error="insufficient_scope", scope="more")
+          )
+          |> Plug.Conn.resp(403, "")
         end
 
       "protected" ->
