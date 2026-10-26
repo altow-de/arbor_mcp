@@ -1645,6 +1645,11 @@ feature (`logging/setLevel`, per-request log levels, and
 available throughout ArborMCP 1.x. New observability integrations should use
 stderr for stdio diagnostics or OpenTelemetry for structured telemetry.
 
+A client's `logging/setLevel` sets the minimum level for that client's own
+connection: the server then sends it only `notifications/message` at that level
+or above. It never changes the host's Logger configuration. Over legacy
+Streamable HTTP, sessions don't yet apply the level.
+
 On the client, `handle_progress/3` and `handle_log_message/3` receive progress
 and log notifications on every transport.
 

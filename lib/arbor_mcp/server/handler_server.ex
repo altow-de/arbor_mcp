@@ -51,7 +51,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
   alias Arbor.MCP.Server.Runtime.Internal.Ingress, as: RuntimeIngress
 
   alias Arbor.MCP.Error.ProtocolError
-  alias Arbor.MCP.Internal.{MessageValidator, VersionRegistry}
+  alias Arbor.MCP.Internal.{Logging, MessageValidator, VersionRegistry}
   alias Arbor.MCP.Protocol.{ErrorCodes, Methods}
   alias Arbor.RPC.{JSONRPC, LogSummary}
 
@@ -345,6 +345,8 @@ defmodule Arbor.MCP.Server.HandlerServer do
           subscriptions: %{},
           subscription_options: Subscriptions.runtime_options(opts, handler_module),
           stdio_eof_timeout: Keyword.get(opts, :stdio_eof_timeout_ms, 15_000),
+          # The minimum level this connection's client set with logging/setLevel.
+          log_level: nil,
           stdio_eof: nil,
           stdio_active: nil,
           stdio_finishing: MapSet.new(),
@@ -402,9 +404,16 @@ defmodule Arbor.MCP.Server.HandlerServer do
            %{"method" => method, "params" => %{}} when method in @request_notifications <-
              notification,
            :ok <- encodable(notification) do
-        case send_message(notification, state) do
-          {:ok, state} -> {:ok, state}
-          {:error, reason} -> {{:error, reason}, state}
+        # The connection's own logging/setLevel applies to every log message
+        # on it, whichever way the message came.
+        if method == "notifications/message" and
+             not log_level_enabled?(notification["params"]["level"], state.log_level) do
+          {:ok, state}
+        else
+          case send_message(notification, state) do
+            {:ok, state} -> {:ok, state}
+            {:error, reason} -> {{:error, reason}, state}
+          end
         end
       else
         :unencodable -> {{:error, :invalid_notification}, state}
@@ -1132,7 +1141,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
   defp accept_rpc_output(token, invocation, {:ok, %{"__runtime_output" => ticket}}, state) do
     with {:ok, response} <- OutputController.result(Ref.table(state.runtime), ticket),
          :ok <- OutputController.deliver(Ref.table(state.runtime), token, ticket) do
-      state = observe_initialize(invocation.method, response, state)
+      state = observe_response(invocation, response, state)
 
       if Map.has_key?(state.ingress, token),
         do: put_in(state.ingress[token].output?, true),
@@ -1148,7 +1157,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
     if output_error?(response) do
       output_failed(token, :output_failed, state)
     else
-      state = observe_initialize(invocation.method, response, state)
+      state = observe_response(invocation, response, state)
       record_completed_response(token, result, response, state)
     end
   end
@@ -1186,6 +1195,13 @@ defmodule Arbor.MCP.Server.HandlerServer do
   end
 
   defp observe_initialize(_method, _response, state), do: state
+
+  defp observe_response(%{method: "logging/setLevel", log_level: level}, %{"result" => _}, state)
+       when is_binary(level),
+       do: %{state | log_level: level}
+
+  defp observe_response(invocation, response, state),
+    do: observe_initialize(invocation.method, response, state)
 
   defp finish_initialize_barrier(token, %{initializing: token} = state) do
     state = %{state | initializing: nil}
@@ -1337,6 +1353,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
         pending_timers: %{},
         protocol_version: nil,
         connection_era: nil,
+        log_level: nil,
         validation_state:
           MessageValidator.new_session(nil,
             max_request_ids: state.validation_state.max_request_ids
@@ -1507,22 +1524,9 @@ defmodule Arbor.MCP.Server.HandlerServer do
 
   @impl GenServer
   def handle_cast({:send_log_message, level, message, data}, state) do
-    # Send log notification to client
-    log_notification = %{
-      "jsonrpc" => "2.0",
-      "method" => "notifications/message",
-      "params" => %{
-        "level" => level,
-        "logger" => "Arbor.MCP.Server",
-        "data" => data || %{},
-        "message" => message
-      }
-    }
-
-    case send_message(log_notification, state) do
-      {:ok, new_state} -> {:noreply, new_state}
-      {:error, _reason} -> {:noreply, state}
-    end
+    if log_level_enabled?(level, state.log_level),
+      do: send_log_notification(level, message, data, state),
+      else: {:noreply, state}
   end
 
   def handle_cast({:notify_progress, progress_token, progress, total}, state) do
@@ -1858,6 +1862,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
           kind: :rpc,
           id: Map.get(request, "id"),
           method: request["method"],
+          log_level: get_in(request, ["params", "level"]),
           connection: state.connection
         }
 
@@ -1938,6 +1943,27 @@ defmodule Arbor.MCP.Server.HandlerServer do
   defp protocol_version_from_result(%{"protocolVersion" => version}), do: version
   defp protocol_version_from_result(%{protocolVersion: version}), do: version
   defp protocol_version_from_result(_result), do: nil
+
+  defp send_log_notification(level, message, data, state) do
+    log_notification = %{
+      "jsonrpc" => "2.0",
+      "method" => "notifications/message",
+      "params" => %{
+        "level" => level,
+        "logger" => "Arbor.MCP.Server",
+        "data" => data || %{},
+        "message" => message
+      }
+    }
+
+    case send_message(log_notification, state) do
+      {:ok, new_state} -> {:noreply, new_state}
+      {:error, _reason} -> {:noreply, state}
+    end
+  end
+
+  defp log_level_enabled?(_level, nil), do: true
+  defp log_level_enabled?(level, minimum), do: Logging.at_least?(level, minimum)
 
   defp stdio?(state), do: state.transport == Arbor.MCP.Server.Stdio.Writer
 
