@@ -27,6 +27,23 @@ defmodule Arbor.MCP.Server.ContextProgressTest do
     end
   end
 
+  defmodule LogHandler do
+    @moduledoc false
+    use Arbor.MCP.Server.Handler
+
+    alias Arbor.MCP.Server.Context
+
+    @impl true
+    def handle_list_tools(_cursor, state),
+      do: {:ok, [%{name: "log", inputSchema: %{type: "object"}}], nil, state}
+
+    @impl true
+    def handle_call_tool("log", _args, state) do
+      result = Context.send_log_message(:info, "with a pid", %{"pid" => self()})
+      {:ok, %{content: [%{type: "text", text: inspect(result)}]}, state}
+    end
+  end
+
   defmodule Recorder do
     @moduledoc false
     @behaviour Arbor.MCP.Client.Handler
@@ -68,6 +85,42 @@ defmodule Arbor.MCP.Server.ContextProgressTest do
 
       assert_received {:progress, %{"progress" => 2, "total" => 2}}
     end
+  end
+
+  test "a notification for a request that isn't current is refused" do
+    {:ok, server} = Server.start_link(transport: :test, handler: Handler)
+    {:ok, edge} = Arbor.MCP.Server.Runtime.edge(server)
+    ref = make_ref()
+
+    notification = %{
+      "jsonrpc" => "2.0",
+      "method" => "notifications/progress",
+      "params" => %{"progressToken" => "x", "progress" => 1}
+    }
+
+    send(edge, {:ex_mcp_request_notification, self(), ref, notification, make_ref()})
+    assert_receive {:ex_mcp_request_notification_ack, ^ref, {:error, :request_closed}}
+  end
+
+  test "log data JSON can't carry is refused rather than crashing the connection" do
+    {:ok, server} = Server.start_link(transport: :test, handler: LogHandler)
+
+    {:ok, client} =
+      Client.start_link(
+        transport: :test,
+        server: server,
+        protocol_mode: :modern_only,
+        health_check_interval: nil
+      )
+
+    assert {:ok, %{"content" => [%{"text" => text}]}} =
+             Client.call_tool(client, "log", %{},
+               format: :map,
+               meta: %{"io.modelcontextprotocol/logLevel" => "info"}
+             )
+
+    assert text =~ ":error"
+    assert {:ok, _} = Client.ping(client)
   end
 
   test "without a progress token there's nothing to report against" do
