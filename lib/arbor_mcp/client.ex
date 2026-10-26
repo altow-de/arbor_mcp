@@ -1896,6 +1896,24 @@ defmodule Arbor.MCP.Client do
     result
   end
 
+  # One of this client's legacy POST tasks got a 401 or 403, as a modern
+  # request stream can: answered here, in turn with every other challenge,
+  # and the task sends its request again with the token.
+  def handle_info(
+        {:http_post_auth_challenge, task, ref, challenge},
+        %{transport_mod: HTTP, transport_state: %HTTP{} = transport_state} = state
+      )
+      when is_pid(task) and is_map(challenge) do
+    if own_post_task?(state, task) do
+      {result, transport_state} = answer_stream_challenge(transport_state, challenge)
+      send(task, {:http_post_auth_result, ref, result})
+      {:noreply, %{state | transport_state: transport_state}}
+    else
+      send(task, {:http_post_auth_result, ref, {:error, :stream_retired}})
+      {:noreply, state}
+    end
+  end
+
   # A modern request stream got a 401 or 403. Answering here, one challenge at
   # a time, means concurrent streams run one refresh or OAuth flow between
   # them, and a stream whose token another one already replaced just retries
@@ -2576,6 +2594,13 @@ defmodule Arbor.MCP.Client do
     else
       state
     end
+  end
+
+  defp own_post_task?(state, task) do
+    Enum.any?(state.async_post_tasks || %{}, fn
+      {_ref, {pid, _request_id}} -> pid == task
+      _other -> false
+    end)
   end
 
   defp answer_stream_challenge(%HTTP{access_token: current} = transport_state, challenge)

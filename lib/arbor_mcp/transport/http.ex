@@ -473,7 +473,7 @@ defmodule Arbor.MCP.Transport.HTTP do
   # A POST task does not authenticate: with several in flight, each would run
   # the OAuth flow. It hands an auth challenge back to the client process,
   # which re-sends that request with send_authenticated/2.
-  defp perform_async(message, state, parent) do
+  defp perform_async(message, state, parent, attempts \\ 0) do
     stream =
       PostStream.consumer(parent,
         max_buffer_bytes: state.max_stream_buffer_bytes,
@@ -482,12 +482,70 @@ defmodule Arbor.MCP.Transport.HTTP do
 
     case perform_http_request(message, state, event_stream: stream) do
       {:ok, response} ->
-        if extract_auth_status(response) == :ok,
-          do: handle_http_response(response, state, message),
-          else: {:error, {:reauthenticate, message}}
+        case {extract_auth_status(response), state.auth_provider} do
+          {:ok, _provider} ->
+            handle_http_response(response, state, message)
+
+          # As a modern request stream does: the client process answers the
+          # challenge, one at a time across its requests, and this task sends
+          # the request again itself, so the client isn't held up meanwhile.
+          # At most an initial 401 and a 403 step-up.
+          {{kind, www_auth}, provider} when not is_nil(provider) and attempts < 2 ->
+            case await_authentication(parent, kind, www_auth, state) do
+              {:ok, token} ->
+                perform_async(message, apply_token_to_state(state, token), parent, attempts + 1)
+
+              {:error, reason} ->
+                {:error, {:authentication_failed, reason}}
+            end
+
+          {_challenge, provider} when not is_nil(provider) ->
+            handle_http_response(response, state, message)
+
+          {_challenge, nil} ->
+            {:error, {:reauthenticate, message}}
+        end
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  @auth_wait_ms 600_000
+
+  defp await_authentication(parent, kind, www_auth, state) do
+    ref = make_ref()
+    monitor = Process.monitor(parent)
+
+    challenge = %{
+      status: if(kind == :unauthorized, do: 401, else: 403),
+      www_authenticate: www_auth,
+      scopes: extract_scope_from_www_auth(www_auth),
+      token: state.access_token
+    }
+
+    Lifetime.deliver(parent, {:http_post_auth_challenge, self(), ref, challenge})
+
+    wait =
+      case state.deadline do
+        deadline when is_integer(deadline) ->
+          min(max(deadline - System.monotonic_time(:millisecond), 0), @auth_wait_ms)
+
+        nil ->
+          @auth_wait_ms
+      end
+
+    receive do
+      {:http_post_auth_result, ^ref, result} ->
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {:DOWN, ^monitor, :process, _pid, _reason} ->
+        {:error, :client_gone}
+    after
+      wait ->
+        Process.demonitor(monitor, [:flush])
+        {:error, :timeout}
     end
   end
 

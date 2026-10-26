@@ -59,6 +59,22 @@ defmodule Arbor.MCP.Client.HTTPAsyncPostTest do
     refute_received :authenticated
   end
 
+  # The retried POST used to run in the client process, holding every other
+  # request until it finished, and a request it carried couldn't be answered.
+  test "a request re-sent after authenticating doesn't hold up the client" do
+    client = start_client(auth_provider: {Provider, test_pid: self()})
+
+    held = Task.async(fn -> Client.call_tool(client, "protected_held", %{}, timeout: 5_000) end)
+    assert_receive :authenticated, 2_000
+    assert_receive {:tool_call_started, "protected_held", handler}, 2_000
+
+    assert {:ok, _} = Client.call_tool(client, "quick", %{}, timeout: 1_000)
+    assert_receive {:client_answered, "server-ping"}, 2_000
+
+    send(handler, :release)
+    assert {:ok, _} = Task.await(held)
+  end
+
   test "a POST that answers after its request settled is dropped, not given to another" do
     client = start_client()
 
@@ -206,7 +222,7 @@ defmodule Arbor.MCP.Client.HTTPAsyncPostTest do
 
   defp respond(conn, %{"method" => "tools/call", "id" => id, "params" => params}, test_pid) do
     name = params["name"]
-    send(test_pid, {:tool_call_started, name, self()})
+    if name != "protected_held", do: send(test_pid, {:tool_call_started, name, self()})
 
     case name do
       "quick" ->
@@ -235,6 +251,34 @@ defmodule Arbor.MCP.Client.HTTPAsyncPostTest do
         end
 
         json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => %{"content" => []}})
+
+      # Once authenticated, asks the client something on the stream and
+      # waits to be released.
+      "protected_held" ->
+        if Plug.Conn.get_req_header(conn, "authorization") == ["Bearer fresh"] do
+          conn =
+            conn
+            |> Plug.Conn.put_resp_content_type("text/event-stream")
+            |> Plug.Conn.send_chunked(200)
+
+          ping = %{"jsonrpc" => "2.0", "id" => "server-ping", "method" => "ping"}
+          {:ok, conn} = Plug.Conn.chunk(conn, "data: #{Jason.encode!(ping)}\n\n")
+          send(test_pid, {:tool_call_started, name, self()})
+
+          receive do
+            :release -> :ok
+          after
+            5_000 -> :ok
+          end
+
+          done = %{"jsonrpc" => "2.0", "id" => id, "result" => %{"content" => []}}
+          {:ok, conn} = Plug.Conn.chunk(conn, "data: #{Jason.encode!(done)}\n\n")
+          conn
+        else
+          conn
+          |> Plug.Conn.put_resp_header("www-authenticate", ~s(Bearer realm="mcp"))
+          |> Plug.Conn.resp(401, "")
+        end
 
       "protected" ->
         if Plug.Conn.get_req_header(conn, "authorization") == ["Bearer fresh"] do
@@ -282,6 +326,11 @@ defmodule Arbor.MCP.Client.HTTPAsyncPostTest do
 
   defp respond(conn, %{"method" => method} = message, test_pid) do
     send(test_pid, {:notification, method, Map.get(message, "params", %{})})
+    Plug.Conn.resp(conn, 202, "")
+  end
+
+  defp respond(conn, %{"id" => id, "result" => _result}, test_pid) do
+    send(test_pid, {:client_answered, id})
     Plug.Conn.resp(conn, 202, "")
   end
 
