@@ -315,6 +315,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
         # SSE and streaming transports - track pending request
         maybe_schedule_request_timeout(id, meta, updated_state)
         updated_state = track_cacheable(updated_state, id, request, meta)
+        updated_state = start_progress_timeout(id, meta, updated_state)
         pending_requests = Map.put(updated_state.pending_requests, id, {from, :single, method})
         new_state = %{updated_state | pending_requests: pending_requests}
         {:noreply, remember_progress_token(request, id, new_state)}
@@ -401,9 +402,12 @@ defmodule Arbor.MCP.Client.RequestHandler do
         do: Deadline.after_ms(state.default_timeout || 5_000),
         else: deadline
 
-    deadline
-    |> Deadline.earliest(transport.deadline)
-    |> Deadline.earliest(Deadline.after_ms(transport.timeouts.request))
+    deadline = Deadline.earliest(deadline, transport.deadline)
+
+    # A request that its progress keeps alive runs to its own deadline.
+    if meta[:progress_timeout],
+      do: deadline,
+      else: Deadline.earliest(deadline, Deadline.after_ms(transport.timeouts.request))
   end
 
   defp remote_relative_deadline(%{timeout: ms}) when is_integer(ms) and ms >= 0,
@@ -621,11 +625,77 @@ defmodule Arbor.MCP.Client.RequestHandler do
   # caller-side timeout authoritative.
   defp maybe_schedule_request_timeout(id, %{timeout: caller_timeout}, _state)
        when is_integer(caller_timeout) do
-    Process.send_after(self(), {:request_timeout, id}, caller_timeout + @caller_timeout_grace)
+    # A request without a total limit has the longest timer Erlang allows.
+    after_ms = min(caller_timeout + @caller_timeout_grace, 4_294_967_295)
+    Process.send_after(self(), {:request_timeout, id}, after_ms)
     :ok
   end
 
   defp maybe_schedule_request_timeout(_id, _meta, _state), do: :ok
+
+  # With reset_timeout_on_progress, a request also times out once it has
+  # gone :progress_timeout ms without progress (see Internal.Request); each
+  # progress update starts that again. Its deadline still caps it. The tag
+  # tells the current timer from one a reset replaced.
+  defp start_progress_timeout(id, %{progress_timeout: ms}, state)
+       when is_integer(ms) and ms >= 0 do
+    tag = make_ref()
+    timer = Process.send_after(self(), {:progress_timeout, id, tag}, ms)
+
+    # Settled requests' timers are dropped here too, so the map never holds
+    # more than the pending requests that asked for one.
+    {timers, settled} =
+      Map.split_with(progress_timeouts(state), fn {request_id, _timer} ->
+        Map.has_key?(state.pending_requests, request_id)
+      end)
+
+    Enum.each(settled, fn {_request_id, {old_timer, _tag, _ms}} ->
+      Process.cancel_timer(old_timer)
+    end)
+
+    Map.put(state, :progress_timeouts, Map.put(timers, id, {timer, tag, ms}))
+  end
+
+  defp start_progress_timeout(_id, _meta, state), do: state
+
+  defp reset_progress_timeout(request_id, state) do
+    with {timer, _tag, ms} <- Map.get(progress_timeouts(state), request_id),
+         true <- Map.has_key?(state.pending_requests, request_id) do
+      Process.cancel_timer(timer)
+      start_progress_timeout(request_id, %{progress_timeout: ms}, state)
+    else
+      _no_timer_or_settled -> state
+    end
+  end
+
+  @doc false
+  # A settled request's timer is dropped when it runs out, so the map holds
+  # only timers still due.
+  @spec progress_timed_out(term(), reference(), map()) :: {:timed_out | :stale, map()}
+  def progress_timed_out(request_id, tag, state) do
+    timers = progress_timeouts(state)
+
+    case Map.get(timers, request_id) do
+      {_timer, ^tag, _ms} ->
+        {:timed_out, Map.put(state, :progress_timeouts, Map.delete(timers, request_id))}
+
+      _replaced_or_gone ->
+        {:stale, state}
+    end
+  end
+
+  defp progress_timeouts(state), do: Map.get(state, :progress_timeouts) || %{}
+
+  defp cancel_progress_timeout(state, request_id) do
+    case Map.pop(progress_timeouts(state), request_id) do
+      {{timer, _tag, _ms}, timers} ->
+        Process.cancel_timer(timer)
+        Map.put(state, :progress_timeouts, timers)
+
+      {nil, _timers} ->
+        state
+    end
+  end
 
   @doc """
   Handles batch MCP requests.
@@ -795,6 +865,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
         state
       )
       when is_map(params) do
+    state = reset_progress_timeout(request_id, state)
     dispatch_request_notification(:handle_progress, request_id, params, state)
   end
 
@@ -1099,6 +1170,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
           %{state | pending_requests: new_pending_requests}
           |> remember_tool_schemas(method, response_id, response_data)
           |> cache_result(response_id, response_data)
+          |> cancel_progress_timeout(response_id)
 
         {:ok, {from, :single}} ->
           :telemetry.execute(
@@ -1171,9 +1243,12 @@ defmodule Arbor.MCP.Client.RequestHandler do
         {:noreply, state}
 
       request_id ->
-        if Map.has_key?(state.pending_requests, request_id),
-          do: dispatch_request_notification(:handle_progress, request_id, params, state),
-          else: {:noreply, forget_progress_token(state, params["progressToken"])}
+        if Map.has_key?(state.pending_requests, request_id) do
+          state = reset_progress_timeout(request_id, state)
+          dispatch_request_notification(:handle_progress, request_id, params, state)
+        else
+          {:noreply, forget_progress_token(state, params["progressToken"])}
+        end
     end
   end
 

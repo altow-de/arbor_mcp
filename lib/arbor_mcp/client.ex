@@ -118,6 +118,9 @@ defmodule Arbor.MCP.Client do
     # Progress tokens of pending requests, mapped to their request ids, so a
     # connection-level notifications/progress reaches the request it reports on.
     progress_requests: %{},
+    # Requests made with reset_timeout_on_progress, mapped to the timer that
+    # runs out if they go that long without progress: {timer, tag, ms}.
+    progress_timeouts: %{},
     # Each listed tool's outputSchema, from the tools/list results this client
     # has seen, so call_tool/4 can check structuredContent against it.
     tool_output_schemas: %{},
@@ -600,6 +603,12 @@ defmodule Arbor.MCP.Client do
   ## Options
 
   - `:timeout` - Request timeout (default: 30000)
+  - `:reset_timeout_on_progress` - When `true`, `:timeout` is how long the
+    call may go without a progress update, as with the TypeScript SDK's
+    `resetTimeoutOnProgress`; a progress token is added if the call has none
+    (default: `false`)
+  - `:max_total_timeout` - With `:reset_timeout_on_progress`, the longest the
+    call may take however much progress it makes (default: no limit)
   - `:format` - Return format (:map or :struct, default: :struct)
   """
   @spec call_tool(t(), String.t(), map(), keyword() | timeout()) ::
@@ -1902,6 +1911,15 @@ defmodule Arbor.MCP.Client do
     RequestHandler.parse_transport_message(message, state)
   end
 
+  # A notification or request on a legacy POST's event stream (see
+  # Arbor.MCP.Transport.HTTP.PostStream). Acknowledged on receipt, so a slow
+  # handler doesn't hold up the stream, and at most one more message from it
+  # waits here meanwhile.
+  def handle_info({:http_post_stream_message, task, ref, message}, state) do
+    send(task, {:http_post_stream_ack, ref})
+    RequestHandler.parse_transport_message(message, state)
+  end
+
   def handle_info(
         {:modern_http_stream_message, stream_pid, request_id, message},
         %{
@@ -2296,6 +2314,15 @@ defmodule Arbor.MCP.Client do
   # Default-timeout enforcement for requests made without an explicit
   # :timeout option (scheduled by RequestHandler). Stale timers for requests
   # that already completed find no pending entry and are ignored.
+  # A request made with reset_timeout_on_progress went its timeout without
+  # progress, and times out as it would at its deadline.
+  def handle_info({:progress_timeout, request_id, tag}, state) do
+    case RequestHandler.progress_timed_out(request_id, tag, state) do
+      {:timed_out, state} -> handle_info({:request_timeout, request_id}, state)
+      {:stale, state} -> {:noreply, state}
+    end
+  end
+
   def handle_info({:request_timeout, request_id}, state) do
     case Map.get(state.pending_requests, request_id) do
       {from, :single, _method} ->
