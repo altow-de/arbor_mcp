@@ -450,7 +450,8 @@ jobs:
     - name: Set up Node.js
       uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
       with:
-        node-version: '20'
+        # @modelcontextprotocol/server-everything 2.x requires Node.js 24.
+        node-version: '24'
 
     - name: Restore deps/_build cache
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -495,6 +496,12 @@ jobs:
 
     - name: Run modern Arbor.MCP HTTP client to TypeScript server tests
       run: mix test --only interop_modern_ex_mcp_http_client
+
+    - name: Run legacy Arbor.MCP HTTP client to everything server tests
+      run: mix test --only interop_everything_legacy
+
+    - name: Run modern Arbor.MCP HTTP client to everything server tests
+      run: mix test --only interop_everything_modern
 
   external-conformance:
     name: MCP 2026-07-28 external conformance
