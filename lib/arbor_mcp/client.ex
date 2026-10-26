@@ -1869,6 +1869,15 @@ defmodule Arbor.MCP.Client do
     RequestHandler.parse_transport_message(message, state)
   end
 
+  # A notification or request on a legacy POST's event stream (see
+  # Arbor.MCP.Transport.HTTP.PostStream). The stream reads its next event
+  # once this one is handled.
+  def handle_info({:http_post_stream_message, task, ref, message}, state) do
+    result = RequestHandler.parse_transport_message(message, state)
+    send(task, {:http_post_stream_ack, ref})
+    result
+  end
+
   def handle_info(
         {:modern_http_stream_message, stream_pid, request_id, message},
         %{

@@ -128,7 +128,16 @@ defmodule Arbor.MCP.Transport.HTTP.BoundedClient do
           deadline = response_deadline(opts)
           max_bytes = Keyword.fetch!(opts, :max_response_bytes)
           limits = [max_bytes: max_bytes, validate_headers: header_policy(max_bytes)]
-          receive_response(next_conn, request_ref, Reducer.empty_response(), deadline, limits)
+          stream = Keyword.get(opts, :event_stream)
+
+          receive_response(
+            next_conn,
+            request_ref,
+            Reducer.empty_response(),
+            deadline,
+            limits,
+            stream
+          )
 
         {:error, next_conn, reason} ->
           {{:error, {:http_request_failed, reason}}, next_conn}
@@ -139,17 +148,24 @@ defmodule Arbor.MCP.Transport.HTTP.BoundedClient do
     reply
   end
 
-  defp receive_response(conn, request_ref, response, deadline, limits) do
+  defp receive_response(conn, request_ref, response, deadline, limits, stream) do
     timeout = Reducer.remaining_ms(deadline, System.monotonic_time(:millisecond))
 
     case Mint.HTTP1.recv(conn, 0, timeout) do
       {:ok, next_conn, events} ->
-        case Reducer.reduce(events, request_ref, response, limits) do
-          {:done, completed} ->
-            {{:ok, format_response(completed)}, next_conn}
-
+        with {:done, completed} <- Reducer.reduce(events, request_ref, response, limits),
+             {:ok, completed, stream} <- consume_stream(completed, stream),
+             {:ok, completed} <- finish_stream(completed, stream) do
+          {{:ok, format_response(completed)}, next_conn}
+        else
           {:cont, updated} ->
-            receive_response(next_conn, request_ref, updated, deadline, limits)
+            case consume_stream(updated, stream) do
+              {:ok, updated, stream} ->
+                receive_response(next_conn, request_ref, updated, deadline, limits, stream)
+
+              {:error, reason} ->
+                {{:error, reason}, next_conn}
+            end
 
           {:error, reason} ->
             {{:error, reason}, next_conn}
@@ -159,6 +175,44 @@ defmodule Arbor.MCP.Transport.HTTP.BoundedClient do
         {{:error, {:http_receive_failed, reason}}, next_conn}
     end
   end
+
+  # An `:event_stream` hook, `{acc, fun}`, takes the body of a 2xx
+  # `text/event-stream` response as it arrives instead of it accumulating:
+  # `fun.(chunk, acc)` returns `{:ok, acc}` or `{:error, reason}`, and
+  # `fun.(:done, acc)` returns `{:ok, body}`, the body the response then
+  # carries. `:max_response_bytes` applies to each batch it is handed.
+  defp consume_stream(response, {acc, fun} = stream) do
+    if response.chunks != [] and event_stream?(response) do
+      case fun.(Reducer.body(response), acc) do
+        {:ok, acc} -> {:ok, %{response | chunks: [], size: 0}, {acc, fun}}
+        {:error, _reason} = error -> error
+      end
+    else
+      {:ok, response, stream}
+    end
+  end
+
+  defp consume_stream(response, nil), do: {:ok, response, nil}
+
+  defp finish_stream(response, {acc, fun}) do
+    if event_stream?(response) do
+      with {:ok, body} <- fun.(:done, acc),
+           do: {:ok, %{response | chunks: [body], size: byte_size(body)}}
+    else
+      {:ok, response}
+    end
+  end
+
+  defp finish_stream(response, nil), do: {:ok, response}
+
+  defp event_stream?(%{status: status, headers: headers}) when status in 200..299 do
+    case List.keyfind(headers, "content-type", 0) do
+      {_name, value} -> String.contains?(String.downcase(value), "text/event-stream")
+      nil -> false
+    end
+  end
+
+  defp event_stream?(_response), do: false
 
   # Applied to the accumulated header list, trailers included: compression
   # and conflicting framing are refused, and the strict single-value

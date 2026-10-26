@@ -99,6 +99,7 @@ defmodule Arbor.MCP.Transport.HTTP do
   alias Arbor.MCP.Transport.HTTP.{
     BoundedClient,
     ModernStreamClient,
+    PostStream,
     RequestHeaders,
     TargetPolicy,
     ToolHeaders
@@ -444,7 +445,7 @@ defmodule Arbor.MCP.Transport.HTTP do
           1_000 -> exit(:client_generation_retired)
         end
 
-        result = perform_async(message, request_state)
+        result = perform_async(message, request_state, parent)
 
         # Report the durable transport-state fields this POST changed
         # (session rotation, SSE metadata) so the client can merge them into
@@ -472,8 +473,11 @@ defmodule Arbor.MCP.Transport.HTTP do
   # A POST task does not authenticate: with several in flight, each would run
   # the OAuth flow. It hands an auth challenge back to the client process,
   # which re-sends that request with send_authenticated/2.
-  defp perform_async(message, state) do
-    case perform_http_request(message, state) do
+  defp perform_async(message, state, parent) do
+    stream =
+      PostStream.consumer(parent, state.max_stream_buffer_bytes, state.max_response_bytes)
+
+    case perform_http_request(message, state, event_stream: stream) do
       {:ok, response} ->
         if extract_auth_status(response) == :ok,
           do: handle_http_response(response, state, message),
@@ -757,7 +761,7 @@ defmodule Arbor.MCP.Transport.HTTP do
     |> List.insert_at(0, {"Authorization", "Bearer #{token}"})
   end
 
-  defp perform_http_request(body, state) do
+  defp perform_http_request(body, state, opts \\ []) do
     # According to MCP spec, POST directly to the MCP endpoint, not /messages
     url = build_url(state, "")
     Logger.debug("HTTP request", endpoint_hash: LogSummary.fingerprint(url))
@@ -772,7 +776,7 @@ defmodule Arbor.MCP.Transport.HTTP do
     # Security validation before making external request
     case sanitize_http_request("POST", url, headers, state) do
       {:ok, sanitized_headers} ->
-        make_http_request(url, sanitized_headers, body, state)
+        make_http_request(url, sanitized_headers, body, state, opts)
 
       {:error, security_error} ->
         Logger.warning("HTTP request blocked by security policy",
@@ -811,9 +815,10 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
-  defp make_http_request(url, headers, body, state) do
+  defp make_http_request(url, headers, body, state, opts) do
     with {:ok, transport_opts} <- https_transport_opts(url, state) do
       BoundedClient.request(:post, url, headers, "application/json", body,
+        event_stream: Keyword.get(opts, :event_stream),
         deadline: state.deadline,
         connect_timeout: state.timeouts.connect,
         request_timeout: response_timeout(state),
@@ -1087,16 +1092,22 @@ defmodule Arbor.MCP.Transport.HTTP do
   defp apply_sse_event_id(state, nil), do: state
   defp apply_sse_event_id(state, id), do: %{state | last_event_id: id}
 
+  # The POST's answer is the response among its events. The notifications
+  # and requests ahead of it were handed to the client as they arrived (see
+  # PostStream), or, in a body read whole during establishment, aren't
+  # answered.
   defp sse_json_data(events) do
-    events
-    |> Enum.flat_map(fn event ->
-      case event[:data] do
-        nil -> []
-        "" -> []
-        data -> [data]
-      end
+    Enum.find_value(events, "", fn
+      %{data: data} when is_binary(data) and data != "" ->
+        case Jason.decode(data) do
+          {:ok, %{"method" => _method}} -> nil
+          {:ok, _response} -> data
+          {:error, _reason} -> nil
+        end
+
+      _no_data ->
+        nil
     end)
-    |> Enum.join("")
   end
 
   defp handle_sse_json_data("", state, _request_body), do: reconnect_deferred_sse(state)
