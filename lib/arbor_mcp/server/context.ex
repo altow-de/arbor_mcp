@@ -139,11 +139,12 @@ defmodule Arbor.MCP.Server.Context do
   @doc """
   Reports progress for the currently executing request callback.
 
-  Modern streamable-HTTP handlers use this request-scoped helper instead of a
-  connection-wide server process. The request must include
-  `_meta.progressToken`, and it must own an active SSE response or an addressed
-  legacy session stream. Request-owned SSE acknowledges actual IO before this
-  function returns. Legacy session SSE accepts a durable replay event before
+  It works on every transport, as TypeScript and Python handlers' progress
+  helpers do. The request must include `_meta.progressToken`. Over BEAM, stdio
+  and the test transport the notification is written to the connection before
+  this function returns, ahead of the callback's result; over HTTP the request
+  must own an active SSE response or an addressed legacy session stream.
+  Request-owned SSE acknowledges actual IO before this function returns. Legacy session SSE accepts a durable replay event before
   returning, ordered before the request's final reply; this is not a client-byte
   receipt. A cancelled callback cannot append under a retired phase or lease.
   Legacy replay or operation pressure returns a fixed typed atom error without

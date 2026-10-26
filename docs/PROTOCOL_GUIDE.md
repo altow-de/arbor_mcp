@@ -346,7 +346,7 @@ def handle_progress(_request_id, %{"progressToken" => token, "progress" => n} = 
   {:ok, state}
 end
 
-# Server — request-scoped, writes notifications/progress on the owning stream
+# Server — request-scoped, on every transport
 @impl true
 def handle_call_tool("import", _args, state) do
   if Arbor.MCP.Server.Context.progress_token() do
@@ -358,8 +358,7 @@ def handle_call_tool("import", _args, state) do
 end
 ```
 
-On BEAM, stdio, and other non-stream helpers you can still publish by
-token:
+Outside a callback, or for another request's token, publish by token:
 
 ```elixir
 :ok = Arbor.MCP.Server.notify_progress(server, "job-42", 50)

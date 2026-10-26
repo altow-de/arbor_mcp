@@ -386,6 +386,28 @@ defmodule Arbor.MCP.Server.HandlerServer do
   end
 
   @impl GenServer
+  # A callback's own progress or log notification (Context.report_progress/3,
+  # send_log_message/3), written to the connection before its answer, as the
+  # callback waits for this acknowledgment before going on.
+  def handle_info({:ex_mcp_request_notification, sender, ref, notification}, state)
+      when is_pid(sender) do
+    {reply, state} =
+      case notification do
+        %{"method" => method, "params" => %{}}
+        when method in ["notifications/progress", "notifications/message"] ->
+          case send_message(notification, state) do
+            {:ok, state} -> {:ok, state}
+            {:error, reason} -> {{:error, reason}, state}
+          end
+
+        _other ->
+          {{:error, :invalid_notification}, state}
+      end
+
+    send(sender, {:ex_mcp_request_notification_ack, ref, reply})
+    {:noreply, state}
+  end
+
   def handle_info({{:runtime_edge_reply, token}, result}, state) do
     Admission.terminal(Ref.table(state.runtime), token, {:ok, result})
     RuntimeIngress.discard_ingress(state.runtime, token)
@@ -1788,6 +1810,8 @@ defmodule Arbor.MCP.Server.HandlerServer do
 
     dispatch_opts = [
       protocol_mode: effective_protocol_mode(state),
+      # Context.report_progress/3 and send_log_message/3 write through here.
+      request_notification_target: self(),
       instructions: state.instructions,
       request_state: state.request_state,
       endpoint: state.endpoint,
