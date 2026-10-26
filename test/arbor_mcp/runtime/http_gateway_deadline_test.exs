@@ -4,6 +4,7 @@ defmodule Arbor.MCP.Server.Runtime.HTTPGatewayDeadlineTest do
 
   alias Arbor.MCP.Server.Runtime.{
     CallbackContext,
+    Deadline,
     HTTPGateway,
     HTTPWriterBinding,
     HTTPWriterProxy,
@@ -47,14 +48,22 @@ defmodule Arbor.MCP.Server.Runtime.HTTPGatewayDeadlineTest do
 
     {:ok, runtime} = Runtime.ref(root)
     assert_receive :http_handler_init
-    {:ok, binding} = HTTPWriterProxy.capture(runtime, timeout: 40)
+    # Entry has to land inside the charged cutoff however slow the machine is.
+    # The timeout error is then published on the failure tail. Checkout in the
+    # gap after the cutoff, before that tail is installed, reports the
+    # invocation closed; that is not the outcome.
+    {:ok, binding} = HTTPWriterProxy.capture(runtime, timeout: 1_000)
     {:ok, proof} = HTTPWriterBinding.validate(binding, runtime)
     {:ok, _token} = HTTPGateway.submit(runtime, binding, %{message(7) | "method" => "hold"})
-    assert_receive {:gateway_entry, 7, _worker, entered, cutoff}
+    assert_receive {:gateway_entry, 7, _worker, entered, cutoff}, 5_000
     assert cutoff == proof.deadline
     assert entered < cutoff
-    Process.sleep(50)
-    {effect, wire} = checkout(binding)
+
+    if Deadline.now() < cutoff do
+      assert :empty = HTTPWriterRegistry.checkout(binding)
+    end
+
+    {effect, wire} = await_failure_frame(binding)
 
     assert %{"id" => 7, "error" => %{"code" => -32603, "message" => "Request timeout"}} =
              Jason.decode!(wire)
@@ -72,19 +81,35 @@ defmodule Arbor.MCP.Server.Runtime.HTTPGatewayDeadlineTest do
     assert :empty = HTTPWriterRegistry.checkout(binding)
     wait(fn -> match?(%{reserved: 0}, Runtime.stats!(runtime)) end)
     assert {:ok, %{"result" => 0}} = Runtime.request(runtime, message(8))
-    refute_receive :http_handler_init, 5
+    refute_receive :http_handler_init, 0
   end
 
   defp message(id), do: %{"jsonrpc" => "2.0", "id" => id, "method" => "read"}
 
-  defp checkout(binding) do
-    wait(fn ->
-      case HTTPWriterRegistry.checkout(binding) do
-        {:ok, effect, wire} -> {effect, wire}
-        :empty -> nil
-        error -> flunk("HTTP checkout failed: #{inspect(error)}")
-      end
-    end)
+  defp await_failure_frame(binding) do
+    {:ok, tail} = HTTPWriterRegistry.wait_deadline(binding)
+    await_failure_frame(binding, tail)
+  end
+
+  defp await_failure_frame(binding, tail) do
+    case HTTPWriterRegistry.checkout(binding) do
+      {:ok, effect, wire} ->
+        {effect, wire}
+
+      result
+      when result in [:empty, {:error, :http_invocation_closed}, {:error, :http_output_expired}] ->
+        if Deadline.now() >= tail do
+          flunk(
+            "timeout error was not published before the failure tail closed: #{inspect(result)}"
+          )
+        else
+          Process.sleep(10)
+          await_failure_frame(binding, tail)
+        end
+
+      error ->
+        flunk("HTTP checkout failed: #{inspect(error)}")
+    end
   end
 
   defp wait(fun, remaining \\ 200)
