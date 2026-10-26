@@ -99,6 +99,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Requires `arbor_rpc` `~> 1.0.0-rc.3` (was `~> 1.0.0-rc.1`). The stdio
+  transport passes `:eof_grace` to `Arbor.RPC.Subprocess`; RPC releases before
+  `1.0.0-rc.3` ignored it and sent SIGTERM as soon as stdin closed, so the MCP
+  shutdown order below needs that release.
 - **BREAKING:** Bandit `~> 1.14` is required, for the eleven HTTP/1, HTTP/2
   and WebSocket advisories 1.14.0 fixes (EEF-CVE-2026-108525, -108529,
   -109584, -110314, -110499, -111101, -111103, -113436, -114213, -114216 and

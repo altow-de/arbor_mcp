@@ -23,7 +23,7 @@ process death alone does not certify physical IO cleanup.
 ExMCP 1.x splits into **ArborMCP** for MCP and **ArborACP** for ACP, with
 independently installable ArborRPC and optional ArborACP adapter packages.
 This guide covers the published ArborMCP `2.0.0-rc.6`, ArborACP and adapter
-`1.0.0-rc.3`, and ArborRPC `1.0.0-rc.2` combination. Library versions are independent; ACP
+`1.0.0-rc.4`, and ArborRPC `1.0.0-rc.3` combination. Library versions are independent; ACP
 protocol versions are a separate upstream concern.
 
 | Library name | Hex package / OTP application | Elixir module namespace |
@@ -114,15 +114,15 @@ Choose additional packages by ownership:
 | What your application uses | Direct dependency |
 | --- | --- |
 | MCP clients, handlers, tools, resources or prompts | `{:arbor_mcp, "== 2.0.0-rc.6"}` |
-| Native ACP agents/controllers or the generic adapter contract | `{:arbor_acp, "== 1.0.0-rc.3"}` |
-| Built-in Claude, Codex, Pi or ZCode adapters | `{:arbor_acp_adapters, "== 1.0.0-rc.3"}` |
-| Shared JSON-RPC/framing/subprocess APIs called directly | `{:arbor_rpc, "== 1.0.0-rc.2"}` |
+| Native ACP agents/controllers or the generic adapter contract | `{:arbor_acp, "== 1.0.0-rc.4"}` |
+| Built-in Claude, Codex, Pi or ZCode adapters | `{:arbor_acp_adapters, "== 1.0.0-rc.4"}` |
+| Shared JSON-RPC/framing/subprocess APIs called directly | `{:arbor_rpc, "== 1.0.0-rc.3"}` |
 
 MCP and ACP each bring in `arbor_rpc`; neither brings in the other protocol.
 The adapter bundle brings in ACP and RPC. Native ACP users do not need the
 bundle, and vendor CLI executables remain separate prerequisites. Add a direct
 RPC dependency only when your code uses its API. A compatible prerelease range
-is `~> 2.0.0-rc.6` for MCP or `~> 1.0.0-rc.2` for the new packages;
+is `~> 2.0.0-rc.6` for MCP or `~> 1.0.0-rc.3` for the new packages;
 an ordinary stable-only constraint does not select these RCs.
 
 For a normal Hex consumer, unset development overrides such as

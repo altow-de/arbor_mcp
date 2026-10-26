@@ -52,18 +52,18 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         persist-credentials: false
-    - name: Check out unpublished ACP packages
+    - name: Check out ACP packages at their release commit
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         repository: trust-arbor/arbor_acp
-        ref: b05ed4a507cc6b31cb710ce08b55b28f108f23ec
+        ref: 8b64bcd97756d2fe5085293c38d266298d9a4736
         path: .arbor-v2/acp
         persist-credentials: false
-    - name: Check out unpublished shared RPC
+    - name: Check out shared RPC at its release commit
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         repository: trust-arbor/arbor_rpc
-        ref: b2e4abee581b060310202c0b8b4d9a5d0e2e3995
+        ref: 5867936bcc8c21a92806babd731d4a884f700240
         path: .arbor-v2/rpc
         persist-credentials: false
     - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124
@@ -134,11 +134,11 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         persist-credentials: false
-    - name: Check out unpublished shared RPC
+    - name: Check out shared RPC at its release commit
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         repository: trust-arbor/arbor_rpc
-        ref: b2e4abee581b060310202c0b8b4d9a5d0e2e3995
+        ref: 5867936bcc8c21a92806babd731d4a884f700240
         path: .arbor-v2/rpc
         persist-credentials: false
     - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124
@@ -245,12 +245,12 @@ jobs:
       with:
         persist-credentials: false
 
-    # Temporary source checkout until the shared RPC package is published.
-    - name: Check out unpublished shared RPC
+    # The RPC release commit, the source of the Hex package mix.lock pins.
+    - name: Check out shared RPC at its release commit
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         repository: trust-arbor/arbor_rpc
-        ref: b2e4abee581b060310202c0b8b4d9a5d0e2e3995
+        ref: 5867936bcc8c21a92806babd731d4a884f700240
         path: .arbor-v2/rpc
         persist-credentials: false
 
@@ -330,12 +330,12 @@ jobs:
       with:
         persist-credentials: false
 
-    # Temporary source checkout until the shared RPC package is published.
-    - name: Check out unpublished shared RPC
+    # The RPC release commit, the source of the Hex package mix.lock pins.
+    - name: Check out shared RPC at its release commit
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         repository: trust-arbor/arbor_rpc
-        ref: b2e4abee581b060310202c0b8b4d9a5d0e2e3995
+        ref: 5867936bcc8c21a92806babd731d4a884f700240
         path: .arbor-v2/rpc
         persist-credentials: false
 
@@ -385,12 +385,12 @@ jobs:
       with:
         persist-credentials: false
 
-    # Temporary source checkout until the shared RPC package is published.
-    - name: Check out unpublished shared RPC
+    # The RPC release commit, the source of the Hex package mix.lock pins.
+    - name: Check out shared RPC at its release commit
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         repository: trust-arbor/arbor_rpc
-        ref: b2e4abee581b060310202c0b8b4d9a5d0e2e3995
+        ref: 5867936bcc8c21a92806babd731d4a884f700240
         path: .arbor-v2/rpc
         persist-credentials: false
 
@@ -431,12 +431,12 @@ jobs:
       with:
         persist-credentials: false
 
-    # Temporary source checkout until the shared RPC package is published.
-    - name: Check out unpublished shared RPC
+    # The RPC release commit, the source of the Hex package mix.lock pins.
+    - name: Check out shared RPC at its release commit
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         repository: trust-arbor/arbor_rpc
-        ref: b2e4abee581b060310202c0b8b4d9a5d0e2e3995
+        ref: 5867936bcc8c21a92806babd731d4a884f700240
         path: .arbor-v2/rpc
         persist-credentials: false
 
@@ -517,12 +517,12 @@ jobs:
       with:
         persist-credentials: false
 
-    # Temporary source checkout until the shared RPC package is published.
-    - name: Check out unpublished shared RPC
+    # The RPC release commit, the source of the Hex package mix.lock pins.
+    - name: Check out shared RPC at its release commit
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         repository: trust-arbor/arbor_rpc
-        ref: b2e4abee581b060310202c0b8b4d9a5d0e2e3995
+        ref: 5867936bcc8c21a92806babd731d4a884f700240
         path: .arbor-v2/rpc
         persist-credentials: false
 
@@ -591,12 +591,12 @@ jobs:
       with:
         persist-credentials: false
 
-    # Temporary source checkout until the shared RPC package is published.
-    - name: Check out unpublished shared RPC
+    # The RPC release commit, the source of the Hex package mix.lock pins.
+    - name: Check out shared RPC at its release commit
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         repository: trust-arbor/arbor_rpc
-        ref: b2e4abee581b060310202c0b8b4d9a5d0e2e3995
+        ref: 5867936bcc8c21a92806babd731d4a884f700240
         path: .arbor-v2/rpc
         persist-credentials: false
 
@@ -646,12 +646,12 @@ jobs:
       with:
         persist-credentials: false
 
-    # Temporary source checkout until the shared RPC package is published.
-    - name: Check out unpublished shared RPC
+    # The RPC release commit, the source of the Hex package mix.lock pins.
+    - name: Check out shared RPC at its release commit
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         repository: trust-arbor/arbor_rpc
-        ref: b2e4abee581b060310202c0b8b4d9a5d0e2e3995
+        ref: 5867936bcc8c21a92806babd731d4a884f700240
         path: .arbor-v2/rpc
         persist-credentials: false
 

@@ -7,9 +7,9 @@ tags remain available:
 | Package | Replacement candidate | First stable target |
 | --- | --- | --- |
 | ArborMCP (`arbor_mcp`) | `2.0.0-rc.6` | `2.0.0` |
-| ArborRPC (`arbor_rpc`) | `1.0.0-rc.2` | `1.0.0` |
-| ArborACP (`arbor_acp`) | `1.0.0-rc.3` | `1.0.0` |
-| ArborACP adapters (`arbor_acp_adapters`) | `1.0.0-rc.3` | `1.0.0` |
+| ArborRPC (`arbor_rpc`) | `1.0.0-rc.3` | `1.0.0` |
+| ArborACP (`arbor_acp`) | `1.0.0-rc.4` | `1.0.0` |
+| ArborACP adapters (`arbor_acp_adapters`) | `1.0.0-rc.4` | `1.0.0` |
 
 The versions below have been published and verified through ordinary Hex
 installation and assembled-release probes. Start with the
@@ -27,8 +27,8 @@ For an MCP application, replace `ex_mcp` with:
 {:arbor_mcp, "== 2.0.0-rc.6"}
 ```
 
-ACP applications use `{:arbor_acp, "== 1.0.0-rc.3"}`. Add
-`{:arbor_acp_adapters, "== 1.0.0-rc.3"}` when using the bundled vendor adapters.
+ACP applications use `{:arbor_acp, "== 1.0.0-rc.4"}`. Add
+`{:arbor_acp_adapters, "== 1.0.0-rc.4"}` when using the bundled vendor adapters.
 `arbor_rpc` is transitive; declare it directly if your code calls `Arbor.RPC.*`.
 Exact versions make a downstream RC report reproducible. Commit the resulting
 lockfile, and use normal Hex resolution without the local package path overrides.
@@ -100,10 +100,12 @@ The public API only gains options; the changelog lists the behavior changes.
 ArborMCP `2.0.0-rc.6` replaces `2.0.0-rc.5`. Servers handle the requests on a
 connection concurrently, as the other MCP SDKs do. The client gains response
 caching, progress-reset timeouts and output-schema checks, and servers gain
-local JWT checks, cache hints and middleware. It requires Bandit `~> 1.14`, for
-that release's advisories, and a client's `logging/setLevel` no longer changes
-the host's global Logger level. Seven changes can break existing code; the
-"Upgrading from 2.0.0-rc.5" section below explains each.
+local JWT checks, cache hints and middleware. It requires ArborRPC
+`~> 1.0.0-rc.3`, whose subprocess close gives a stdio server `:eof_grace` to
+exit before SIGTERM, and Bandit `~> 1.14`, for that release's advisories. A
+client's `logging/setLevel` no longer changes the host's global Logger level.
+Seven changes can break existing code; the "Upgrading from 2.0.0-rc.5" section
+below explains each.
 
 Earlier credential-free CLI lifecycle checks do not qualify live model turns.
 No completed continuous 48-hour final-candidate soak is claimed.
