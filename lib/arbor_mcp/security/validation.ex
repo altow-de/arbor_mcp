@@ -431,7 +431,7 @@ defmodule Arbor.MCP.Security.Validation do
   end
 
   defp validate_origin_requirements(%{validate_origin: true, allowed_origins: origins})
-       when is_list(origins) and length(origins) > 0 do
+       when is_list(origins) and origins != [] do
     :ok
   end
 

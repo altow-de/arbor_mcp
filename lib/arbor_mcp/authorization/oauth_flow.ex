@@ -379,7 +379,7 @@ defmodule Arbor.MCP.Authorization.OAuthFlow do
 
     # Add scope if present
     base_params =
-      if params[:scopes] && length(params.scopes) > 0 do
+      if params[:scopes] && params.scopes != [] do
         base_params ++ [{"scope", Enum.join(params.scopes, " ")}]
       else
         base_params
