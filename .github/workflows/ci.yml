@@ -56,7 +56,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         repository: trust-arbor/arbor_acp
-        ref: 8b64bcd97756d2fe5085293c38d266298d9a4736
+        ref: ce40bcc285e89b0d31b345e425f011a147658e60
         path: .arbor-v2/acp
         persist-credentials: false
     - name: Check out shared RPC at its release commit
