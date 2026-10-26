@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- POST event streams now stop at the response deadline even when the socket
+  or stream consumer keeps returning data. This ports the 1.x maintenance
+  fix from `87b495e`.
+
 ## [2.0.0-rc.6] — 2026-10-26
 
 ### Added
