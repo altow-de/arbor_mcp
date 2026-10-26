@@ -110,6 +110,21 @@ defmodule Arbor.MCP.HttpPlug do
   and any requested replay page, then returns. The deprecated GET handshake
   announces its POST alias; the Streamable HTTP GET uses a `connected` event.
   Neither mode starts a standalone global SSEHandler or session manager.
+  Without the option, the `:arbor_mcp, :sse_mode` application environment
+  decides, and the legacy `:arbor_mcp, :test_mode` flag makes it `:oneshot`;
+  pass `sse_mode: :stream` to a test listener whose clients read the GET
+  stream. A `:stream` GET lasts until the Runtime's `:request_timeout_ms`, and
+  an ArborMCP client then opens it again with `Last-Event-ID`.
+
+  In the legacy Streamable HTTP revisions, a request that carries
+  `_meta.progressToken`, from a client whose `Accept` header allows
+  `text/event-stream`, owns its POST response stream, as with the TypeScript
+  SDK's servers. Its progress and its callback's other notifications are
+  written there ahead of the response. `initialize`, batches and requests
+  without a progress token are answered with JSON; their callback's progress,
+  log messages and list changes go to the session's own GET stream. Requests a
+  callback sends to the client, such as `roots/list`, always use that GET
+  stream. Without an open GET stream these return `{:error, :stream_closed}`.
 
   MCP 2026-07-28 does not use that GET stream. A modern
   `subscriptions/listen` POST owns its SSE response directly. The response
@@ -1603,8 +1618,33 @@ defmodule Arbor.MCP.HttpPlug do
   defp runtime_output_format(%{private: %{arbor_mcp_legacy_session: _id}}, _request),
     do: :legacy_sse
 
-  defp runtime_output_format(conn, request),
-    do: if(request_stream?(conn, request), do: :sse, else: :json)
+  defp runtime_output_format(conn, request) do
+    if request_stream?(conn, request) or legacy_progress_stream?(conn, request),
+      do: :sse,
+      else: :json
+  end
+
+  # In the legacy Streamable HTTP revisions a server may answer a request's
+  # POST with an event stream that carries the request's own notifications
+  # ahead of its response, as the TypeScript SDK's servers do. A legacy
+  # request that asks for progress, from a client that accepts an event
+  # stream, gets one, so its progress doesn't depend on the session's GET
+  # stream. `initialize` stays JSON, and a client that accepts only JSON keeps
+  # the JSON answer with progress on its session GET stream. Modern requests
+  # are decided by `request_stream?/2` alone.
+  defp legacy_progress_stream?(
+         conn,
+         %{
+           "id" => _id,
+           "method" => method,
+           "params" => %{"_meta" => %{"progressToken" => token}}
+         } = request
+       )
+       when method != "initialize" and not is_nil(token) do
+    not modern_http_request?(conn, request) and accepts_event_stream?(conn)
+  end
+
+  defp legacy_progress_stream?(_conn, _request), do: false
 
   defp runtime_route_policy(%{private: %{arbor_mcp_legacy_session: _id}} = conn, request) do
     members = if is_list(request), do: request, else: [request]

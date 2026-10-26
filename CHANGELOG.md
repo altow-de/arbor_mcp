@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which an ArborMCP server does at its `:request_timeout_ms`: it opens the
   stream again with `Last-Event-ID`, where it used to reconnect, start a new
   session and fail every pending request.
+- An ArborMCP server answered every legacy Streamable HTTP request with JSON,
+  so a request's progress could only travel on the session's GET stream, and
+  `Context.report_progress/3` and `Server.notify_progress/4` returned
+  `{:error, :stream_closed}` to a client without one (`use_sse: false`). As
+  the TypeScript SDK's servers do, a legacy request that carries
+  `_meta.progressToken`, from a client whose `Accept` header allows
+  `text/event-stream`, now gets an event stream that carries its progress, and
+  its callback's other notifications, ahead of the result. `initialize`,
+  batches and a client that accepts only JSON still get JSON, with progress on
+  the session's GET stream.
 
 ## [2.0.0-rc.6] — 2026-10-26
 
