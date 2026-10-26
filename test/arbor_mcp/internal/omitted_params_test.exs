@@ -25,6 +25,18 @@ defmodule Arbor.MCP.Internal.OmittedParamsTest do
     assert {:error, :invalid_message} = Protocol.parse_message(~s({"jsonrpc":"2.0","id":1}))
   end
 
+  test "a response that also names a method stays a response" do
+    assert {:result, %{}, 42} =
+             Protocol.parse_message_unvalidated(
+               ~s({"jsonrpc":"2.0","id":42,"method":"ping","result":{}})
+             )
+
+    assert {:error, %{"code" => -1}, 43} =
+             Protocol.parse_message_unvalidated(
+               ~s({"jsonrpc":"2.0","id":43,"method":"ping","error":{"code":-1,"message":"x"}})
+             )
+  end
+
   @tool %{
     "name" => "count",
     "inputSchema" => %{"type" => "object"},
