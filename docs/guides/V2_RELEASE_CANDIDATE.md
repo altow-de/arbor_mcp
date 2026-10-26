@@ -109,7 +109,7 @@ The stable 48-hour qualification remains open.
 
 The next candidate, not yet published, makes servers handle the requests on a
 connection concurrently, as the other MCP SDKs do, and lets the caller decide how
-long a request runs. Five changes can break existing code. The
+long a request runs. Six changes can break existing code. The
 [changelog](../../CHANGELOG.md) lists the rest, including the client changes.
 
 ### Request callbacks no longer change handler state by default
@@ -207,6 +207,33 @@ decode twice. Templates also match every RFC 6570 operator now: `{+path}` and
 As in Python's MCPServer, a decoded value doesn't match if it contains a NUL
 byte, climbs out of its starting point with `..`, or is an absolute path; the
 read then fails as an unknown resource.
+
+### Elicitations are checked in both eras
+
+An elicitation a handler asks for in an `input_required` result is now checked
+against the protocol's ElicitRequest schema on modern connections too, as it
+already was on legacy ones. A form elicitation's `requestedSchema` must be an
+object with `properties`, each a string, number, integer, boolean, or single- or
+multi-select enum field. One that isn't, most often `%{"type" => "object"}` with
+no `properties`, fails the call with `-32602` and
+`%{"inputRequestId" => id, "method" => "elicitation/create"}`, and the client
+is never asked:
+
+```elixir
+# Fails the call:
+%{"message" => "Name?", "requestedSchema" => %{"type" => "object"}}
+
+# Fits, with fields or without:
+%{
+  "message" => "Name?",
+  "requestedSchema" => %{
+    "type" => "object",
+    "properties" => %{"name" => %{"type" => "string"}}
+  }
+}
+
+%{"message" => "Continue?", "requestedSchema" => %{"type" => "object", "properties" => %{}}}
+```
 
 ## Limits to exercise in downstream tests
 
