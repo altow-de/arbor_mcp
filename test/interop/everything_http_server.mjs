@@ -10,6 +10,12 @@
 
 import { createApp } from "@modelcontextprotocol/server-everything/dist/transports/streamableHttp.js";
 
+// createApp() logs every request with console.log. The test reads only the
+// PORT line, and the rest would fill its bounded output queue, which closes
+// the server, so those logs are dropped. A failed request still reaches the
+// client as an error response.
+console.log = () => {};
+
 const { app, shutdown } = createApp();
 
 // Listen on port 0 for random available port
