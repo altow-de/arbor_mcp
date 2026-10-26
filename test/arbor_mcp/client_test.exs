@@ -721,14 +721,16 @@ defmodule Arbor.MCP.ClientTest do
           max_reconnect_attempts: 1
         )
 
-      # Give it time to initialize then disconnect
-      Process.sleep(100)
-
-      # Try to make a request - should fail with not connected
-      {:ok, status} = Client.get_status(client)
-
-      # Status should show either disconnected or attempting reconnection
-      assert status.connection_status in [:disconnected, :connecting, :reconnecting, :error]
+      # The transport disconnects after initialization; wait until the client
+      # has noticed, rather than sleeping and hoping it has.
+      :ok =
+        Arbor.MCP.TestHelpers.wait_until(
+          fn ->
+            {:ok, status} = Client.get_status(client)
+            status.connection_status in [:disconnected, :connecting, :reconnecting, :error]
+          end,
+          timeout: 2_000
+        )
 
       if Process.alive?(client), do: GenServer.stop(client)
     end

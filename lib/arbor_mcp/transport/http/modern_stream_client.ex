@@ -30,6 +30,12 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
   # credentials, the body the request's arguments, and the HTTP options TLS
   # settings: none is printed, and format_status/1 keeps them out of crash
   # reports too.
+  # How long a stream waits for the client to answer its auth challenge. A
+  # browser flow can take minutes; the caller's own timeout cancels the
+  # stream sooner, and a dead client is noticed through the parent monitor,
+  # so this only bounds a lost answer.
+  @auth_wait_ms 600_000
+
   @derive {Inspect, except: [:headers, :body, :http_options, :auth_provider_state]}
   defstruct [
     :parent,
@@ -52,6 +58,8 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
     :auth_provider_state,
     :header_sanitizer,
     :consumer_ack_timeout,
+    # {ref, timer} while the client process answers an auth challenge.
+    :auth_wait,
     auth_attempts: 0,
     buffer: "",
     completed?: false,
@@ -244,6 +252,25 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
 
   def handle_info(:handshake_timeout, state), do: {:noreply, state}
 
+  def handle_info(
+        {:modern_http_stream_auth_result, ref, result},
+        %{auth_wait: {ref, timer}} = state
+      ) do
+    Process.cancel_timer(timer, async: false, info: false)
+    retry_with_auth(result, %{state | auth_wait: nil})
+  end
+
+  # An answer after the wait timed out, or for an earlier challenge.
+  def handle_info({:modern_http_stream_auth_result, _ref, _result}, state),
+    do: {:noreply, state}
+
+  def handle_info({:auth_timeout, ref}, %{auth_wait: {ref, _timer}} = state),
+    do:
+      {:stop, :normal,
+       notify_closed(%{state | auth_wait: nil}, {:authentication_failed, :timeout})}
+
+  def handle_info({:auth_timeout, _ref}, state), do: {:noreply, state}
+
   def handle_info(:idle_timeout, state) do
     cancel_request(state)
     {:stop, :normal, notify_closed(state, :stream_idle_timeout)}
@@ -277,14 +304,8 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
 
   defp handle_complete_http_response(status, headers, body, state) do
     case maybe_retry_with_auth(status, headers, state) do
-      {:retry, state} ->
-        case open_request(%{state | request_ref: nil}) do
-          {:ok, request_ref} ->
-            {:noreply, state |> Map.put(:request_ref, request_ref) |> reset_handshake_timer()}
-
-          {:error, reason} ->
-            {:stop, :normal, notify_closed(state, {:auth_retry_failed, reason})}
-        end
+      {:await_auth, state} ->
+        {:noreply, state}
 
       :no_retry ->
         state = handle_complete_response(status, body, state)
@@ -294,9 +315,6 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
         end
 
         {:stop, :normal, state}
-
-      {:error, reason, state} ->
-        {:stop, :normal, notify_closed(state, {:authentication_failed, reason})}
     end
   end
 
@@ -407,48 +425,76 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
   # rather than stream_start/stream_end messages. Retry at most the same two
   # challenge steps as the ordinary HTTP path: an initial 401 followed by an
   # optional 403 insufficient-scope step-up.
+  #
+  # The stream doesn't run the provider itself. With several streams open, each
+  # would refresh, and a rotating refresh token used twice fails. The client
+  # process answers every stream's challenges in turn and reuses a token
+  # another stream already obtained, so the stream waits for its answer.
   defp maybe_retry_with_auth(status, response_headers, state)
        when status in [401, 403] and not is_nil(state.auth_provider) and
               state.auth_attempts < 2 do
-    callback = if status == 401, do: :handle_unauthorized, else: :handle_forbidden
     www_auth = Headers.get(response_headers, "www-authenticate")
-    scopes = extract_scopes(www_auth)
+    ref = make_ref()
 
-    case apply(state.auth_provider, callback, [www_auth, scopes, state.auth_provider_state]) do
-      {:ok, token, provider_state} when is_binary(token) ->
-        case sanitize_retry_headers(put_bearer_header(state.headers, token), state) do
-          {:ok, headers} ->
-            Lifetime.deliver(
-              state.parent,
-              {:modern_http_stream_auth_updated, self(), state.request_id,
-               %{access_token: token, auth_provider_state: provider_state}}
-            )
+    challenge = %{
+      status: status,
+      www_authenticate: www_auth,
+      scopes: extract_scopes(www_auth),
+      token: bearer_token(state.headers)
+    }
 
-            {:retry,
-             %{
-               state
-               | headers: headers,
-                 auth_provider_state: provider_state,
-                 auth_attempts: state.auth_attempts + 1,
-                 buffer: "",
-                 close_notified?: false,
-                 failed?: false,
-                 completed?: false
-             }}
+    Lifetime.deliver(
+      state.parent,
+      {:modern_http_stream_auth_challenge, self(), state.request_id, ref, challenge}
+    )
 
-          {:error, reason} ->
-            {:error, {:security_policy_rejected, reason}, state}
-        end
-
-      {:error, reason, _provider_state} ->
-        {:error, reason, state}
-
-      other ->
-        {:error, {:invalid_provider_response, other}, state}
-    end
+    timer = Process.send_after(self(), {:auth_timeout, ref}, @auth_wait_ms)
+    {:await_auth, %{state | request_ref: nil, auth_wait: {ref, timer}}}
   end
 
   defp maybe_retry_with_auth(_status, _response_headers, _state), do: :no_retry
+
+  defp retry_with_auth({:ok, token}, state) when is_binary(token) do
+    case sanitize_retry_headers(put_bearer_header(state.headers, token), state) do
+      {:ok, headers} ->
+        state = %{
+          state
+          | headers: headers,
+            auth_attempts: state.auth_attempts + 1,
+            buffer: "",
+            close_notified?: false,
+            failed?: false,
+            completed?: false
+        }
+
+        case open_request(state) do
+          {:ok, request_ref} ->
+            {:noreply, state |> Map.put(:request_ref, request_ref) |> reset_handshake_timer()}
+
+          {:error, reason} ->
+            {:stop, :normal, notify_closed(state, {:auth_retry_failed, reason})}
+        end
+
+      {:error, reason} ->
+        {:stop, :normal,
+         notify_closed(state, {:authentication_failed, {:security_policy_rejected, reason}})}
+    end
+  end
+
+  defp retry_with_auth({:error, reason}, state),
+    do: {:stop, :normal, notify_closed(state, {:authentication_failed, reason})}
+
+  defp retry_with_auth(other, state),
+    do:
+      {:stop, :normal,
+       notify_closed(state, {:authentication_failed, {:invalid_provider_response, other}})}
+
+  defp bearer_token(headers) do
+    case Headers.get(headers, "authorization") do
+      "Bearer " <> token -> token
+      _none -> nil
+    end
+  end
 
   defp sanitize_retry_headers(headers, %{header_sanitizer: sanitizer})
        when is_function(sanitizer, 1) do

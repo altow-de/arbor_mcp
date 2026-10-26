@@ -472,7 +472,9 @@ defmodule Arbor.MCP.Server.Runtime.Initialization do
       :runtime_requirements,
       :stdio_output_lease,
       :http_writer_domain,
-      :http_writer_proxy
+      :http_writer_proxy,
+      # Tools, resources and prompts added at runtime outlive a cohort.
+      :registry
     ] or
       match?({:runtime_owned, _pid}, key)
   end

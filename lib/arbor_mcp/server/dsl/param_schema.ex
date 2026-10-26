@@ -6,7 +6,7 @@ defmodule Arbor.MCP.Server.DSL.ParamSchema do
   @array [:min_items, :max_items, :unique_items]
   @object [:min_properties, :max_properties, :additional_properties]
   @constraints @numeric ++ @string ++ @array ++ @object ++ [:enum]
-  @options [:required, :default, :description, :schema] ++ @constraints
+  @options [:required, :default, :description, :schema, :complete] ++ @constraints
   @wire_keys %{
     exclusive_minimum: :exclusiveMinimum,
     exclusive_maximum: :exclusiveMaximum,

@@ -167,10 +167,11 @@ defmodule Arbor.MCP.Server.ResultValueTest do
   end
 
   test "legacy scalar result rejection happens before state commit; objects still work" do
+    # The rejection is a JSON-RPC error the handler can act on, not a crash.
     root =
       start_supervised!({HandlerServer, handler: Handler, transport: :test, execution: :stateful})
 
-    assert {:error, %{"error" => %{"data" => %{"type" => "handler_crash"}}}} =
+    assert {:ok, %{"error" => %{"code" => -32603, "data" => %{"type" => "invalid_result"}}}} =
              Runtime.request(root, request("boolean", 1, :legacy))
 
     assert Server.call(root, :read) == 0

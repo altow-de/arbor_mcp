@@ -10,8 +10,12 @@ defmodule Arbor.MCP.Server.DSL.Builder do
           default: any(),
           has_default: boolean(),
           description: String.t() | nil,
+          complete: completer() | nil,
           schema: map() | boolean()
         }
+
+  @type completer ::
+          {:values, [String.t()]} | {:local, atom()} | {:capture, (String.t(), map() -> term())}
 
   @spec tool(String.t(), String.t() | nil, keyword()) :: map()
   def tool(name, description, opts) when is_binary(name) do
@@ -90,7 +94,98 @@ defmodule Arbor.MCP.Server.DSL.Builder do
       default: Keyword.get(opts, :default),
       has_default: Keyword.has_key?(opts, :default),
       description: Keyword.get(opts, :description),
-      schema: ParamSchema.build(type, opts)
+      complete: completer!(name, Keyword.get(opts, :complete)),
+      schema: ParamSchema.build(type, Keyword.delete(opts, :complete))
+    }
+  end
+
+  # A completer is a list of candidate strings, the name of a function in the
+  # declaring module, or an external capture, each called as fun(value,
+  # context). Anonymous functions can't be stored in compiled declarations.
+  @completer_forms "a list of strings, a local function name, or an external capture " <>
+                     "of arity 2 such as &MyApp.Names.complete/2"
+
+  defp completer!(_name, nil), do: nil
+
+  defp completer!(name, values) when is_list(values) do
+    if Enum.all?(values, &is_binary/1),
+      do: {:values, values},
+      else: raise(ArgumentError, "complete: for #{inspect(name)} must list strings")
+  end
+
+  defp completer!(_name, function) when is_atom(function), do: {:local, function}
+
+  defp completer!(name, function) when is_function(function, 2) do
+    if Function.info(function, :type) == {:type, :external},
+      do: {:capture, function},
+      else: invalid_completer!(name, function)
+  end
+
+  defp completer!(name, other), do: invalid_completer!(name, other)
+
+  defp invalid_completer!(name, other),
+    do:
+      raise(
+        ArgumentError,
+        "complete: for #{inspect(name)} must be #{@completer_forms}, got: #{inspect(other)}"
+      )
+
+  @doc false
+  # One page of a DSL list. Without a page size every item is returned and
+  # any cursor ignored, as before page_size existed.
+  def list_page(items, _cursor, nil, state), do: {:ok, items, nil, state}
+
+  def list_page(items, cursor, page_size, state) do
+    case decode_cursor(cursor) do
+      {:ok, offset} ->
+        page = Enum.slice(items, offset, page_size)
+        next = if offset + page_size < length(items), do: encode_cursor(offset + page_size)
+        {:ok, page, next, state}
+
+      :error ->
+        {:error, Arbor.MCP.Error.protocol_error(-32602, "Invalid cursor"), state}
+    end
+  end
+
+  defp encode_cursor(offset), do: Base.url_encode64("o:#{offset}", padding: false)
+
+  defp decode_cursor(nil), do: {:ok, 0}
+
+  defp decode_cursor(cursor) when is_binary(cursor) do
+    with {:ok, "o:" <> digits} <- Base.url_decode64(cursor, padding: false),
+         {offset, ""} when offset >= 0 <- Integer.parse(digits) do
+      {:ok, offset}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp decode_cursor(_cursor), do: :error
+
+  @doc false
+  # Answers completion/complete from a DSL completer, capped at the 100
+  # values the spec allows per response.
+  def complete(completer, module, value, context) do
+    value = if is_binary(value), do: value, else: ""
+
+    values =
+      case completer do
+        {:values, candidates} ->
+          prefix = String.downcase(value)
+          Enum.filter(candidates, &String.starts_with?(String.downcase(&1), prefix))
+
+        {:local, function} ->
+          List.wrap(apply(module, function, [value, context]))
+
+        {:capture, function} ->
+          List.wrap(function.(value, context))
+      end
+      |> Enum.filter(&is_binary/1)
+
+    total = length(values)
+
+    %{
+      completion: %{values: Enum.take(values, 100), total: total, hasMore: total > 100}
     }
   end
 

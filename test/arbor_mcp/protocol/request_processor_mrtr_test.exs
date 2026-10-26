@@ -17,7 +17,10 @@ defmodule Arbor.MCP.Protocol.RequestProcessorMRTRTest do
            %{
              "approval" => %{
                "method" => "elicitation/create",
-               "params" => %{"message" => "Approve", "requestedSchema" => %{}}
+               "params" => %{
+                 "message" => "Approve",
+                 "requestedSchema" => %{"type" => "object", "properties" => %{}}
+               }
              }
            }, %{"source" => "request-processor"}, state}
 

@@ -12,6 +12,8 @@ defmodule Arbor.MCP.Server.Runtime.Config do
             dispatcher: Arbor.MCP.Server.Dispatch,
             cancellation_tracker: nil,
             dispatch_opts: [],
+            middleware: [],
+            cache_hints: %{},
             services: nil,
             store_children: [],
             # Concurrent by default, like the other MCP SDKs. :stateful runs one
@@ -51,6 +53,9 @@ defmodule Arbor.MCP.Server.Runtime.Config do
          :ok <- validate_name(Keyword.get(opts, :name)),
          :ok <- validate_legacy_services(opts),
          :ok <- validate_handler(config),
+         {:ok, config} <- put_middleware(config),
+         {:ok, config} <- put_cache_hints(config),
+         config = put_execution(config),
          :ok <- validate_execution(config),
          :ok <- validate_limits(config),
          :ok <- validate_timers(config),
@@ -114,6 +119,82 @@ defmodule Arbor.MCP.Server.Runtime.Config do
        do: :ok
 
   defp validate_handler(_config), do: {:error, :handler_required}
+
+  # The legacy input bridge runs a callback several times and must hold a
+  # stateless one to its snapshot between runs.
+  defp put_execution(config),
+    do: %{config | dispatch_opts: Keyword.put(config.dispatch_opts, :execution, config.execution)}
+
+  # Dispatch reads the chain from its options, on every transport.
+  defp put_middleware(%{middleware: []} = config), do: {:ok, config}
+
+  defp put_middleware(config) do
+    with {:ok, middleware} <- Arbor.MCP.Server.Middleware.normalize(config.middleware) do
+      {:ok,
+       %{
+         config
+         | middleware: middleware,
+           dispatch_opts: Keyword.put(config.dispatch_opts, :middleware, middleware)
+       }}
+    end
+  end
+
+  # `ttlMs` / `cacheScope` for the cacheable results a handler leaves them off,
+  # by method, as the TypeScript SDK's `cacheHints` server option: mostly the
+  # list results, which the server builds itself. Checked here, at start.
+  defp put_cache_hints(%{cache_hints: hints} = config) when hints in [%{}, []], do: {:ok, config}
+
+  defp put_cache_hints(%{cache_hints: hints} = config) when is_map(hints) or is_list(hints) do
+    hints
+    |> Enum.reduce_while({:ok, %{}}, fn {method, hint}, {:ok, acc} ->
+      case cache_hint(to_string(method), hint) do
+        {:ok, wire} -> {:cont, {:ok, Map.put(acc, to_string(method), wire)}}
+        error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, wire} ->
+        {:ok,
+         %{
+           config
+           | cache_hints: wire,
+             dispatch_opts: Keyword.put(config.dispatch_opts, :cache_hints, wire)
+         }}
+
+      error ->
+        error
+    end
+  end
+
+  defp put_cache_hints(_config), do: {:error, {:invalid_cache_hints, :not_a_map}}
+
+  defp cache_hint(method, hint) when is_list(hint) or is_map(hint) do
+    with true <- Arbor.MCP.Protocol.CacheableResult.cacheable_method?(method),
+         {:ok, wire} <- cache_hint_fields(Map.new(hint)) do
+      {:ok, wire}
+    else
+      false -> {:error, {:invalid_cache_hints, {:not_cacheable, method}}}
+      {:error, field} -> {:error, {:invalid_cache_hints, {method, field}}}
+    end
+  end
+
+  defp cache_hint(method, _hint), do: {:error, {:invalid_cache_hints, {method, :not_a_map}}}
+
+  defp cache_hint_fields(hint) do
+    Enum.reduce_while(hint, {:ok, %{}}, fn
+      {:ttl_ms, ms}, {:ok, acc} when is_integer(ms) and ms >= 0 ->
+        {:cont, {:ok, Map.put(acc, "ttlMs", ms)}}
+
+      {:cache_scope, scope}, {:ok, acc} when scope in [:public, :private] ->
+        {:cont, {:ok, Map.put(acc, "cacheScope", Atom.to_string(scope))}}
+
+      {:cache_scope, scope}, {:ok, acc} when scope in ["public", "private"] ->
+        {:cont, {:ok, Map.put(acc, "cacheScope", scope)}}
+
+      {field, _invalid}, _acc ->
+        {:halt, {:error, field}}
+    end)
+  end
 
   @default_max_concurrency 64
 

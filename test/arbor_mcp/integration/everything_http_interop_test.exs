@@ -17,6 +17,26 @@ defmodule Arbor.MCP.Integration.EverythingHTTPInteropTest do
   @moduletag :integration
   @moduletag timeout: 60_000
 
+  defmodule ProgressRecorder do
+    @moduledoc false
+    @behaviour Arbor.MCP.Client.Handler
+
+    @impl true
+    def init(opts), do: {:ok, %{owner: Keyword.fetch!(opts, :owner)}}
+    @impl true
+    def handle_ping(state), do: {:ok, %{}, state}
+    @impl true
+    def handle_list_roots(state), do: {:ok, [], state}
+    @impl true
+    def handle_create_message(_params, state), do: {:error, "unused", state}
+
+    @impl true
+    def handle_progress(_request_id, params, state) do
+      send(state.owner, {:progress, params})
+      {:ok, state}
+    end
+  end
+
   @interop_dir Path.expand("../../interop", __DIR__)
   @server_script Path.join(@interop_dir, "everything_http_server.mjs")
   @node_modules Path.join(@interop_dir, "node_modules")
@@ -95,6 +115,61 @@ defmodule Arbor.MCP.Integration.EverythingHTTPInteropTest do
 
         content = get_content_text(result)
         assert content =~ "Echo: hello from Elixir"
+      after
+        Arbor.MCP.Client.disconnect(client)
+      end
+    end
+
+    # The server sends each step's progress on the call's POST stream, ahead
+    # of the result.
+    test "receives a long-running tool's progress while it runs", %{server_port: port} do
+      {:ok, client} = connect_client(port, handler: {ProgressRecorder, [owner: self()]})
+
+      try do
+        call =
+          Task.async(fn ->
+            Arbor.MCP.Client.call_tool(
+              client,
+              "longRunningOperation",
+              %{"duration" => 2, "steps" => 4},
+              timeout: 10_000,
+              format: :map,
+              meta: %{"progressToken" => "long-running"}
+            )
+          end)
+
+        assert_receive {:progress, %{"progress" => 1, "total" => 4}}, 5_000
+        assert Task.yield(call, 0) == nil
+
+        assert {:ok, result} = Task.await(call, 10_000)
+        assert get_content_text(result) =~ "Long running operation completed"
+        for step <- 2..4, do: assert_received({:progress, %{"progress" => ^step}})
+      after
+        Arbor.MCP.Client.disconnect(client)
+      end
+    end
+
+    # Six steps half a second apart: longer than the timeout, but never
+    # that long without progress.
+    test "progress keeps a long-running call alive past its timeout", %{server_port: port} do
+      {:ok, client} = connect_client(port, handler: {ProgressRecorder, [owner: self()]})
+      args = %{"duration" => 3, "steps" => 6}
+
+      try do
+        assert {:ok, result} =
+                 Arbor.MCP.Client.call_tool(client, "longRunningOperation", args,
+                   timeout: 1_000,
+                   reset_timeout_on_progress: true,
+                   format: :map
+                 )
+
+        assert get_content_text(result) =~ "Long running operation completed"
+
+        assert {:error, :timeout} =
+                 Arbor.MCP.Client.call_tool(client, "longRunningOperation", args,
+                   timeout: 1_000,
+                   format: :map
+                 )
       after
         Arbor.MCP.Client.disconnect(client)
       end
@@ -304,15 +379,17 @@ defmodule Arbor.MCP.Integration.EverythingHTTPInteropTest do
     use_sse = Keyword.get(opts, :use_sse, false)
 
     Arbor.MCP.Client.start_link(
-      transport: :http,
-      url: "http://127.0.0.1:#{port}",
-      endpoint: "/mcp",
-      use_sse: use_sse,
-      # This fixture uses the session-based SDK 1.x transport.
-      protocol_mode: :legacy_only,
-      timeout: 10_000,
-      request_timeout: 10_000,
-      stream_handshake_timeout: 10_000
+      [
+        transport: :http,
+        url: "http://127.0.0.1:#{port}",
+        endpoint: "/mcp",
+        use_sse: use_sse,
+        # This fixture uses the session-based SDK 1.x transport.
+        protocol_mode: :legacy_only,
+        timeout: 10_000,
+        request_timeout: 10_000,
+        stream_handshake_timeout: 10_000
+      ] ++ Keyword.take(opts, [:handler])
     )
   end
 

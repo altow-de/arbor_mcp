@@ -7,29 +7,142 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Servers can check JWT access tokens locally against the authorization
+  server's keys instead of introspecting each one: `jwks_uri:` in
+  `:auth_config` uses the new `Arbor.MCP.Authorization.JWTVerifier`, which
+  accepts only asymmetric signatures, keeps the key set for ten minutes and
+  fetches it again when a token names an unknown key (at most once a
+  minute). Any `Arbor.MCP.Authorization.TokenVerifier` can be plugged in with
+  `token_verifier:`, as the TypeScript SDK's `OAuthTokenVerifier` can. The
+  guard still binds such tokens to the configured issuer, audience and
+  scopes.
+- The client keeps results the server marks fresh, as the TypeScript SDK's
+  client does: each `tools/list`, `prompts/list`, `resources/list` and
+  `resources/templates/list` page and each `resources/read` is answered from
+  the cache for its `ttlMs` (at most a day). `list_changed` and
+  `resources/updated` notifications drop what they make stale, including a
+  request still in flight, and reconnecting clears it. Per call,
+  `cache_mode: :refresh` or `:bypass` skips it; `response_cache: false` turns
+  it off, and `:default_cache_ttl_ms` keeps results that carry no `ttlMs`.
+- Servers take `:cache_hints`, per method, for the `ttlMs` and `cacheScope` of
+  cacheable results a handler doesn't set, such as the lists, as the
+  TypeScript SDK's `cacheHints` option does. A `resources/read` handler may
+  also return the whole result, with its own hints, instead of just the
+  contents.
+- Requests take `reset_timeout_on_progress: true`, as the TypeScript SDK's
+  `resetTimeoutOnProgress` does: `:timeout` then limits how long the request
+  may go without a progress update, each update starts it again, and
+  `:max_total_timeout` caps the whole request. The client adds a progress
+  token to a request that has none, and the HTTP transport's
+  `:request_timeout` doesn't cut such a request off.
+- `Client.call_tool/4` checks a result against the tool's `outputSchema`, as
+  the TypeScript and Python SDKs do. Once `list_tools/2` has shown a tool
+  with one, a successful result must carry `structuredContent` that
+  conforms, or the call returns `{:error, %Arbor.MCP.Error.ValidationError{}}`.
+  Only complete results are checked, not `isError` ones, task handles or MRTR
+  rounds; a `null` `structuredContent` counts as present. `validate_output:
+  false` turns it off for a call. A first-page `tools/list` replaces the
+  recorded schemas, a new connection starts without any, and a
+  `tools/list_changed` notification forgets them until tools are listed
+  again.
+- One handler serves both protocol eras when it asks for input. A callback
+  that returns an MRTR `input_required` result to a legacy client no longer
+  fails with "input_required requires MCP 2026-07-28": the server sends each
+  input request as the server-to-client request it stands for (elicitation,
+  sampling or roots), then calls the callback again with the answers in
+  `Server.Context.input_responses/0` and its state in
+  `Context.request_state/0`, as the TypeScript, Go and C# SDKs do. A callback
+  may ask up to 10 times. A request the connection's negotiated revision
+  doesn't define, or that the client didn't declare the capability for, fails
+  the call instead of being sent, and a cancelled call's pending request is
+  dropped. A stateless callback must return its snapshot every round.
+- DSL server options `instructions:`, `capabilities:` and `page_size:`.
+  Instructions are returned by `initialize` and `server/discover`, and clients
+  read them with the new `Arbor.MCP.Client.instructions/1`. Capabilities are
+  merged into the generated ones. A page size paginates the four list methods
+  with an opaque cursor; an invalid cursor fails with `-32602`.
+- DSL completion: prompt arguments and resource-template variables take
+  `complete:` with a list of strings, a local function name or an external
+  capture of arity 2. The generated server advertises `completions` and
+  answers `completion/complete` for them, passing the request's `context`
+  (already-filled arguments) to functions. Other arguments still reach
+  `handle_complete/3`.
+- `Handler.handle_complete/4` receives the completion `context` (MCP
+  2025-06-18), and `Client.complete/4` sends one with `context:`.
+- `Server.Context.request_id/0`, `session_id/0`, `auth_info/0` and
+  `request_headers/0` describe the request a callback handles, like the
+  `extra` argument of TypeScript SDK handlers. Over HTTP with
+  `oauth_enabled: true`, `auth_info/0` returns the validated bearer token as a
+  new `Arbor.MCP.Server.AuthInfo`, which leaves the token out of `inspect/1`. A
+  host that authenticates requests in its own plug can attach one with
+  `Arbor.MCP.HttpPlug.put_auth_info/2`.
+- `Server.add_tool/3`, `add_resource/3`, `add_resource_template/3` and
+  `add_prompt/3` add definitions to a running server with a function that
+  serves them, and `remove_tool/2` and its siblings take them away. Each
+  change notifies clients that the list changed, like `registerTool` in the
+  TypeScript SDK and `AddTool` in Go. Registered entries are listed after the
+  handler's own, take precedence over handler entries with the same name, and
+  are advertised with `listChanged: true`. Tool arguments are validated
+  against `inputSchema` and results against `outputSchema`; a failure is an
+  `isError` tool result, as for DSL tools. This works for
+  plain handlers and DSL servers alike.
+- Server middleware: the `:middleware` runtime option takes modules
+  implementing the new `Arbor.MCP.Server.Middleware`, which wrap every
+  request and notification dispatched to the handler, on every transport,
+  like Python's `MCPServer(middleware=[...])` and Go's
+  `AddReceivingMiddleware`. A middleware can refuse a request, rewrite its
+  params or change its result, and never sees the handler state.
+
 ### Changed
 
+- **BREAKING:** Resource-template variables are percent-decoded, so a handler
+  that decoded them itself now decodes twice. Template matching supports every
+  RFC 6570 operator (`{+path}` and `{#frag}` span slashes, `{/a,b}`, `{.ext}`,
+  `{;params}`, `{?query}` and `{&more}`), exploded lists and prefixes. Later
+  variables of a path expression may be omitted. Query variables match in
+  any order and may be absent, and other query parameters are ignored. As
+  in Python's MCPServer, a decoded value doesn't match if it contains a NUL
+  byte, climbs above its start with `..`, or is an absolute path, however it
+  was encoded. Before, every expression matched one path segment as written.
+- DSL servers advertise `listChanged: true` for tools, resources and prompts,
+  as the TypeScript SDK does. Send the notifications with
+  `Arbor.MCP.Server.notify_tools_changed/1` and its siblings.
 - **BREAKING:** Servers handle the requests on a connection concurrently by
   default, like the other MCP SDKs. The runtime default is now
   `execution: :stateless, max_concurrency: 64` (was `execution: :stateful,
-  max_concurrency: 1`). `init/1` and `handle_initialize/2` may still set up
-  handler state, and initializations commit one at a time. Every other callback
-  must return its snapshot of the state unchanged; one that returns a changed
-  state fails its request with `invalid_handler_state` (over HTTP too, where it
-  was reported as `output_failed`), and the runtime logs a warning naming the
-  handler the first time. A stateless callback was compared with the latest
-  committed state rather than its own snapshot, so a commit made while it ran
-  (an initialization, a cancellation tracker) failed it; it is now compared
-  with its snapshot. Keep mutable data in a process or ETS table, or start the server
-  with `execution: :stateful` to run callbacks one at a time and commit their
-  state as before. `execution: :stateful` now implies `max_concurrency: 1`.
+  max_concurrency: 1`).
+  - `init/1` and `handle_initialize/2` may still set up handler state, and
+    initializations commit one at a time. Every other callback, including
+    custom `handle_call/3` and `handle_cast/2` used through `Arbor.MCP.Server.call/3`
+    and `cast/2`, gets a snapshot of the state and must return it unchanged.
+  - A callback that returns a changed state fails its request with `-32603` and
+    `%{"type" => "invalid_handler_state"}` (over HTTP too, where it was reported
+    as `output_failed`), and the runtime logs a warning naming the handler the
+    first time.
+  - `execution: :stateful` now implies `max_concurrency: 1` and rejects any
+    other value.
+  - A stateless callback was compared with the latest committed state rather
+    than its own snapshot, so a commit made while it ran (an initialization, a
+    cancellation tracker) failed it; it is now compared with its snapshot.
+  - **Upgrade:** start servers whose callbacks change state with
+    `execution: :stateful`, which keeps the previous one-at-a-time behavior, or
+    move the changing data into a process or ETS table. See
+    [upgrading from rc.5](docs/guides/V2_RELEASE_CANDIDATE.md).
+- **BREAKING:** A server's responses on one connection can arrive in completion
+  order rather than request order, on every transport including stdio: a slow
+  tool's answer can follow a later, faster one. Each response carries its
+  request's id, JSON-RPC allows any order, and ArborMCP's client and the
+  official SDKs match responses by id. **Upgrade:** a hand-written client or test
+  that reads responses in order must match them by id, or the server can start
+  with `execution: :stateful`, which still answers requests in arrival order
+  except `ping`, answered at once.
 - **BREAKING:** The server's `request_timeout_ms` defaults to one hour (was
   10 s). Tools that ran longer than 10 s used to fail with `handler_timeout`
   while the client was still waiting. The caller's timeout now decides, and a
-  timed-out request is cancelled on the server (see below).
-- **BREAKING:** DSL servers' generated `handle_initialize/2` no longer stores the
-  negotiated `:protocol_version` in handler state. The version belongs to a
-  connection, and one runtime can serve several.
+  timed-out request is cancelled on the server (see below). **Upgrade:** set
+  `request_timeout_ms` explicitly to keep a tighter server-side bound.
 - A stateful server answers `ping` while a callback runs instead of queueing it
   behind that callback, so peers can tell a busy server from a dead one.
 - The stdio server runs requests concurrently when its runtime is stateless. It
@@ -77,6 +190,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `with_connection/3`'s `:cleanup_timeout` bounds the scope only. It was also
   passed to a stdio transport, where it became the server's subprocess shutdown
   budget; set `:eof_grace` or `:cleanup_timeout` in the connection spec instead.
+- **BREAKING:** An elicitation a handler asks for in an `input_required`
+  result is held to the protocol's ElicitRequest schema in both eras. A modern
+  client used to get it unchecked, while the legacy bridge refused one that
+  didn't fit. A request that doesn't fit, such as a `requestedSchema` without
+  `properties`, now fails the call with a `-32602` error naming the input
+  request, before it reaches the client. **Upgrade:** give a form
+  elicitation's `requestedSchema` its `properties` (`%{}` if there are none),
+  each a string, number, boolean or enum field.
+- **BREAKING:** A DSL tool called with invalid arguments returns an `isError`
+  tool result, "Input validation error: …" naming the failing fields and rules,
+  instead of a `-32602` protocol error with no details. A path shows only
+  the properties and array indices the schema declares at that position; a
+  key the caller sent, and everything below it, shows as `*`. This follows SEP-1303,
+  as the other MCP SDKs do, and lets a model correct the call. Rejected values
+  are never included. **Upgrade:** callers that matched the error tuple from
+  `Client.call_tool/4` now receive `{:ok, %Arbor.MCP.Response{is_error: true}}`.
+
+### Fixed
+
+- `Context.report_progress/3` and `Context.send_log_message/3` returned
+  `{:error, :request_not_streaming}` over BEAM, stdio and the test transport,
+  so a handler could only report progress there through
+  `Server.notify_progress/4` and a server reference. They now work on every
+  transport, as TypeScript and Python handlers' progress helpers do, and the
+  notification goes out before the callback's result.
+- The client took a request or notification without `params` for an invalid
+  message and dropped it. JSON-RPC allows leaving `params` out, and the
+  TypeScript SDK's servers send `ping` and `notifications/*/list_changed`
+  that way, so the client never answered their pings or saw their list
+  changes. Such a message now parses with empty params.
+- An elicitation a handler asked for could fail as
+  `invalid_elicitation_params` on a busy machine: the pinned schema it's
+  checked against was compiled again for each request within 250 ms, and
+  checking had 100 ms. The schema is now compiled once, and checking the
+  bounded request has up to a second.
+- A tool result its connection's revision can't carry, such as a
+  non-object `structuredContent` in a legacy era, raised in the server and
+  reached the client as an opaque `handler_crash`. It's now a `-32603`
+  error with `%{"type" => "invalid_result"}`, and the server logs why.
+- In the legacy Streamable HTTP revisions a server may answer a request's
+  POST with an event stream that carries the request's notifications and its
+  own requests ahead of the response, as the TypeScript SDK's servers do for
+  progress, log messages and elicitation. The client read the whole stream
+  before parsing it and joined every event into one JSON document, so a
+  notification ahead of the response left the call waiting until it timed
+  out, and a request the server waited on was never answered. Each message
+  on the stream is now handled as it arrives, so progress reaches
+  `handle_progress/3` while the call runs, and the stream's length is no
+  longer limited by `:max_response_bytes` (each incomplete event is limited
+  by `:max_stream_buffer_bytes`). The SSE parser also reads an `id`,
+  `retry` or `event` field written without a space after the colon, as the
+  format allows; such an event id used to be ignored for resumption.
+- A notification sent before the answer to `initialize` or
+  `server/discover`, such as a log message, was taken for the answer, and
+  the client failed to connect. It now skips notifications until the answer
+  arrives or its deadline passes.
+- The client sent `"capabilities": {}` in a legacy `initialize`, whatever its
+  `:capabilities` option said, so a server that respects declared
+  capabilities never sent it elicitation, sampling or roots requests. It now
+  sends the configured capabilities, as a modern client does with each
+  request.
+- The client delivered `notifications/progress` and `notifications/message` to
+  its handler only on modern HTTP request streams and dropped them on stdio,
+  BEAM and legacy HTTP. `handle_progress/3` now receives progress on every
+  transport, matched to the pending request by its `progressToken`, and
+  `handle_log_message/3` receives connection-level log messages with a `nil`
+  request id. A request whose `progressToken` a pending request already
+  carries is refused with a `:not_sent` transport error
+  (`cause: :duplicate_progress_token`), since its progress would be
+  misrouted.
+- The default OAuth provider kept no refresh token, so an expired access token
+  started the full authorization flow again, which found the same authorization
+  server and failed with `:auth_loop_detected`. It now refreshes the token
+  shortly before it expires and when the server rejects it, and runs the full
+  flow only if refreshing fails. A refreshed token replaces the stored one in
+  the `:credential_store`, under the resource and scopes of the flow that
+  issued the first, and keeps the refresh token and scopes when the server's
+  response omits them, or under the new scope when it changes. If a token
+  refreshed after a 401 is rejected in turn, the provider runs discovery,
+  which asks nothing of the user, and starts the full flow only if the
+  resource now names a different authorization server; otherwise it
+  refreshes again. Modern HTTP request streams hand their 401 and 403
+  challenges to the client process, which runs one refresh or flow for all of
+  them, so a rotating refresh token isn't used twice; a 403 reuses another
+  stream's newer token only if that token was granted the challenged scopes.
+  Migration is decided from published metadata only, never a guessed issuer,
+  and a failed flow for a new server, or one after a rejection, doesn't
+  start again with each 401, unless the metadata then names a server not
+  yet tried. The HTTP transport now keeps the provider's state when
+  authentication fails, or when the request it retried still fails, where it
+  used to drop it with any refresh token the refresh had rotated.
+  The provider struct no longer shows its tokens or its auth config, which
+  can hold a client secret, in `inspect/1`.
+- A BEAM or test-transport server sent list changes to a connection that
+  hadn't sent `initialize` or a modern request yet. A client establishing
+  that connection took the notification for the answer to its
+  `server/discover` probe and failed to connect. The connection now gets
+  list changes once its era is set.
+- A modern `tools/call` checked its `Mcp-Param-*` headers against the first
+  `tools/list` page only, so a tool on a later page of a paginated list
+  skipped the check. The server now follows the cursors until it finds the
+  tool, for up to 100 pages, and fails the request closed past that.
+- `Server.notify_tools_changed/1` and the other change notifications,
+  `Server.call/3` and `Server.cast/2` crashed an HTTP runtime when called
+  outside a request: with no edge process to send through, they messaged the
+  runtime supervisor. List changes now go to the runtime's
+  `subscriptions/listen` streams, and calls and casts return
+  `{:error, :runtime_unavailable}`.
+- When a legacy Streamable HTTP request got a 401 or 403, the client sent it
+  again from its own process, after authenticating, and held every other
+  request and server message until that POST finished; a server request on
+  its stream couldn't be answered. As with a modern request stream, the
+  client process now answers the challenge, one at a time across requests,
+  and the request's own task sends it again.
 
 ### Fixed
 

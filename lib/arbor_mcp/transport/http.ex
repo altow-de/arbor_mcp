@@ -99,6 +99,7 @@ defmodule Arbor.MCP.Transport.HTTP do
   alias Arbor.MCP.Transport.HTTP.{
     BoundedClient,
     ModernStreamClient,
+    PostStream,
     RequestHeaders,
     TargetPolicy,
     ToolHeaders
@@ -345,6 +346,9 @@ defmodule Arbor.MCP.Transport.HTTP do
             error
         end
 
+      {:error, reason, _state} ->
+        {:error, reason}
+
       {:error, reason} ->
         {:error, reason}
     end
@@ -359,6 +363,9 @@ defmodule Arbor.MCP.Transport.HTTP do
       {:ok, response, new_state} ->
         handle_http_response(response, new_state, message)
 
+      {:error, reason, _state} ->
+        {:error, reason}
+
       {:error, reason} ->
         {:error, reason}
     end
@@ -369,20 +376,40 @@ defmodule Arbor.MCP.Transport.HTTP do
       do: async_post(message, state)
 
   # SSE mode without active connection (pre-initialization) or fallback
-  def send_message(message, %__MODULE__{} = state), do: send_authenticated(message, state)
+  def send_message(message, %__MODULE__{} = state) do
+    case send_authenticated(message, state) do
+      {:error, reason, _state} -> {:error, reason}
+      result -> result
+    end
+  end
 
   @doc false
   # Sends `message` synchronously from the calling process, running any
   # authentication its response asks for. The client re-sends a request this
   # way when an async POST hands back an auth challenge, so only one
   # authentication runs at a time.
+  # An authentication failure returns the transport state too, so the
+  # provider's record of what it tried is kept.
   @spec send_authenticated(term(), t()) ::
-          {:ok, t()} | {:ok, t(), term()} | {:error, term()}
+          {:ok, t()} | {:ok, t(), term()} | {:error, term()} | {:error, term(), t()}
   def send_authenticated(message, %__MODULE__{} = state) do
     case perform_and_maybe_auth(message, state) do
-      {:ok, response} -> handle_http_response(response, state, message)
-      {:ok, response, new_state} -> handle_http_response(response, new_state, message)
-      {:error, reason} -> {:error, reason}
+      {:ok, response} ->
+        handle_http_response(response, state, message)
+
+      # Authentication changed the state (a refresh may have rotated its
+      # token), so a request that still fails keeps it.
+      {:ok, response, new_state} ->
+        case handle_http_response(response, new_state, message) do
+          {:error, reason} -> {:error, reason, new_state}
+          result -> result
+        end
+
+      {:error, reason, new_state} ->
+        {:error, reason, new_state}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -418,17 +445,20 @@ defmodule Arbor.MCP.Transport.HTTP do
           1_000 -> exit(:client_generation_retired)
         end
 
-        result = perform_async(message, request_state)
+        {result, sent_state} = perform_async(message, request_state, parent)
 
         # Report the durable transport-state fields this POST changed
         # (session rotation, SSE metadata) so the client can merge them into
-        # its copy of the transport state instead of discarding.
+        # its copy of the transport state instead of discarding. They're
+        # measured from the state the POST was last sent with, so a token
+        # the client handed this task (and has since perhaps replaced) isn't
+        # merged back.
         meta = %{
           request_id: request_id,
           task_pid: self(),
           deadline: request_state.deadline,
           tool_list: tool_list_page(message),
-          state_changes: result_state_changes(request_state, result)
+          state_changes: result_state_changes(sent_state, result)
         }
 
         Lifetime.deliver(parent, {:async_post_result, result, meta})
@@ -439,22 +469,94 @@ defmodule Arbor.MCP.Transport.HTTP do
     send(task_pid, {nonce, :run})
 
     # Return without response data — it will arrive via :async_post_result
-    # or via the GET SSE stream (for SSE-formatted POST responses)
-    {:ok, %{state | auth_provider_state: request_state.auth_provider_state}}
+    # or via the GET SSE stream (for SSE-formatted POST responses). The
+    # token the provider gave is kept with its state, so a challenge to it
+    # isn't mistaken for one to an older token.
+    {:ok,
+     %{
+       state
+       | auth_provider_state: request_state.auth_provider_state,
+         access_token: request_state.access_token,
+         headers: request_state.headers
+     }}
   end
 
   # A POST task does not authenticate: with several in flight, each would run
   # the OAuth flow. It hands an auth challenge back to the client process,
   # which re-sends that request with send_authenticated/2.
-  defp perform_async(message, state) do
-    case perform_http_request(message, state) do
+  defp perform_async(message, state, parent, attempts \\ 0) do
+    stream =
+      PostStream.consumer(parent,
+        max_buffer_bytes: state.max_stream_buffer_bytes,
+        max_kept_bytes: state.max_response_bytes
+      )
+
+    case perform_http_request(message, state, event_stream: stream) do
       {:ok, response} ->
-        if extract_auth_status(response) == :ok,
-          do: handle_http_response(response, state, message),
-          else: {:error, {:reauthenticate, message}}
+        case {extract_auth_status(response), state.auth_provider} do
+          {:ok, _provider} ->
+            {handle_http_response(response, state, message), state}
+
+          # As a modern request stream does: the client process answers the
+          # challenge, one at a time across its requests, and this task sends
+          # the request again itself, so the client isn't held up meanwhile.
+          # At most an initial 401 and a 403 step-up.
+          {{kind, www_auth}, provider} when not is_nil(provider) and attempts < 2 ->
+            case await_authentication(parent, kind, www_auth, state) do
+              {:ok, token} ->
+                perform_async(message, apply_token_to_state(state, token), parent, attempts + 1)
+
+              {:error, reason} ->
+                {{:error, {:authentication_failed, reason}}, state}
+            end
+
+          {_challenge, provider} when not is_nil(provider) ->
+            {handle_http_response(response, state, message), state}
+
+          {_challenge, nil} ->
+            {{:error, {:reauthenticate, message}}, state}
+        end
 
       {:error, reason} ->
-        {:error, reason}
+        {{:error, reason}, state}
+    end
+  end
+
+  @auth_wait_ms 600_000
+
+  defp await_authentication(parent, kind, www_auth, state) do
+    ref = make_ref()
+    monitor = Process.monitor(parent)
+
+    challenge = %{
+      status: if(kind == :unauthorized, do: 401, else: 403),
+      www_authenticate: www_auth,
+      scopes: extract_scope_from_www_auth(www_auth),
+      token: state.access_token
+    }
+
+    Lifetime.deliver(parent, {:http_post_auth_challenge, self(), ref, challenge})
+
+    wait =
+      case state.deadline do
+        deadline when is_integer(deadline) ->
+          min(max(deadline - System.monotonic_time(:millisecond), 0), @auth_wait_ms)
+
+        nil ->
+          @auth_wait_ms
+      end
+
+    receive do
+      {:http_post_auth_result, ^ref, result} ->
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {:DOWN, ^monitor, :process, _pid, _reason} ->
+        {:error, :client_gone}
+    after
+      wait ->
+        Process.demonitor(monitor, [:flush])
+        {:error, :timeout}
     end
   end
 
@@ -523,8 +625,10 @@ defmodule Arbor.MCP.Transport.HTTP do
         new_state = state |> Map.put(:auth_provider_state, new_ps) |> apply_token_to_state(token)
         provider_retry_request(body, new_state)
 
-      {:error, reason, _ps} ->
-        {:error, reason}
+      # The provider's state records what it tried (its loop guards), so it
+      # survives the failure.
+      {:error, reason, ps} ->
+        {:error, reason, %{state | auth_provider_state: ps}}
     end
   end
 
@@ -559,8 +663,10 @@ defmodule Arbor.MCP.Transport.HTTP do
       {:ok, nil, new_ps} ->
         %{state | auth_provider_state: new_ps}
 
+      # access_token names the token the header carries, which a stream's
+      # auth challenge is compared with.
       {:ok, token, new_ps} ->
-        %{state | auth_provider_state: new_ps, headers: put_bearer_header(state.headers, token)}
+        %{apply_token_to_state(state, token) | auth_provider_state: new_ps}
 
       {:error, _} ->
         state
@@ -727,7 +833,7 @@ defmodule Arbor.MCP.Transport.HTTP do
     |> List.insert_at(0, {"Authorization", "Bearer #{token}"})
   end
 
-  defp perform_http_request(body, state) do
+  defp perform_http_request(body, state, opts \\ []) do
     # According to MCP spec, POST directly to the MCP endpoint, not /messages
     url = build_url(state, "")
     Logger.debug("HTTP request", endpoint_hash: LogSummary.fingerprint(url))
@@ -742,7 +848,7 @@ defmodule Arbor.MCP.Transport.HTTP do
     # Security validation before making external request
     case sanitize_http_request("POST", url, headers, state) do
       {:ok, sanitized_headers} ->
-        make_http_request(url, sanitized_headers, body, state)
+        make_http_request(url, sanitized_headers, body, state, opts)
 
       {:error, security_error} ->
         Logger.warning("HTTP request blocked by security policy",
@@ -781,9 +887,10 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
-  defp make_http_request(url, headers, body, state) do
+  defp make_http_request(url, headers, body, state, opts) do
     with {:ok, transport_opts} <- https_transport_opts(url, state) do
       BoundedClient.request(:post, url, headers, "application/json", body,
+        event_stream: Keyword.get(opts, :event_stream),
         deadline: state.deadline,
         connect_timeout: state.timeouts.connect,
         request_timeout: response_timeout(state),
@@ -997,7 +1104,7 @@ defmodule Arbor.MCP.Transport.HTTP do
   defp handle_non_sse_response(body, headers, state, request_body) do
     content_type = Headers.get(headers, "content-type") || ""
 
-    if String.contains?(content_type, "text/event-stream") do
+    if String.contains?(String.downcase(content_type), "text/event-stream") do
       handle_sse_post_response(body, state, request_body)
     else
       case Jason.decode(body) do
@@ -1057,16 +1164,22 @@ defmodule Arbor.MCP.Transport.HTTP do
   defp apply_sse_event_id(state, nil), do: state
   defp apply_sse_event_id(state, id), do: %{state | last_event_id: id}
 
+  # The POST's answer is the response among its events. The notifications
+  # and requests ahead of it were handed to the client as they arrived (see
+  # PostStream), or, in a body read whole during establishment, aren't
+  # answered.
   defp sse_json_data(events) do
-    events
-    |> Enum.flat_map(fn event ->
-      case event[:data] do
-        nil -> []
-        "" -> []
-        data -> [data]
-      end
+    Enum.find_value(events, "", fn
+      %{data: data} when is_binary(data) and data != "" ->
+        case Jason.decode(data) do
+          {:ok, %{"method" => _method}} -> nil
+          {:ok, _response} -> data
+          {:error, _reason} -> nil
+        end
+
+      _no_data ->
+        nil
     end)
-    |> Enum.join("")
   end
 
   defp handle_sse_json_data("", state, _request_body), do: reconnect_deferred_sse(state)

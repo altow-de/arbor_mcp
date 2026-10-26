@@ -14,6 +14,9 @@ defmodule Arbor.MCP.Server.RequestContext do
   alias Arbor.MCP.Tasks.Extension, as: TasksExtension
   alias Arbor.RPC.JSONRPC
 
+  # The headers include Authorization; read them with
+  # Arbor.MCP.Server.Context.request_headers/0, not from inspect output.
+  @derive {Inspect, except: [:request_headers]}
   @enforce_keys [:method, :request_id, :request?, :era]
   defstruct [
     :method,
@@ -37,6 +40,9 @@ defmodule Arbor.MCP.Server.RequestContext do
     :notification_target,
     :application_context,
     :cancellation_scope,
+    :session_id,
+    :auth_info,
+    :request_headers,
     meta: %{},
     trace_context: %{}
   ]
@@ -63,6 +69,9 @@ defmodule Arbor.MCP.Server.RequestContext do
           notification_target: term(),
           application_context: term(),
           cancellation_scope: term(),
+          session_id: String.t() | nil,
+          auth_info: Arbor.MCP.Server.AuthInfo.t() | nil,
+          request_headers: [{String.t(), String.t()}] | nil,
           meta: map(),
           trace_context: map()
         }

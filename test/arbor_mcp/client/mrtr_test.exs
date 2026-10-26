@@ -41,7 +41,7 @@ defmodule Arbor.MCP.Client.MRTRTest do
                   "method" => "elicitation/create",
                   "params" => %{
                     "message" => "Display name",
-                    "requestedSchema" => %{"type" => "object"}
+                    "requestedSchema" => %{"type" => "object", "properties" => %{}}
                   }
                 }
               },
@@ -76,7 +76,7 @@ defmodule Arbor.MCP.Client.MRTRTest do
                 "method" => "elicitation/create",
                 "params" => %{
                   "message" => "Confirm operation #{operation}",
-                  "requestedSchema" => %{"type" => "object"}
+                  "requestedSchema" => %{"type" => "object", "properties" => %{}}
                 }
               }
             },

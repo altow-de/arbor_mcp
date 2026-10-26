@@ -7,10 +7,12 @@ defmodule Arbor.MCP.Server.Context do
   be read later from a spawned process.
 
   `cancelled?/0` reports whether the current request id has been cancelled.
+  `request_id/0`, `session_id/0`, `auth_info/0` and `request_headers/0` describe
+  the request, like the `extra` argument of TypeScript SDK handlers.
   """
 
   alias Arbor.MCP.Internal.Protocol
-  alias Arbor.MCP.Server.{Cancellation, RequestContext}
+  alias Arbor.MCP.Server.{AuthInfo, Cancellation, RequestContext}
   alias Arbor.MCP.Server.Runtime.{CallbackContext, HTTPNotificationTarget}
 
   @key {__MODULE__, :current}
@@ -94,13 +96,56 @@ defmodule Arbor.MCP.Server.Context do
   end
 
   @doc """
+  Returns the JSON-RPC id of the request being handled, or `nil` for a
+  notification.
+  """
+  @spec request_id() :: Arbor.MCP.Types.request_id() | nil
+  def request_id, do: field(:request_id)
+
+  @doc """
+  Returns the `Mcp-Session-Id` of a legacy Streamable HTTP request.
+
+  Modern HTTP is stateless and has no session, and stdio and BEAM connections
+  have none either, so this is `nil` for them.
+  """
+  @spec session_id() :: String.t() | nil
+  def session_id, do: field(:session_id)
+
+  @doc """
+  Returns the validated access token of an HTTP request, or `nil` when the
+  request carried none. See `Arbor.MCP.Server.AuthInfo`.
+  """
+  @spec auth_info() :: AuthInfo.t() | nil
+  def auth_info, do: field(:auth_info)
+
+  @doc """
+  Returns the HTTP request headers as `{lowercase_name, value}` pairs, as in
+  `Plug.Conn.req_headers`, or `nil` for stdio and BEAM requests.
+
+  They are the headers as received, including `authorization` and `cookie`,
+  so don't log them whole. `inspect(Context.current())` leaves them out; use
+  `auth_info/0` for the validated token.
+  """
+  @spec request_headers() :: [{String.t(), String.t()}] | nil
+  def request_headers, do: field(:request_headers)
+
+  defp field(key) do
+    case current() do
+      %RequestContext{} = context -> Map.fetch!(context, key)
+      nil -> nil
+    end
+  end
+
+  @doc """
   Reports progress for the currently executing request callback.
 
-  Modern streamable-HTTP handlers use this request-scoped helper instead of a
-  connection-wide server process. The request must include
-  `_meta.progressToken`, and it must own an active SSE response or an addressed
-  legacy session stream. Request-owned SSE acknowledges actual IO before this
-  function returns. Legacy session SSE accepts a durable replay event before
+  It works on every transport, as TypeScript and Python handlers' progress
+  helpers do. The request must include `_meta.progressToken`. Over BEAM, stdio
+  and the test transport the notification is queued on the connection, ahead
+  of the callback's result, before this function returns, and refused once the
+  request is cancelled; over HTTP the request must own an active SSE response
+  or an addressed legacy session stream.
+  Request-owned SSE acknowledges actual IO before this function returns. Legacy session SSE accepts a durable replay event before
   returning, ordered before the request's final reply; this is not a client-byte
   receipt. A cancelled callback cannot append under a retired phase or lease.
   Legacy replay or operation pressure returns a fixed typed atom error without
@@ -113,7 +158,7 @@ defmodule Arbor.MCP.Server.Context do
         {:error, :progress_not_requested}
 
       %RequestContext{notification_target: target, progress_token: token} ->
-        if is_pid(target) or HTTPNotificationTarget.target?(target),
+        if deliverable?(target),
           do: deliver(target, Protocol.encode_progress(token, progress, total, message)),
           else: {:error, :request_not_streaming}
 
@@ -163,7 +208,7 @@ defmodule Arbor.MCP.Server.Context do
       not log_level_enabled?(level, requested) ->
         :ok
 
-      not (is_pid(target) or HTTPNotificationTarget.target?(target)) ->
+      not deliverable?(target) ->
         {:error, :request_not_streaming}
 
       true ->
@@ -202,16 +247,24 @@ defmodule Arbor.MCP.Server.Context do
     end
   end
 
+  # A request's own stream (HTTP), or the edge of its connection (BEAM,
+  # stdio, test), which takes it only while that request is current.
+  defp deliverable?({:arbor_mcp_edge, edge, _token}) when is_pid(edge), do: true
+  defp deliverable?(target), do: is_pid(target) or HTTPNotificationTarget.target?(target)
+
+  defp deliver({:arbor_mcp_edge, edge, token}, notification),
+    do: deliver_pid(edge, {:ex_mcp_request_notification, self(), :ref, notification, token})
+
   defp deliver(target, notification) do
     if HTTPNotificationTarget.target?(target),
       do: HTTPNotificationTarget.deliver(target, notification),
-      else: deliver_pid(target, notification)
+      else: deliver_pid(target, {:ex_mcp_request_notification, self(), :ref, notification})
   end
 
-  defp deliver_pid(target, notification) do
+  defp deliver_pid(target, message) do
     ref = make_ref()
     monitor = Process.monitor(target)
-    send(target, {:ex_mcp_request_notification, self(), ref, notification})
+    send(target, put_elem(message, 2, ref))
 
     receive do
       {:ex_mcp_request_notification_ack, ^ref, :ok} ->

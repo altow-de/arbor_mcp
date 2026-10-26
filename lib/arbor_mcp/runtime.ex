@@ -165,6 +165,7 @@ defmodule Arbor.MCP.Server.Runtime do
     {:ok, _context} = Initialization.begin(table, config, :runtime, deadline)
     {:ok, guard} = ShutdownGuard.start(self(), table, config)
     :ets.insert(table, {:shutdown_guard, guard})
+    :ets.insert(table, {:registry, Arbor.MCP.Server.Registry.new()})
 
     Process.put({__MODULE__, :reference}, Ref.new(self(), table))
 
