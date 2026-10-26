@@ -90,10 +90,11 @@ defmodule Arbor.MCP.Client.PaginationTest do
           {:ok, %{"tools" => [], "nextCursor" => "next"}},
           {:ok, %{"tools" => []}}
         ],
-        delay: 45
+        delay: 150
       )
 
-    assert {:error, :timeout} = Client.all_tools(client, timeout: 70)
+    # The first page answers well inside the deadline; the second can't.
+    assert {:error, :timeout} = Client.all_tools(client, timeout: 250)
     assert_receive {:page_request, _, _, first}
     assert_receive {:page_request, _, _, second}
     assert first.deadline == second.deadline
