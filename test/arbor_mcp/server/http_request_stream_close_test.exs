@@ -1,7 +1,7 @@
 defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
   use ExUnit.Case, async: false
 
-  alias Arbor.MCP.Server.Runtime
+  alias Arbor.MCP.Server.{Runtime, Transport}
   alias Arbor.MCP.Server.Runtime.{HTTPWriterProxy, HTTPWriterRegistry}
 
   defmodule Handler do
@@ -99,6 +99,89 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
     end
   end
 
+  for adapter <- [:cowboy, :bandit] do
+    @tag :physical_http
+    test "owned #{adapter} servers apply :request_keepalive_interval_ms" do
+      root =
+        start_supervised!(
+          {Runtime,
+           handler: Handler,
+           handler_args: [test_pid: self()],
+           transport: :http,
+           protocol_mode: :modern_only,
+           http: [
+             adapter: unquote(adapter),
+             port: 0,
+             host: {127, 0, 0, 1},
+             request_keepalive_interval_ms: 40
+           ]}
+        )
+
+      conn = connect(owned_port(root))
+      {:ok, conn, ref} = request(conn, "hold")
+      assert_receive {:tool_started, worker}, 1_000
+      # The 15-second default would not write a comment before this times out.
+      {conn, events} = receive_until(conn, ref, &heartbeat?/1)
+      assert content_type(events, ref) == "text/event-stream"
+
+      send(worker, :release)
+      {conn, tail} = receive_until(conn, ref, &Enum.member?(&1, {:done, ref}))
+      assert response_body(events ++ tail, ref) =~ "\"text\":\"released\""
+      Mint.HTTP.close(conn)
+    end
+
+    test "owned #{adapter} servers reject an invalid request interval like the subscription interval" do
+      for key <- [:subscription_keepalive_interval_ms, :request_keepalive_interval_ms] do
+        http = [{:adapter, unquote(adapter)}, {:port, 0}, {:host, {127, 0, 0, 1}}, {key, 0}]
+
+        # The mount validates both intervals when the listener initializes it.
+        assert {:error, _reason} =
+                 start_supervised(
+                   {Runtime,
+                    handler: Handler,
+                    handler_args: [test_pid: self()],
+                    transport: :http,
+                    protocol_mode: :modern_only,
+                    http: http},
+                   id: key
+                 )
+
+        assert_raise ArgumentError, ~r/#{key} must be a positive integer or :infinity/, fn ->
+          Arbor.MCP.HttpPlug.init([{key, 0}, runtime: :not_started])
+        end
+      end
+    end
+  end
+
+  test "owned and borrowed HTTP configuration keep both keepalive intervals for the mount" do
+    for ownership <- [:owned, :borrowed] do
+      assert {:ok, %{plug_options: plug}} =
+               Arbor.MCP.Server.HTTP.Config.new(
+                 [
+                   transport: :http,
+                   http_adapter: :bandit,
+                   request_keepalive_interval_ms: 40,
+                   subscription_keepalive_interval_ms: 50
+                 ],
+                 ownership
+               )
+
+      assert plug[:request_keepalive_interval_ms] == 40
+      assert plug[:subscription_keepalive_interval_ms] == 50
+    end
+  end
+
+  defp owned_port(root) do
+    case Transport.http_listener(root) do
+      {:ok, %{adapter: :bandit, listener: listener}} ->
+        {:ok, {_ip, port}} = ThousandIsland.listener_info(listener)
+        port
+
+      {:ok, %{adapter: :cowboy, ranch_ref: ref}} ->
+        :ranch.get_port(ref)
+    end
+  end
+
   defp start_server(adapter) do
     runtime =
       start_supervised!(
@@ -151,21 +234,6 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
   end
 
   defp request(conn, name, stream? \\ true) do
-    meta = %{
-      "io.modelcontextprotocol/protocolVersion" => "2026-07-28",
-      "io.modelcontextprotocol/clientCapabilities" => %{}
-    }
-
-    meta = if stream?, do: Map.put(meta, "progressToken", "heartbeat"), else: meta
-
-    body =
-      Jason.encode!(%{
-        jsonrpc: "2.0",
-        id: System.unique_integer([:positive]),
-        method: "tools/call",
-        params: %{name: name, arguments: %{}, _meta: meta}
-      })
-
     Mint.HTTP.request(
       conn,
       "POST",
@@ -177,8 +245,25 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
         {"mcp-method", "tools/call"},
         {"mcp-name", name}
       ],
-      body
+      tool_body(name, stream?)
     )
+  end
+
+  # A progress token makes the request own an SSE response stream.
+  defp tool_body(name, stream?) do
+    meta = %{
+      "io.modelcontextprotocol/protocolVersion" => "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities" => %{}
+    }
+
+    meta = if stream?, do: Map.put(meta, "progressToken", "heartbeat"), else: meta
+
+    Jason.encode!(%{
+      jsonrpc: "2.0",
+      id: System.unique_integer([:positive]),
+      method: "tools/call",
+      params: %{name: name, arguments: %{}, _meta: meta}
+    })
   end
 
   defp receive_until(conn, ref, predicate, events \\ []) do
