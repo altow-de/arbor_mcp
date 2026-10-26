@@ -194,6 +194,7 @@ defmodule Arbor.MCP.Reliability.RetryTest do
 
       try do
         counter = start_counter()
+        started = System.monotonic_time(:millisecond)
 
         assert {:error, :failure} =
                  Retry.with_linear_retry(
@@ -205,10 +206,15 @@ defmodule Arbor.MCP.Reliability.RetryTest do
                    delay: 50
                  )
 
+        # A sleep never returns early, so the two delays took at least 100ms.
+        assert System.monotonic_time(:millisecond) - started >= 100
         assert get_counter(counter) == 3
         assert_receive {:trace, _, :call, {Process, :sleep, [50]}}, 5_000
         assert_receive {:trace, _, :call, {Process, :sleep, [50]}}, 5_000
-        refute_receive {:trace, _, :call, {Process, :sleep, _}}, 0
+        # Trace messages reach the tracer in call order, ahead of this marker.
+        send(tracer, {:flushed, self()})
+        assert_receive {:flushed, _test}, 5_000
+        refute_received {:trace, _, :call, {Process, :sleep, _}}
       after
         :erlang.trace(self(), false, [:call])
         :erlang.trace_pattern({Process, :sleep, 1}, false, [])
