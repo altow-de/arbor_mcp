@@ -201,6 +201,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `Context.report_progress/3` and `Context.send_log_message/3` returned
+  `{:error, :request_not_streaming}` over BEAM, stdio and the test transport,
+  so a handler could only report progress there through
+  `Server.notify_progress/4` and a server reference. They now work on every
+  transport, as TypeScript and Python handlers' progress helpers do, and the
+  notification goes out before the callback's result.
 - The client took a request or notification without `params` for an invalid
   message and dropped it. JSON-RPC allows leaving `params` out, and the
   TypeScript SDK's servers send `ping` and `notifications/*/list_changed`

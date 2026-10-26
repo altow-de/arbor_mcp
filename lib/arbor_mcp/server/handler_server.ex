@@ -85,6 +85,8 @@ defmodule Arbor.MCP.Server.HandlerServer do
   # JSON-RPC batches were removed from the spec in 2025-06-18 and have not
   # come back since, so every version from 2025-06-18 onwards rejects them.
   @batch_removed_in "2025-06-18"
+  # What Context sends for a callback through the connection's edge.
+  @request_notifications ["notifications/progress", "notifications/message"]
 
   @type handler_module :: module()
   @type state :: %{
@@ -386,6 +388,33 @@ defmodule Arbor.MCP.Server.HandlerServer do
   end
 
   @impl GenServer
+  # A callback's own progress or log notification (Context.report_progress/3,
+  # send_log_message/3), queued on the connection ahead of its result, as
+  # the callback waits for this acknowledgment before going on. Only while
+  # its request is current: not once cancelled, nor for an earlier
+  # connection.
+  def handle_info({:ex_mcp_request_notification, sender, ref, notification, token}, state)
+      when is_pid(sender) do
+    {reply, state} =
+      with %{kind: :rpc, id: id, connection: connection} <- Map.get(state.invocations, token),
+           true <- connection == state.connection,
+           false <- :ets.member(Ref.table(state.runtime), {:wire_cancel, token, id}),
+           %{"method" => method, "params" => %{}} when method in @request_notifications <-
+             notification,
+           :ok <- encodable(notification) do
+        case send_message(notification, state) do
+          {:ok, state} -> {:ok, state}
+          {:error, reason} -> {{:error, reason}, state}
+        end
+      else
+        :unencodable -> {{:error, :invalid_notification}, state}
+        _not_current_or_invalid -> {{:error, :request_closed}, state}
+      end
+
+    send(sender, {:ex_mcp_request_notification_ack, ref, reply})
+    {:noreply, state}
+  end
+
   def handle_info({{:runtime_edge_reply, token}, result}, state) do
     Admission.terminal(Ref.table(state.runtime), token, {:ok, result})
     RuntimeIngress.discard_ingress(state.runtime, token)
@@ -1059,6 +1088,17 @@ defmodule Arbor.MCP.Server.HandlerServer do
     else
       process_mcp_request(request, state)
     end
+  end
+
+  # Log data is the callback's own: a term JSON can't carry is refused, not
+  # left to crash the edge when it's written.
+  defp encodable(notification) do
+    case Jason.encode(notification) do
+      {:ok, _json} -> :ok
+      {:error, _reason} -> :unencodable
+    end
+  rescue
+    _exception -> :unencodable
   end
 
   defp complete_invocation(token, result, state) do
@@ -1786,8 +1826,12 @@ defmodule Arbor.MCP.Server.HandlerServer do
   defp dispatch(request, state) do
     state = request |> maybe_pin_connection_era(state) |> remember_client_capabilities(request)
 
+    token = state.current_ingress
+
     dispatch_opts = [
       protocol_mode: effective_protocol_mode(state),
+      # Context.report_progress/3 and send_log_message/3 write through here.
+      request_notification_target: {:arbor_mcp_edge, self(), token},
       instructions: state.instructions,
       request_state: state.request_state,
       endpoint: state.endpoint,
@@ -1796,8 +1840,6 @@ defmodule Arbor.MCP.Server.HandlerServer do
       replay_cache: state.replay_cache,
       require_replay_protection: state.require_replay_protection
     ]
-
-    token = state.current_ingress
 
     case RuntimeIngress.dispatch_reserved(
            state.runtime,
