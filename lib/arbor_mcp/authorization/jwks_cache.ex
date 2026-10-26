@@ -4,15 +4,17 @@ defmodule Arbor.MCP.Authorization.JWKSCache do
   # tokens locally (see JWTVerifier).
   #
   # A key set is kept for `:jwks_cache_ttl_ms` (default ten minutes). A token
-  # signed with a key the set lacks fetches it again, at most once per
-  # `:jwks_min_refresh_ms` (default a minute), so a rotated key is picked up
-  # and made-up key ids can't make the server fetch more often. If fetching
-  # fails, the last set fetched keeps being used for `:jwks_max_stale_ms`
-  # (default an hour), as other JWT libraries do, so a short outage of the
-  # authorization server doesn't refuse every request.
+  # the held keys don't verify fetches the set again, so a rotated key is
+  # picked up; but no set is fetched more than once per `:jwks_min_refresh_ms`
+  # (default a minute), whether the last try worked or failed, so made-up key
+  # ids, forged signatures or an unreachable server can't make every request
+  # fetch. While fetching fails, the last set fetched keeps being used for
+  # `:jwks_max_stale_ms` (default an hour), as other JWT libraries do.
   #
-  # Reads come from ETS; fetches go through this process one at a time, so
-  # callers waiting on the same set share one fetch.
+  # A set is kept per URL and per fetch policy (`:oauth_http`), so keys a
+  # laxer policy fetched never answer for a stricter one. Reads come from
+  # ETS; fetches go through this process, so callers waiting on a set share
+  # one fetch.
 
   use GenServer
 
@@ -34,19 +36,19 @@ defmodule Arbor.MCP.Authorization.JWKSCache do
   # The key set at `uri`, fetched if it isn't held or has expired.
   @spec keys(String.t(), keyword()) :: {:ok, [JOSE.JWK.t()]} | {:error, term()}
   def keys(uri, opts) do
-    case lookup(uri) do
-      {keys, fetched_at} ->
+    case lookup(cache_key(uri, opts)) do
+      %{keys: [_ | _] = keys, fetched_at: fetched_at} ->
         if fresh?(fetched_at, opts), do: {:ok, keys}, else: fetch(uri, opts, :expired)
 
-      nil ->
+      _none ->
         fetch(uri, opts, :expired)
     end
   end
 
   @doc false
-  # The key set at `uri` again, for a token signed with a key it lacks.
+  # The key set at `uri` again, for a token the held keys don't verify.
   @spec refresh(String.t(), keyword()) :: {:ok, [JOSE.JWK.t()]} | {:error, term()}
-  def refresh(uri, opts), do: fetch(uri, opts, :unknown_key)
+  def refresh(uri, opts), do: fetch(uri, opts, :refresh)
 
   @doc false
   @spec clear() :: :ok
@@ -74,56 +76,66 @@ defmodule Arbor.MCP.Authorization.JWKSCache do
 
   @impl true
   def handle_call({:fetch, uri, opts, why}, _from, state) do
-    # Another caller may have fetched it while this one waited.
-    reply =
-      case lookup(uri) do
-        {keys, fetched_at} ->
-          if recent?(fetched_at, why, opts),
-            do: {:ok, keys},
-            else: fetch_and_store(uri, opts, {keys, fetched_at})
+    key = cache_key(uri, opts)
+    entry = lookup(key)
 
-        nil ->
-          fetch_and_store(uri, opts, nil)
+    reply =
+      cond do
+        # Another caller fetched it while this one waited.
+        why == :expired and held_fresh?(entry, opts) ->
+          {:ok, entry.keys}
+
+        entry != nil and now() - entry.attempted_at < option(opts, :jwks_min_refresh_ms) ->
+          held(entry, opts)
+
+        true ->
+          fetch_and_store(key, uri, opts, entry)
       end
 
     {:reply, reply, state}
   end
 
-  defp fetch_and_store(uri, opts, held) do
+  defp fetch_and_store(key, uri, opts, entry) do
+    now = now()
+
     case JWT.fetch_jwks(uri, fetch_options(opts)) do
       {:ok, keys} ->
-        :ets.insert(@table, {uri, keys, now()})
+        :ets.insert(@table, {key, %{keys: keys, fetched_at: now, attempted_at: now}})
         {:ok, keys}
 
-      {:error, reason} = error ->
-        case held do
-          {keys, fetched_at} ->
-            if now() - fetched_at < option(opts, :jwks_max_stale_ms) do
-              Logger.warning("Could not refresh a JWKS; using the keys fetched before",
-                reason: inspect(reason)
-              )
+      {:error, reason} ->
+        Logger.warning("Could not fetch a JWKS", reason: inspect(reason))
 
-              {:ok, keys}
-            else
-              error
-            end
+        entry = %{
+          keys: entry && entry.keys,
+          fetched_at: entry && entry.fetched_at,
+          attempted_at: now
+        }
 
-          nil ->
-            error
-        end
+        :ets.insert(@table, {key, entry})
+        held(entry, opts)
     end
   end
 
-  defp recent?(fetched_at, :expired, opts), do: fresh?(fetched_at, opts)
+  # The last set fetched, while it isn't too old to trust.
+  defp held(%{keys: [_ | _] = keys, fetched_at: fetched_at}, opts) do
+    if now() - fetched_at < option(opts, :jwks_max_stale_ms),
+      do: {:ok, keys},
+      else: {:error, :jwks_unavailable}
+  end
 
-  defp recent?(fetched_at, :unknown_key, opts),
-    do: now() - fetched_at < option(opts, :jwks_min_refresh_ms)
+  defp held(_entry, _opts), do: {:error, :jwks_unavailable}
+
+  defp held_fresh?(%{keys: [_ | _], fetched_at: fetched_at}, opts), do: fresh?(fetched_at, opts)
+  defp held_fresh?(_entry, _opts), do: false
 
   defp fresh?(fetched_at, opts), do: now() - fetched_at < option(opts, :jwks_cache_ttl_ms)
 
-  defp lookup(uri) do
-    case :ets.lookup(@table, uri) do
-      [{^uri, keys, fetched_at}] -> {keys, fetched_at}
+  defp cache_key(uri, opts), do: {uri, :erlang.phash2(fetch_options(opts))}
+
+  defp lookup(key) do
+    case :ets.lookup(@table, key) do
+      [{^key, entry}] -> entry
       [] -> nil
     end
   rescue

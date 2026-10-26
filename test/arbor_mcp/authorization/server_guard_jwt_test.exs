@@ -105,6 +105,20 @@ defmodule Arbor.MCP.Authorization.ServerGuardJWTTest do
     end
   end
 
+  test "local checks can't be unbound, or mixed with introspection", %{key: key, config: config} do
+    unbound = Map.put(config, :legacy_unbound_tokens, true)
+    assert {:error, {500, _, _}} = ServerGuard.authorize(bearer(key, %{}), [], unbound)
+
+    mixed =
+      Map.merge(config, %{
+        introspection_endpoint: "https://auth.example.com/introspect",
+        client_id: "rs",
+        client_secret: "secret"
+      })
+
+    assert {:error, {500, _, _}} = ServerGuard.authorize(bearer(key, %{}), [], mixed)
+  end
+
   test "any token verifier can stand in for introspection" do
     config = %{
       token_verifier:

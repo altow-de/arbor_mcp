@@ -223,7 +223,8 @@ defmodule Arbor.MCP.Authorization.ServerGuard do
   # Checked locally, by a verifier: there's no introspection client to
   # authenticate, and the token is always bound to the issuer and audience.
   defp validate_config(%{} = config) when not is_map_key(config, :introspection_endpoint) do
-    with {:ok, {module, _opts}} <- verifier(config),
+    with false <- Map.get(config, :legacy_unbound_tokens, false),
+         {:ok, {module, _opts}} <- verifier(config),
          true <-
            Code.ensure_loaded?(module) and function_exported?(module, :verify_access_token, 2),
          :ok <- validate_jwks_uri(Map.get(config, :jwks_uri)),
@@ -236,6 +237,12 @@ defmodule Arbor.MCP.Authorization.ServerGuard do
       _invalid -> {:error, :invalid_auth_config}
     end
   end
+
+  # One way of checking tokens: introspection mixed with a verifier is a
+  # mistake, not a choice between them.
+  defp validate_config(%{introspection_endpoint: _} = config)
+       when is_map_key(config, :jwks_uri) or is_map_key(config, :token_verifier),
+       do: {:error, :invalid_auth_config}
 
   defp validate_config(%{introspection_endpoint: endpoint} = config) when is_binary(endpoint) do
     with :ok <- Validator.validate_https_endpoint(endpoint),

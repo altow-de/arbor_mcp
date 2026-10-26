@@ -116,6 +116,30 @@ defmodule Arbor.MCP.Authorization.JWTVerifierTest do
     refute_received :jwks_fetched
   end
 
+  test "while fetching fails, it isn't tried again for every request" do
+    bypass = Bypass.open()
+    test = self()
+
+    Bypass.stub(bypass, "GET", "/jwks", fn conn ->
+      send(test, :jwks_fetched)
+      Plug.Conn.resp(conn, 500, "")
+    end)
+
+    opts = [
+      jwks_uri: "http://localhost:#{bypass.port}/jwks",
+      oauth_http: [allow_insecure_loopback: true]
+    ]
+
+    token = token(JWT.generate_rsa_key(), "k1")
+
+    for _attempt <- 1..3 do
+      assert {:error, {:jwks_unavailable, _}} = JWTVerifier.verify_access_token(token, opts)
+    end
+
+    assert_received :jwks_fetched
+    refute_received :jwks_fetched
+  end
+
   test "the keys are kept, and kept a while longer if fetching them fails",
        %{bypass: bypass, publish: publish, opts: opts} do
     key = JWT.generate_rsa_key()
@@ -132,6 +156,42 @@ defmodule Arbor.MCP.Authorization.JWTVerifierTest do
 
     assert {:error, {:jwks_unavailable, _reason}} =
              JWTVerifier.verify_access_token(token(key, "k1"), [jwks_max_stale_ms: 0] ++ expired)
+  end
+
+  test "a key rotated without a key id is picked up too", %{publish: publish, opts: opts} do
+    old = JWT.generate_rsa_key()
+    publish.([{"old", old}])
+    assert {:ok, _} = JWTVerifier.verify_access_token(token(old, "old"), opts)
+
+    new = JWT.generate_rsa_key()
+    publish.([{"new", new}])
+    {:ok, kidless} = JWT.sign(%{"exp" => now() + 300}, new, typ: "at+jwt")
+
+    assert {:ok, _} =
+             JWTVerifier.verify_access_token(kidless, [jwks_min_refresh_ms: 0] ++ opts)
+  end
+
+  test "keys fetched under one fetch policy don't answer for another",
+       %{publish: publish, opts: opts} do
+    key = JWT.generate_rsa_key()
+    publish.([{"k1", key}])
+    assert {:ok, _} = JWTVerifier.verify_access_token(token(key, "k1"), opts)
+    assert_received :jwks_fetched
+
+    other = Keyword.update!(opts, :oauth_http, &Keyword.put(&1, :request_timeout_ms, 4_000))
+    assert {:ok, _} = JWTVerifier.verify_access_token(token(key, "k1"), other)
+    assert_received :jwks_fetched
+  end
+
+  test "a non-string typ is refused", %{publish: publish, opts: opts} do
+    key = JWT.generate_rsa_key()
+    publish.([{"k1", key}])
+
+    jws = JOSE.JWS.from_map(%{"alg" => "RS256", "kid" => "k1", "typ" => 1})
+    {_modules, signed} = JOSE.JWK.sign(Jason.encode!(%{"exp" => now() + 300}), jws, key)
+    {_modules, compact} = JOSE.JWS.compact(signed)
+
+    assert {:error, :invalid_token} = JWTVerifier.verify_access_token(compact, opts)
   end
 
   test "a token that isn't a JWT, or is too long, is refused", %{opts: opts} do

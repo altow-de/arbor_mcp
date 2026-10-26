@@ -27,7 +27,10 @@ defmodule Arbor.MCP.Authorization.JWTVerifier do
     accepted.
   - `:require_at_jwt_typ` - Accept only tokens whose `typ` header is `at+jwt`,
     as RFC 9068 asks (default: `false`, since many authorization servers
-    still issue `JWT`). A `typ` other than those two is always refused.
+    still issue `JWT`, and C#'s JWT bearer handler doesn't check it either).
+    A `typ` other than those two is always refused. An ID token is kept out
+    either way by the audience the guard requires, which for an ID token is
+    the client, not this server; set this when the issuer issues `at+jwt`.
   - `:max_token_bytes` - The longest token checked (default: 16_384).
   - `:jwks_cache_ttl_ms`, `:jwks_min_refresh_ms`, `:jwks_max_stale_ms` - How
     long a key set is kept (10 minutes), how often a token signed with an
@@ -79,35 +82,36 @@ defmodule Arbor.MCP.Authorization.JWTVerifier do
   defp algorithm(_header, _allowed), do: {:error, :invalid_token}
 
   defp typ(header, require_at_jwt?) do
-    case header |> Map.get("typ") |> normalize_typ() do
+    case header |> Map.fetch("typ") |> normalize_typ() do
       typ when typ in @at_jwt -> :ok
-      typ when typ in [nil, "jwt"] and not require_at_jwt? -> :ok
+      typ when typ in [:absent, "jwt"] and not require_at_jwt? -> :ok
       _other -> {:error, :invalid_token}
     end
   end
 
-  defp normalize_typ(typ) when is_binary(typ), do: String.downcase(typ)
-  defp normalize_typ(_typ), do: nil
+  defp normalize_typ({:ok, typ}) when is_binary(typ), do: String.downcase(typ)
+  defp normalize_typ({:ok, _not_a_string}), do: :invalid
+  defp normalize_typ(:error), do: :absent
 
   defp key_set({:ok, keys}), do: {:ok, keys}
   defp key_set({:error, reason}), do: {:error, {:jwks_unavailable, reason}}
 
-  # A token naming a key the set lacks fetches the set again, once.
+  # A token the held keys don't verify fetches the set again, once, in case
+  # the server rotated its keys (the cache limits how often that fetches).
   defp verify(token, alg, kid, keys, uri, opts) do
     case check(token, alg, signing_keys(keys, kid, alg)) do
       {:ok, claims} ->
         {:ok, claims}
 
-      :no_key when is_binary(kid) ->
-        with {:ok, keys} <- key_set(JWKSCache.refresh(uri, opts)) do
-          case check(token, alg, signing_keys(keys, kid, alg)) do
-            {:ok, claims} -> {:ok, claims}
-            _no_key_or_invalid -> {:error, :invalid_token}
-          end
-        end
-
       _no_key_or_invalid ->
-        {:error, :invalid_token}
+        with {:ok, refreshed} <- key_set(JWKSCache.refresh(uri, opts)),
+             false <- refreshed == keys,
+             {:ok, claims} <- check(token, alg, signing_keys(refreshed, kid, alg)) do
+          {:ok, claims}
+        else
+          {:error, {:jwks_unavailable, _reason}} = error -> error
+          _unchanged_or_invalid -> {:error, :invalid_token}
+        end
     end
   end
 

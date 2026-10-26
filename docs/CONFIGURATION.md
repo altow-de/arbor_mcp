@@ -1004,15 +1004,20 @@ algorithm (RSA, RSA-PSS or ECDSA; never `none` or a shared secret) and a `typ`
 of `at+jwt` or `JWT`; the guard then checks the issuer, audience, `exp`, `nbf`
 and scopes as for an introspected token, reading a `scp` claim as the scopes.
 The key set is fetched through the same hardened client as OAuth metadata,
-kept for ten minutes, and fetched again for a token signed with a key it
-lacks, at most once a minute; if fetching fails, the last set is used for up
-to an hour. Tune these, or require `typ: at+jwt`, under `:jwt`, for example
-`jwt: [require_at_jwt_typ: true, jwks_cache_ttl_ms: 300_000]`.
+kept for ten minutes, and fetched again for a token its keys don't verify, in
+case they rotated; no set is fetched more than once a minute, whether the last
+try worked or failed. If fetching fails, the last set is used for up to an
+hour. Tune these, or require `typ: at+jwt` as RFC 9068 asks, under `:jwt`, for
+example `jwt: [require_at_jwt_typ: true, jwks_cache_ttl_ms: 300_000]`. A `JWT`
+typ is accepted by default because many authorization servers still issue it;
+the required audience keeps ID tokens out, since theirs is the client.
 
 Any other check plugs in as an `Arbor.MCP.Authorization.TokenVerifier`, as with
 the TypeScript SDK's `OAuthTokenVerifier`: `token_verifier: {MyApp.Verifier,
-opts}`. Either way the issuer and audience/resource must be configured, and
-the client credentials for introspection aren't needed.
+opts}`. Either way the issuer and audience/resource must be configured, the
+client credentials for introspection aren't needed, and
+`legacy_unbound_tokens` isn't accepted. A configuration naming both an
+introspection endpoint and a verifier is refused.
 
 ### Session storage
 
