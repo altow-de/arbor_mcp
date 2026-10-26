@@ -907,6 +907,24 @@ defmodule Arbor.MCP.Server.Runtime.HTTPWriterRegistry do
     end
   end
 
+  # The leases of the legacy sessions whose GET stream is open now, the
+  # Streamable HTTP session stream or the deprecated HTTP+SSE alias. A list
+  # change published outside a callback goes to each of their replays.
+  @spec session_stream_leases(t()) :: {:ok, [term()]} | error()
+  def session_stream_leases(domain) do
+    with {:ok, domain} <- valid(domain),
+         {:ok, gate} <- read(domain) do
+      leases =
+        for {_token, info} <- gate.bindings,
+            info.mode == :open and not is_nil(info.proof.lease) and
+              live_resource_stream?(domain, info),
+            uniq: true,
+            do: info.proof.lease
+
+      {:ok, leases}
+    end
+  end
+
   defp live_resource_stream?(domain, info) do
     session_stream_current?(domain, info) or
       (Map.get(info.authority || %{}, :session_stream, false) and

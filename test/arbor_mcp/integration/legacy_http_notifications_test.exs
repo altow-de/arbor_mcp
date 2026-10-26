@@ -205,6 +205,74 @@ defmodule Arbor.MCP.Integration.LegacyHTTPNotificationsTest do
         refute_received {:ex_mcp_notification, _listener, _method, _params}
       end
 
+      # A list change sent outside a callback isn't addressed to a session.
+      # Every legacy session with an open GET stream gets it there, beside
+      # the modern subscriptions, and a session without a stream is skipped
+      # (not queued for later) without holding up the others.
+      test "a list change sent outside a callback reaches every open stream in both eras",
+           %{server: server} do
+        {root, port} = start_server(server, :prefer_modern, [])
+        a = connect(port, :a, use_sse: true)
+        b = connect(port, :b, use_sse: true)
+        _postonly = connect(port, :postonly, use_sse: false)
+        modern = connect(port, :modern, protocol_mode: :modern_only)
+        filter = %{"toolsListChanged" => true, "promptsListChanged" => true}
+        {:ok, a_listener} = Client.subscribe_notifications(a, filter)
+        {:ok, b_listener} = Client.subscribe_notifications(b, filter)
+        {:ok, subscription} = Client.listen(modern, filter, timeout: 2_000)
+
+        # A session whose GET stream is open but never read, and one that has
+        # none yet.
+        slow = raw_session(port)
+        _unread = raw_get(port, slow)
+        later = raw_session(port)
+
+        assert :ok = Server.notify_tools_changed(root)
+
+        for listener <- [a_listener, b_listener] do
+          assert_receive {:ex_mcp_notification, ^listener, "notifications/tools/list_changed",
+                          _params},
+                         2_000
+        end
+
+        assert_receive {:ex_mcp_subscription, ^subscription, "notifications/tools/list_changed",
+                        _params},
+                       2_000
+
+        assert :ok = Server.notify_prompts_changed(root)
+
+        assert_receive {:ex_mcp_notification, ^a_listener, "notifications/prompts/list_changed",
+                        _params},
+                       2_000
+
+        # The session that had no stream then didn't get the change queued:
+        # its stream is ordered, so it would come ahead of this log message.
+        stream = raw_get(port, later)
+
+        assert {200, _headers, _body} =
+                 raw_post(port, later, announce_call(2, "later"), "application/json")
+
+        [before_log, _rest] =
+          stream |> read_until("from later") |> String.split("from later", parts: 2)
+
+        refute before_log =~ "list_changed"
+        close_session(port, later, stream)
+      end
+
+      test "a list change sent outside a callback reports a session that didn't take it",
+           %{server: server} do
+        {root, port} =
+          start_server(server, :legacy_only,
+            services: [sessions: [options: [max_event_bytes: 16]]]
+          )
+
+        client = connect(port, :solo, use_sse: true)
+        {:ok, listener} = Client.subscribe_notifications(client, %{"toolsListChanged" => true})
+
+        assert {:error, :partially_delivered} = Server.notify_tools_changed(root)
+        refute_received {:ex_mcp_notification, ^listener, _method, _params}
+      end
+
       test "a legacy POST that accepts only JSON gets JSON, with its progress on the GET stream",
            %{server: server} do
         port = serve(server)
@@ -294,7 +362,10 @@ defmodule Arbor.MCP.Integration.LegacyHTTPNotificationsTest do
     assert_receive {:server_announced, ^who, [:ok, :ok]}, 1_000
   end
 
-  defp serve(server, runtime_opts \\ []) do
+  defp serve(server, runtime_opts \\ []),
+    do: server |> start_server(:legacy_only, runtime_opts) |> elem(1)
+
+  defp start_server(server, mode, runtime_opts) do
     root =
       start_supervised!(
         {Runtime,
@@ -302,14 +373,14 @@ defmodule Arbor.MCP.Integration.LegacyHTTPNotificationsTest do
            handler: Handler,
            handler_args: [owner: self()],
            transport: :mounted_http,
-           protocol_mode: :legacy_only
+           protocol_mode: mode
          ] ++ runtime_opts}
       )
 
     plug_opts = [
       runtime: root,
       path: "/mcp",
-      protocol_mode: :legacy_only,
+      protocol_mode: mode,
       sse_mode: :stream,
       allowed_origins: :any
     ]
@@ -321,7 +392,7 @@ defmodule Arbor.MCP.Integration.LegacyHTTPNotificationsTest do
     :ok = :telemetry.attach_many(telemetry, @telemetry, &__MODULE__.handle_telemetry/4, owner)
 
     on_exit(fn -> :telemetry.detach(telemetry) end)
-    port
+    {root, port}
   end
 
   defp listen(:cowboy, plug_opts) do
@@ -353,23 +424,28 @@ defmodule Arbor.MCP.Integration.LegacyHTTPNotificationsTest do
   # Clients are started one at a time, and each waits for its GET stream's
   # `connected` event, sent after the server registered that stream.
   defp connect(port, name, opts) do
+    era =
+      if opts[:protocol_mode] == :modern_only,
+        do: [protocol_mode: :modern_only],
+        else: [protocol_mode: :legacy_only, protocol_version: @version]
+
     client =
       start_supervised!(
         {Client,
          [
            transport: :http,
            url: "http://127.0.0.1:#{port}/mcp",
-           protocol_mode: :legacy_only,
-           protocol_version: @version,
            health_check_interval: nil,
            reconnect: false,
            capabilities: %{"roots" => %{}},
            handler: {ClientHandler, [owner: self(), name: name]}
-         ] ++ opts},
+         ]
+         |> Keyword.merge(era)
+         |> Keyword.merge(opts)},
         id: {:client, name}
       )
 
-    assert {:ok, @version} = Client.negotiated_version(client)
+    if era[:protocol_version], do: assert({:ok, @version} = Client.negotiated_version(client))
     if opts[:use_sse], do: assert_receive({:sse_event, ^client, "connected"}, 2_000)
     client
   end

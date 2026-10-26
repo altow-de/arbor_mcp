@@ -48,6 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:ok`. With no origin of its own, the publication took the subscription's
   registration, and narrowing its deadline before the compatibility check
   made it no longer equal to that registration. The check now comes first.
+- The same list changes never reached legacy Streamable HTTP sessions. They
+  now go to every legacy session whose GET stream is open at that moment,
+  through its own bounded replay, which its stream writes out; a slow or
+  dead stream holds up neither the others nor the caller. A session with no
+  open GET stream, including one whose client is about to reopen it, misses
+  the change rather than having it queued. The call returns `:ok` only when
+  every matching subscription and every open session took the change, and
+  `{:error, :partially_delivered}` otherwise, where it returned `:ok` whatever
+  happened.
 
 ## [2.0.0-rc.6] — 2026-10-26
 
