@@ -42,6 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   case. A wildcard such as `*/*` still gets JSON, since the MCP spec asks
   clients to list `text/event-stream`. The Streamable HTTP GET stream uses
   the same rule.
+- `Server.notify_tools_changed/1`, `notify_prompts_changed/1` and
+  `notify_resources_changed/1` called outside a callback on an HTTP runtime
+  never reached a modern `subscriptions/listen` stream, though they returned
+  `:ok`. With no origin of its own, the publication took the subscription's
+  registration, and narrowing its deadline before the compatibility check
+  made it no longer equal to that registration. The check now comes first.
 
 ## [2.0.0-rc.6] — 2026-10-26
 
