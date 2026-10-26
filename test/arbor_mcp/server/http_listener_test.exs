@@ -23,9 +23,9 @@ defmodule Arbor.MCP.Server.HTTPListenerTest do
     end
 
     requirement = dependencies |> List.keyfind(:bandit, 0) |> elem(1)
-    assert Version.match?("1.13.1", requirement)
-    refute Version.match?("1.13.0", requirement)
-    assert Version.compare(Mix.Dep.Lock.read()[:bandit] |> elem(2), "1.13.1") in [:eq, :gt]
+    assert Version.match?("1.14.0", requirement)
+    refute Version.match?("1.13.1", requirement)
+    assert Version.compare(Mix.Dep.Lock.read()[:bandit] |> elem(2), "1.14.0") in [:eq, :gt]
   end
 
   test "published requirements allow host graphs beyond the owned constructor versions" do
@@ -34,10 +34,10 @@ defmodule Arbor.MCP.Server.HTTPListenerTest do
     thousand_island = dependencies |> List.keyfind(:thousand_island, 0) |> elem(1)
     ranch = dependencies |> List.keyfind(:ranch, 0) |> elem(1)
 
-    assert Version.match?("1.13.2", bandit)
-    assert Version.match?("1.14.0", bandit)
+    assert Version.match?("1.14.1", bandit)
+    assert Version.match?("1.15.0", bandit)
+    refute Version.match?("1.13.1", bandit)
     refute Version.match?("1.12.5", bandit)
-    refute Version.match?("1.13.0", bandit)
     refute Version.match?("2.0.0", bandit)
 
     assert Version.match?("1.6.1", thousand_island)

@@ -51,8 +51,8 @@ defmodule Arbor.MCP.Server.HTTPBanditCompatibilityTest do
     end
 
     for {bandit, island} <- [
-          {"1.12.5", "1.5.0"}, {"1.13.0", "1.6.0"},
-          {"1.13.2", "1.6.0"}, {"1.13.1", "1.5.0"}, {"1.13.1", "1.6.1"}
+          {"1.12.5", "1.5.0"}, {"1.13.1", "1.6.0"},
+          {"1.14.1", "1.6.0"}, {"1.14.0", "1.5.0"}, {"1.14.0", "1.6.1"}
         ] do
       for {app, version} <- [bandit: bandit, thousand_island: island] do
         :ok = Application.unload(app)
@@ -134,9 +134,9 @@ defmodule Arbor.MCP.Server.HTTPBanditCompatibilityTest do
     {conn, ref, websocket} = websocket(port)
     assert_receive {:websocket_connection, connection}, 1_000
 
-    {conn, websocket} = send_frame(conn, ref, websocket, {:text, "bandit 1.13.1"})
+    {conn, websocket} = send_frame(conn, ref, websocket, {:text, "bandit 1.14.0"})
     {conn, websocket, frames} = frames(conn, ref, websocket)
-    assert {:text, "bandit 1.13.1"} in frames
+    assert {:text, "bandit 1.14.0"} in frames
     {conn, websocket} = send_frame(conn, ref, websocket, {:binary, <<0, 1, 255>>})
     {conn, websocket, frames} = frames(conn, ref, websocket)
     assert {:binary, <<0, 1, 255>>} in frames
@@ -161,6 +161,58 @@ defmodule Arbor.MCP.Server.HTTPBanditCompatibilityTest do
     assert_receive {:DOWN, ^monitor, :process, ^connection, _}, 1_000
     Mint.HTTP.close(conn)
     assert_socket_closed(socket, socket_monitor)
+  end
+
+  # Bandit 1.14.0 returns `:more` from an HTTP/2 read that reaches `:length`
+  # before END_STREAM, so a body exactly at the limit must not look oversized.
+  @tag :physical_http
+  test "an HTTP/2 body exactly at body_limit is accepted without content-length" do
+    {:ok, root} = Runtime.start_link(handler: Handler, transport: :mounted_http)
+    on_exit(fn -> Runtime.stop(root) end)
+
+    body =
+      Jason.encode!(%{
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: %{
+          protocolVersion: "2025-11-25",
+          capabilities: %{},
+          clientInfo: %{name: "bandit-body-limit", version: "1"}
+        }
+      })
+
+    headers = [
+      {"content-type", "application/json"},
+      {"accept", "application/json"},
+      {"mcp-protocol-version", "2025-11-25"}
+    ]
+
+    for {limit, status} <- [{byte_size(body), 200}, {byte_size(body) - 1, 413}] do
+      mcp = Arbor.MCP.HttpPlug.init(runtime: root, path: "/mcp", body_limit: limit)
+
+      {:ok, listener} =
+        Bandit.start_link(
+          plug: {HostPlug, [mcp: mcp, observer: self()]},
+          port: 0,
+          ip: {127, 0, 0, 1},
+          startup_log: false
+        )
+
+      {:ok, {{127, 0, 0, 1}, port}} = ThousandIsland.listener_info(listener)
+      conn = connect(port, :http2)
+
+      # Streaming sends no content-length, and `:eof` sends END_STREAM in an
+      # empty DATA frame of its own.
+      {:ok, conn, ref} = Mint.HTTP.request(conn, "POST", "/mcp", headers, :stream)
+      {:ok, conn} = Mint.HTTP.stream_request_body(conn, ref, body)
+      {:ok, conn} = Mint.HTTP.stream_request_body(conn, ref, :eof)
+      {conn, events} = response(conn, ref)
+      assert {:status, ref, status} in events
+
+      Mint.HTTP.close(conn)
+      assert :ok = Supervisor.stop(listener)
+    end
   end
 
   @tag :physical_http

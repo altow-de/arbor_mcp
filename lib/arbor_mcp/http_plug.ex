@@ -1919,13 +1919,17 @@ defmodule Arbor.MCP.HttpPlug do
     end
   end
 
+  # The read asks for one byte past the limit: an adapter may stop at
+  # `:length` before the body's end (Bandit's HTTP/2 does, without a
+  # content-length), and may return a whole body longer than `:length`.
   defp read_or_cached_body(conn, opts) do
     body_limit = Map.get(opts, :body_limit, 1_000_000)
 
-    with {:ok, read_opts} <- runtime_read_options(conn, body_limit) do
+    with {:ok, read_opts} <- runtime_read_options(conn, body_limit + 1) do
       case read_body(conn, read_opts) do
         {:ok, "", conn} -> parsed_json_body(conn, body_limit)
-        {:ok, body, conn} -> {:ok, body, conn}
+        {:ok, body, conn} when byte_size(body) <= body_limit -> {:ok, body, conn}
+        {:ok, _body, _conn} -> {:error, :body_too_large}
         {:more, _partial, _conn} -> {:error, :body_too_large}
         {:error, reason} -> {:error, reason}
       end
