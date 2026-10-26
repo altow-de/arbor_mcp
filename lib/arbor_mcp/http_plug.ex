@@ -119,12 +119,16 @@ defmodule Arbor.MCP.HttpPlug do
 
   In the legacy Streamable HTTP revisions, a request that carries
   `_meta.progressToken`, from a client that accepts `text/event-stream`, owns
-  its POST response stream, as with the TypeScript SDK's servers. Its progress and its callback's other notifications are
-  written there ahead of the response. `initialize`, batches and requests
-  without a progress token are answered with JSON; their callback's progress,
-  log messages and list changes go to the session's own GET stream. Requests a
-  callback sends to the client, such as `roots/list`, always use that GET
-  stream. Without an open GET stream these return `{:error, :stream_closed}`.
+  its POST response stream, as with the TypeScript SDK's servers. Its progress
+  and its callback's other notifications are written there ahead of the
+  response. `initialize`, batches and requests without a progress token are
+  answered with JSON; their callback's progress, log messages and list changes
+  go to the session's own GET stream. Requests a callback sends to the client,
+  such as `roots/list`, always use that GET stream. Without an open GET stream
+  these return `{:error, :stream_closed}`. Those revisions say a disconnect
+  SHOULD NOT be taken for a cancellation, so a legacy request whose connection
+  goes away runs to its end, under its original deadline, and what it would
+  have written is released; a client cancels with `notifications/cancelled`.
 
   MCP 2026-07-28 does not use that GET stream. A modern
   `subscriptions/listen` POST owns its SSE response directly. The response
@@ -139,7 +143,7 @@ defmodule Arbor.MCP.HttpPlug do
   gets JSON. `notifications/progress` and
   `notifications/message` are written only there, followed by one final
   JSON-RPC response that closes the stream. A disconnect or chunk failure
-  cancels that request's worker without affecting other
+  cancels that modern request's worker without affecting other
   requests or subscriptions.
 
   Mount subscription authorizers are composed with the Runtime service policy;

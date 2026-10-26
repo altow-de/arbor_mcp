@@ -105,7 +105,10 @@ Other legacy requests get JSON. Their callback's progress, log messages and
 list changes, and every request a callback sends to the client (roots,
 sampling, elicitation), go to that session's GET stream and never to another
 session's; with no GET stream open they return `{:error, :stream_closed}`.
-The server closes a GET stream at the Runtime's `:request_timeout_ms`; the
+As those revisions ask, a legacy request whose connection goes away isn't
+taken for cancelled: it runs to its end, under its original deadline, and its
+response, which nothing can carry any more, is released. A modern request is
+cancelled with its connection. The server closes a GET stream at the Runtime's `:request_timeout_ms`; the
 client keeps its session and opens the stream again with `Last-Event-ID`. A
 server that answers that GET with 405 no longer offers the stream, and the
 client carries on POST-only.

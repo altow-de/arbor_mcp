@@ -57,6 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every matching subscription and every open session took the change, and
   `{:error, :partially_delivered}` otherwise, where it returned `:ok` whatever
   happened.
+- A legacy Streamable HTTP request was cancelled when its connection went
+  away, as a modern one is, although the legacy revisions say a disconnect
+  SHOULD NOT be taken for a cancellation (a client cancels with
+  `notifications/cancelled`). It now runs to its end, under its original
+  deadline, and its response, which nothing can carry any more, is released.
+  A modern request is still cancelled with its connection.
 
 ## [2.0.0-rc.6] — 2026-10-26
 
