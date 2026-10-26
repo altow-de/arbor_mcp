@@ -68,12 +68,12 @@ defmodule Arbor.MCP.Compliance.Features.Prompts do
     try do
       {:ok, prompts_result} = Client.list_prompts(test_context.client)
 
-      if length(prompts_result.prompts) > 0 do
+      if prompts_result.prompts != [] do
         prompt = hd(prompts_result.prompts)
 
         # Get the prompt with some sample arguments
         args =
-          if prompt[:arguments] && length(prompt.arguments) > 0 do
+          if prompt[:arguments] && prompt.arguments != [] do
             # Build args based on required arguments
             Enum.reduce(prompt.arguments, %{}, fn arg, acc ->
               if arg[:required] do

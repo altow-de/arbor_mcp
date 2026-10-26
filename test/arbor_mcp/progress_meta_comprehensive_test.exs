@@ -385,7 +385,7 @@ defmodule Arbor.MCP.ProgressMetaComprehensiveTest do
       # Current API doesn't support _meta in list_tools, but let's test
       # that it doesn't break anything
       assert {:ok, %{tools: tools}} = Client.list_tools(client)
-      assert length(tools) > 0
+      assert tools != []
     end
 
     test "resources/list can include progress token", %{client: client} do
@@ -394,7 +394,7 @@ defmodule Arbor.MCP.ProgressMetaComprehensiveTest do
 
       # Similar limitation - API doesn't expose _meta for list operations yet
       assert {:ok, %{resources: resources}} = Client.list_resources(client)
-      assert length(resources) > 0
+      assert resources != []
     end
 
     test "prompts/get supports progress token", %{client: client} do
