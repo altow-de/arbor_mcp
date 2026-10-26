@@ -138,7 +138,11 @@ defmodule Arbor.MCP.MixProject do
       external_dep(:propcheck, "~> 1.4", only: :test),
       external_dep(:benchee, "~> 1.0", only: [:dev, :test]),
       external_dep(:bypass, "~> 2.0", only: :test),
-      external_dep(:jose, "~> 1.11")
+      # 1.11.13 fixes EEF-CVE-2026-65625 (AES-GCM tag length), -65626
+      # (RSAES-PKCS1-v1_5 padding oracle) and -65627 (JWE zip decompression).
+      # All three are in JWE decryption, which this library doesn't use; the
+      # floor keeps consumers' dependency graphs off the vulnerable releases.
+      external_dep(:jose, "~> 1.11 and >= 1.11.13")
     ]
   end
 
