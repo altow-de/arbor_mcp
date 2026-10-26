@@ -30,7 +30,10 @@ defmodule Arbor.MCP.Authorization.JWTVerifier do
     still issue `JWT`, and C#'s JWT bearer handler doesn't check it either).
     A `typ` other than those two is always refused. An ID token is kept out
     either way by the audience the guard requires, which for an ID token is
-    the client, not this server; set this when the issuer issues `at+jwt`.
+    the client, and through `Arbor.MCP.HttpPlug` by the scopes every method
+    requires, which ID tokens don't carry. Set this when the issuer issues
+    `at+jwt`, and especially if you call the guard with no required scopes
+    and an audience that is the client's own id.
   - `:max_token_bytes` - The longest token checked (default: 16_384).
   - `:jwks_cache_ttl_ms`, `:jwks_min_refresh_ms`, `:jwks_max_stale_ms` - How
     long a key set is kept (10 minutes), how often a token signed with an

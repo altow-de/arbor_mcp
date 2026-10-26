@@ -1010,8 +1010,15 @@ case they rotated; no set is fetched more than once a minute, whether the last
 try worked or failed. If fetching fails, the last set is used for up to an
 hour. Tune these, or require `typ: at+jwt` as RFC 9068 asks, under `:jwt`, for
 example `jwt: [require_at_jwt_typ: true, jwks_cache_ttl_ms: 300_000]`. A `JWT`
-typ is accepted by default because many authorization servers still issue it;
-the required audience keeps ID tokens out, since theirs is the client.
+typ is accepted by default because many authorization servers (Azure AD and
+Keycloak among them) still issue it, as C#'s JWT bearer handler and jose do.
+Two checks keep an ID token from passing for an access token: the required
+audience, which for an ID token is the client, and, through `Arbor.MCP.HttpPlug`,
+the scopes every method requires, which ID tokens don't carry. If you call
+`Arbor.MCP.Authorization.ServerGuard.authorize/3` yourself with no required
+scopes, and your expected audience is the client's own id (as some providers
+issue for an app's own API), set `require_at_jwt_typ: true` if your provider
+issues `at+jwt`, or require a scope.
 
 Any other check plugs in as an `Arbor.MCP.Authorization.TokenVerifier`, as with
 the TypeScript SDK's `OAuthTokenVerifier`: `token_verifier: {MyApp.Verifier,
