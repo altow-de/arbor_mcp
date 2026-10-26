@@ -224,10 +224,10 @@ defmodule Arbor.MCP.Authorization.ServerGuard do
   # authenticate, and the token is always bound to the issuer and audience.
   defp validate_config(%{} = config) when not is_map_key(config, :introspection_endpoint) do
     with false <- Map.get(config, :legacy_unbound_tokens, false),
-         {:ok, {module, _opts}} <- verifier(config),
+         {:ok, {module, opts}} <- verifier(config),
          true <-
            Code.ensure_loaded?(module) and function_exported?(module, :verify_access_token, 2),
-         :ok <- validate_jwks_uri(Map.get(config, :jwks_uri)),
+         :ok <- validate_verifier_options(module, opts),
          :ok <- validate_realm(Map.get(config, :realm)),
          :ok <- validate_clock_skew(Map.get(config, :clock_skew_seconds, 30)),
          :ok <- non_empty_string(Map.get(config, :expected_issuer)),
@@ -260,24 +260,37 @@ defmodule Arbor.MCP.Authorization.ServerGuard do
     {:error, :invalid_auth_config}
   end
 
-  defp verifier(%{token_verifier: {module, opts}}) when is_atom(module) and is_list(opts),
-    do: {:ok, {module, opts}}
+  defp verifier(%{token_verifier: {module, opts}}) when is_atom(module) and is_list(opts) do
+    if Keyword.keyword?(opts), do: {:ok, {module, opts}}, else: :error
+  end
 
   defp verifier(%{jwks_uri: uri} = config) when is_binary(uri) do
-    opts =
-      config
-      |> Map.get(:jwt, [])
-      |> Keyword.put(:jwks_uri, uri)
-      |> Keyword.put_new(:oauth_http, secure_http_options(config))
+    jwt = Map.get(config, :jwt, [])
 
-    {:ok, {JWTVerifier, opts}}
+    if is_list(jwt) and Keyword.keyword?(jwt) do
+      opts =
+        jwt
+        |> Keyword.put(:jwks_uri, uri)
+        |> Keyword.put_new(:oauth_http, secure_http_options(config))
+
+      {:ok, {JWTVerifier, opts}}
+    else
+      :error
+    end
   end
 
   defp verifier(_config), do: :error
 
-  defp validate_jwks_uri(nil), do: :ok
-  defp validate_jwks_uri(uri) when is_binary(uri), do: Validator.validate_https_endpoint(uri)
-  defp validate_jwks_uri(_uri), do: {:error, :invalid_auth_config}
+  # The built-in verifier needs its key set's URL, which must be HTTPS but
+  # for localhost; another verifier checks its own options.
+  defp validate_verifier_options(JWTVerifier, opts) do
+    case Keyword.get(opts, :jwks_uri) do
+      uri when is_binary(uri) -> Validator.validate_https_endpoint(uri)
+      _missing -> {:error, :invalid_auth_config}
+    end
+  end
+
+  defp validate_verifier_options(_module, _opts), do: :ok
 
   defp validate_bound_config(config) do
     auth_method = Map.get(config, :introspection_auth_method, :client_secret_basic)
@@ -343,11 +356,13 @@ defmodule Arbor.MCP.Authorization.ServerGuard do
       {:error, :invalid_token} ->
         {:error, :invalid_token, "The access token is invalid."}
 
+      # The token couldn't be checked (an unreachable key set, say): a server
+      # error, not a reason for the client to drop its token.
       {:error, reason} ->
-        {:error, :token_validation_failed, reason}
+        {:error, {:token_verifier_unavailable, reason}}
 
       _other ->
-        {:error, :token_validation_failed, :invalid_verifier_result}
+        {:error, {:token_verifier_unavailable, :invalid_verifier_result}}
     end
   end
 

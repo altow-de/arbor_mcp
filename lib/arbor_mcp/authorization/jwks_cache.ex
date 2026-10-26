@@ -20,7 +20,7 @@ defmodule Arbor.MCP.Authorization.JWKSCache do
 
   require Logger
 
-  alias Arbor.MCP.Authorization.JWT
+  alias Arbor.MCP.Authorization.{JWT, MetadataFetcher}
 
   @table __MODULE__
   @defaults [
@@ -131,7 +131,9 @@ defmodule Arbor.MCP.Authorization.JWKSCache do
 
   defp fresh?(fetched_at, opts), do: now() - fetched_at < option(opts, :jwks_cache_ttl_ms)
 
-  defp cache_key(uri, opts), do: {uri, :erlang.phash2(fetch_options(opts))}
+  # The whole effective fetch policy, configured defaults included: a hash
+  # could make two policies share keys.
+  defp cache_key(uri, opts), do: {uri, MetadataFetcher.options(fetch_options(opts))}
 
   defp lookup(key) do
     case :ets.lookup(@table, key) do

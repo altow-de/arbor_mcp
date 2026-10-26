@@ -139,9 +139,24 @@ defmodule Arbor.MCP.Authorization.ServerGuardJWTTest do
     assert {:error, {401, _, _}} =
              ServerGuard.authorize([{"authorization", "Bearer other"}], [], config)
 
-    assert {:error, {401, www_authenticate, _}} =
+    # Couldn't check, rather than invalid: the client keeps its token.
+    assert {:error, {500, www_authenticate, _}} =
              ServerGuard.authorize([{"authorization", "Bearer broken"}], [], config)
 
-    assert www_authenticate =~ "Token validation failed"
+    assert www_authenticate =~ ~s(error="server_error")
+  end
+
+  test "verifier options that can't work are refused as configuration errors",
+       %{key: key, config: config} do
+    for bad <- [
+          Map.put(config, :jwt, :strict),
+          Map.put(config, :jwt, [:strict]),
+          config
+          |> Map.delete(:jwks_uri)
+          |> Map.put(:token_verifier, {Arbor.MCP.Authorization.JWTVerifier, []}),
+          Map.put(config, :jwks_uri, "http://auth.example.com/jwks")
+        ] do
+      assert {:error, {500, _, _}} = ServerGuard.authorize(bearer(key, %{}), [], bad)
+    end
   end
 end

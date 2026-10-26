@@ -51,9 +51,10 @@ defmodule Arbor.MCP.Authorization.JWTVerifier do
 
   @impl true
   def verify_access_token(token, opts) when is_binary(token) and is_list(opts) do
-    uri = Keyword.fetch!(opts, :jwks_uri)
+    uri = Keyword.get(opts, :jwks_uri)
 
-    with :ok <- within_size(token, Keyword.get(opts, :max_token_bytes, 16_384)),
+    with true <- is_binary(uri) || {:error, :jwks_uri_missing},
+         :ok <- within_size(token, Keyword.get(opts, :max_token_bytes, 16_384)),
          {:ok, header} <- header(token),
          {:ok, alg} <- algorithm(header, Keyword.get(opts, :algorithms, @asymmetric)),
          :ok <- typ(header, Keyword.get(opts, :require_at_jwt_typ, false)),
