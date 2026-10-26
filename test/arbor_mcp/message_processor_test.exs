@@ -188,6 +188,24 @@ defmodule Arbor.MCP.MessageProcessorTest do
       do: {:error, "Resource not found: #{uri}", state}
   end
 
+  defmodule ReadHandlerServer do
+    use Arbor.MCP.Server.Handler
+
+    @impl true
+    def init(_args), do: {:ok, %{}}
+
+    @impl true
+    def handle_read_resource("file:///item", state),
+      do: {:ok, %{uri: "file:///item", text: "a"}, state}
+
+    def handle_read_resource("file:///whole", state),
+      do: {:ok, %{contents: [%{uri: "file:///whole", text: "a"}], ttlMs: 5_000}, state}
+
+    def handle_read_resource("file:///whole-with-uri", state),
+      do:
+        {:ok, %{contents: [%{uri: "file:///whole-with-uri", text: "a"}], uri: "file:///a"}, state}
+  end
+
   defmodule FailingInitHandlerServer do
     use Arbor.MCP.Server.Handler
 
@@ -350,6 +368,34 @@ defmodule Arbor.MCP.MessageProcessorTest do
         request |> MessageProcessor.new() |> MessageProcessor.process(%{handler: HandlerServer})
 
       assert conn.response["result"]["completion"]["values"] == ["prompt:par"]
+    end
+
+    test "resources/read wraps a content item and passes a whole result through" do
+      read = fn uri ->
+        conn =
+          4
+          |> protocol_request("resources/read", %{"uri" => uri})
+          |> MessageProcessor.new()
+          |> MessageProcessor.process(%{handler: ReadHandlerServer})
+
+        conn.response["result"]
+      end
+
+      assert read.("file:///item") == %{
+               "contents" => [%{"uri" => "file:///item", "text" => "a"}]
+             }
+
+      # This path used to wrap every value, nesting a whole result inside
+      # its own contents list.
+      assert read.("file:///whole") == %{
+               "contents" => [%{"uri" => "file:///whole", "text" => "a"}],
+               "ttlMs" => 5_000
+             }
+
+      assert read.("file:///whole-with-uri") == %{
+               "contents" => [%{"uri" => "file:///whole-with-uri", "text" => "a"}],
+               "uri" => "file:///a"
+             }
     end
 
     test "passes handler_opts to temporary handler GenServers" do

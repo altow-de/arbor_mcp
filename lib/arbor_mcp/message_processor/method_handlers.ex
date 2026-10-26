@@ -532,9 +532,9 @@ defmodule Arbor.MCP.MessageProcessor.MethodHandlers do
     end
   end
 
-  defp handle_resource_reply(conn, {:ok, contents}, id) do
-    contents = ResultNormalizer.stringify_keys(List.wrap(contents))
-    put_success(conn, %{"contents" => contents}, id)
+  defp handle_resource_reply(conn, {:ok, value}, id) do
+    result = value |> ResultNormalizer.read_result() |> ResultNormalizer.stringify_keys()
+    put_success(conn, result, id)
   end
 
   defp handle_resource_reply(conn, {:error, %Error.ProtocolError{} = error}, id),

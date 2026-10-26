@@ -12,11 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Arbor.MCP.Server.Handler.handle_get_prompt/3` accepts a GetPromptResult
   (`%{messages: [...]}`, optional `description`). The callback used to
   require a single prompt message, so a correct `prompts/get` result failed
-  Dialyzer with `callback_type_mismatch`. `handle_read_resource/2` also
-  accepts a list of contents or the whole read result, including cache
-  hints. `handle_complete/3` and `handle_complete/4` require a CompleteResult
-  (`%{completion: %{values: [...]}}`). `Handler.Echo` returns that empty
-  completion result.
+  Dialyzer with `callback_type_mismatch`. A prompt message may carry a
+  `resource_link` content block. `handle_read_resource/2` also accepts a
+  list of contents or the whole read result, including the `ttlMs` and
+  `cacheScope` cache hints. `handle_complete/3` and `handle_complete/4`
+  require a CompleteResult (`%{completion: %{values: [...]}}`). All three
+  callbacks accept string keys as well as atom keys, as the server does.
+  `Handler.Echo` returns that empty completion result.
+- A `resources/read` handler's whole result (`%{contents: [...]}`) is sent
+  as the result even when it has other keys. A map with a `uri` beside its
+  `contents` list used to be sent as one content item with neither `text`
+  nor `blob`. Over HTTP with a handler module, every whole result used to
+  be nested inside its own `contents` list. One content item or a list of
+  them is still wrapped as `contents`.
 
 ## [2.0.0-rc.6] — 2026-10-26
 
