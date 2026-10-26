@@ -66,20 +66,9 @@ defmodule Arbor.MCP.Client.Internal.Request do
   end
 
   defp validate_options!(opts) do
-    case Keyword.get(opts, :format, :struct) do
-      format when format in [:map, :struct] -> :ok
-      _invalid -> raise ArgumentError, "format must be :map or :struct"
-    end
-
-    case Keyword.get(opts, :cache_mode, :use) do
-      mode when mode in [:use, :refresh, :bypass] -> :ok
-      _invalid -> raise ArgumentError, "cache_mode must be :use, :refresh or :bypass"
-    end
-
-    case Keyword.get(opts, :reset_timeout_on_progress, false) do
-      reset when is_boolean(reset) -> :ok
-      _invalid -> raise ArgumentError, "reset_timeout_on_progress must be a boolean"
-    end
+    validate_option!(opts, :format, [:map, :struct], ":map or :struct")
+    validate_option!(opts, :cache_mode, [:use, :refresh, :bypass], ":use, :refresh or :bypass")
+    validate_option!(opts, :reset_timeout_on_progress, [true, false], "a boolean")
 
     for key <- [:timeout, :max_total_timeout], Keyword.has_key?(opts, key) do
       case Keyword.fetch!(opts, key) do
@@ -89,6 +78,16 @@ defmodule Arbor.MCP.Client.Internal.Request do
     end
 
     :ok
+  end
+
+  defp validate_option!(opts, key, allowed, description) do
+    case Keyword.fetch(opts, key) do
+      :error ->
+        :ok
+
+      {:ok, value} ->
+        if value in allowed, do: :ok, else: raise(ArgumentError, "#{key} must be #{description}")
+    end
   end
 
   defp do_make_request(
