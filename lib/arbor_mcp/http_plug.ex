@@ -3116,27 +3116,69 @@ defmodule Arbor.MCP.HttpPlug do
   # section 12.5.1), so `text/event-stream;q=0` refuses one. A wildcard such
   # as `*/*` or `text/*` doesn't opt in: the MCP spec asks clients to list
   # `text/event-stream` itself, and JSON is always a valid answer to a POST.
+  # Commas and semicolons inside a quoted parameter value don't separate
+  # anything, so a range's own `q` can't be cut off from it; a header with an
+  # unterminated quoted string doesn't opt in.
   defp accepts_event_stream?(conn) do
     conn
     |> get_req_header("accept")
-    |> Enum.flat_map(&ConnUtils.list/1)
-    |> Enum.any?(&event_stream_range?/1)
+    |> Enum.any?(fn header ->
+      case split_unquoted(header, ?,) do
+        {:ok, ranges} -> Enum.any?(ranges, &event_stream_range?/1)
+        :error -> false
+      end
+    end)
   end
 
   defp event_stream_range?(range) do
-    case ConnUtils.media_type(range) do
-      {:ok, "text", "event-stream", params} -> positive_quality?(params)
+    with {:ok, [media | params]} <- split_unquoted(range, ?;),
+         "text/event-stream" <- media |> String.trim() |> String.downcase() do
+      positive_quality?(quality(params))
+    else
       _other -> false
     end
   end
 
-  # A malformed qvalue makes its range unusable, so it doesn't opt in either.
-  defp positive_quality?(%{"q" => q}) do
+  # The weight is the `q` parameter, whose value is a bare qvalue (RFC 9110
+  # section 12.4.2). A range without one has quality 1.
+  defp quality(params) do
+    Enum.find_value(params, "1", fn param ->
+      case String.split(param, "=", parts: 2) do
+        [name, value] -> if String.downcase(String.trim(name)) == "q", do: String.trim(value)
+        _other -> nil
+      end
+    end)
+  end
+
+  # A malformed qvalue, a quoted one included, makes its range unusable, so it
+  # doesn't opt in either.
+  defp positive_quality?(q) do
     Regex.match?(~r/\A(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)\z/, q) and
       not Regex.match?(~r/\A0(?:\.0{0,3})?\z/, q)
   end
 
-  defp positive_quality?(_params), do: true
+  # Splits a header value at `separator` outside quoted strings (RFC 9110
+  # section 5.6.4). Inside one, a backslash escapes the next byte, so an
+  # escaped quote doesn't end it.
+  defp split_unquoted(value, separator), do: split_unquoted(value, separator, false, "", [])
+
+  defp split_unquoted(<<>>, _separator, true, _part, _parts), do: :error
+
+  defp split_unquoted(<<>>, _separator, false, part, parts),
+    do: {:ok, Enum.reverse([part | parts])}
+
+  defp split_unquoted(<<?\\, byte, rest::binary>>, separator, true, part, parts),
+    do: split_unquoted(rest, separator, true, <<part::binary, ?\\, byte>>, parts)
+
+  defp split_unquoted(<<?", rest::binary>>, separator, quoted?, part, parts),
+    do: split_unquoted(rest, separator, not quoted?, <<part::binary, ?">>, parts)
+
+  defp split_unquoted(<<byte, rest::binary>>, separator, false, part, parts)
+       when byte == separator,
+       do: split_unquoted(rest, separator, false, "", [part | parts])
+
+  defp split_unquoted(<<byte, rest::binary>>, separator, quoted?, part, parts),
+    do: split_unquoted(rest, separator, quoted?, <<part::binary, byte>>, parts)
 
   defp process_mcp_request(%{"method" => "subscriptions/listen"} = request, opts) do
     open_http_subscription(request, opts)

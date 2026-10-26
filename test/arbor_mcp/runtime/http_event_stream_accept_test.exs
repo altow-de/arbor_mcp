@@ -23,19 +23,29 @@ defmodule Arbor.MCP.Server.Runtime.HTTPEventStreamAcceptTest do
     end
   end
 
+  # A quoted parameter value may hold commas, semicolons and escaped quotes
+  # (RFC 9110 section 5.6.4). None of them separates ranges or parameters, so
+  # the q-value after one still belongs to its range.
   @streams [
     "application/json, text/event-stream",
     "application/json;q=0.5, Text/Event-Stream;q=0.2",
-    "text/event-stream;charset=utf-8;q=1, application/json"
+    "text/event-stream;charset=utf-8;q=1, application/json",
+    ~S(text/event-stream;foo="x;y,z";q=0.5, application/json),
+    ~S(text/event-stream;foo="a\"b";q=1, application/json)
   ]
 
   @json [
     "application/json, text/event-stream;q=0",
     "application/json, text/event-stream;q=0.000",
     "application/json, text/event-stream;q=abc",
+    ~S(application/json, text/event-stream;q="1"),
     "application/json",
     "*/*",
-    "application/json, text/*"
+    "application/json, text/*",
+    ~S(application/json, text/event-stream;foo="a,b";q=0),
+    ~S(application/json, text/event-stream;foo="a\",b";q=0),
+    ~S(application/json, text/event-stream;foo="a;q=1";q=0),
+    ~S(application/json, text/event-stream;foo="unterminated)
   ]
 
   for era <- [:legacy, :modern] do
@@ -67,14 +77,46 @@ defmodule Arbor.MCP.Server.Runtime.HTTPEventStreamAcceptTest do
     end
   end
 
+  # The legacy session GET stream follows the same rule: a header that
+  # refuses an event stream is turned away rather than served one.
+  describe "legacy GET stream" do
+    for accept <- @streams do
+      test "Accept #{inspect(accept)} opens it" do
+        conn = get_stream(unquote(accept))
+        assert conn.status == 200
+        assert content_type(conn) =~ "text/event-stream"
+      end
+    end
+
+    for accept <- @json do
+      test "Accept #{inspect(accept)} is refused" do
+        assert get_stream(unquote(accept)).status == 400
+      end
+    end
+  end
+
+  defp get_stream(accept) do
+    root =
+      start_supervised!(
+        {Runtime, handler: Handler, handler_args: [test: self()], services: [sessions: []]}
+      )
+
+    {:ok, runtime} = Runtime.ref(root)
+    opts = HttpPlug.init(runtime: runtime, protocol_mode: :legacy_only, sse_mode: :oneshot)
+    headers = era_headers(:legacy, opts)
+
+    headers
+    |> Enum.reduce(Plug.Test.conn(:get, "/mcp"), fn {key, value}, conn ->
+      Plug.Conn.put_req_header(conn, key, value)
+    end)
+    |> Plug.Conn.put_req_header("accept", accept)
+    |> HttpPlug.call(opts)
+  end
+
   defp call_progress(era, accept) do
     root =
       start_supervised!(
-        {Runtime,
-         handler: Handler,
-         handler_args: [test: self()],
-         request_timeout_ms: 2_000,
-         services: [sessions: []]}
+        {Runtime, handler: Handler, handler_args: [test: self()], services: [sessions: []]}
       )
 
     {:ok, runtime} = Runtime.ref(root)

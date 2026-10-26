@@ -39,9 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `text/event-stream;q=0`, and JSON from one that wrote
   `Text/Event-Stream`. Both eras now parse the header's media ranges: an event
   stream needs `text/event-stream` named with a quality above zero, in any
-  case. A wildcard such as `*/*` still gets JSON, since the MCP spec asks
-  clients to list `text/event-stream`. The Streamable HTTP GET stream uses
-  the same rule.
+  case. A comma or semicolon inside a quoted parameter value, escaped quotes
+  included, separates nothing, so a range keeps its own `q`; a quoted or
+  malformed `q`, or an unterminated quoted string, doesn't opt in. A wildcard
+  such as `*/*` still gets JSON, since the MCP spec asks clients to list
+  `text/event-stream`. The Streamable HTTP GET stream uses the same rule.
 - `Server.notify_tools_changed/1`, `notify_prompts_changed/1` and
   `notify_resources_changed/1` called outside a callback on an HTTP runtime
   never reached a modern `subscriptions/listen` stream, though they returned
