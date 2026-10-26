@@ -50,7 +50,7 @@ defmodule ConformanceHandler do
   end
 
   @impl true
-  def init(_args), do: {:ok, %{subscriptions: MapSet.new()}}
+  def init(_args), do: {:ok, %{}}
 
   @impl true
   def handle_initialize(_params, state) do
@@ -644,13 +644,13 @@ defmodule ConformanceHandler do
      ], nil, state}
   end
 
+  # The runtime tracks subscriptions itself. A stateless handler (the
+  # default) must return its state unchanged, or the request fails.
   @impl true
-  def handle_subscribe_resource(uri, state),
-    do: {:ok, %{}, %{state | subscriptions: MapSet.put(state.subscriptions, uri)}}
+  def handle_subscribe_resource(_uri, state), do: {:ok, %{}, state}
 
   @impl true
-  def handle_unsubscribe_resource(uri, state),
-    do: {:ok, %{}, %{state | subscriptions: MapSet.delete(state.subscriptions, uri)}}
+  def handle_unsubscribe_resource(_uri, state), do: {:ok, %{}, state}
 
   # ── Prompts ────────────────────────────────────────────────
 

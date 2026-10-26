@@ -504,7 +504,7 @@ jobs:
       run: mix test --only interop_everything_modern
 
   external-conformance:
-    name: MCP 2026-07-28 external conformance
+    name: MCP external conformance
     runs-on: ubuntu-latest
     # The harness launches client scenarios in parallel. Keep test-only
     # dependencies (notably PropCheck's shared CounterStrike DETS file) out of
@@ -558,12 +558,26 @@ jobs:
     - name: Run complete modern conformance suites
       run: ./scripts/conformance.sh modern
 
+    # Each run of the script clears tmp/conformance_output.txt.
+    - name: Keep the modern conformance output
+      if: always()
+      run: |
+        mkdir -p tmp/conformance-modern
+        cp tmp/conformance_output.txt tmp/conformance_server.log tmp/conformance-modern/
+
+    # The published stable package's server and client suites cover the
+    # legacy (initialize) era, which the modern suites don't.
+    - name: Run published legacy core conformance suites
+      if: always()
+      run: ./scripts/conformance.sh all
+
     - name: Preserve conformance evidence
       if: always()
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
       with:
-        name: mcp-2026-07-28-conformance
+        name: mcp-conformance
         path: |
+          tmp/conformance-modern/
           tmp/conformance_output.txt
           tmp/conformance_server.log
         if-no-files-found: error

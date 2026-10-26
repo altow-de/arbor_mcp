@@ -216,6 +216,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as the other MCP SDKs do, and lets a model correct the call. Rejected values
   are never included. **Upgrade:** callers that matched the error tuple from
   `Client.call_tool/4` now receive `{:ok, %Arbor.MCP.Response{is_error: true}}`.
+- The gating MCP 2026-07-28 conformance runner now pins
+  `@modelcontextprotocol/conformance@0.2.0-alpha.12`, which adds checks for
+  deterministic `tools/list` ordering, the RFC 8707 `resource` parameter and
+  tool-name format. CI now also gates the published legacy core server and
+  client suites (`0.1.16`), which it didn't run before; they caught the
+  conformance fixture's subscribe handlers changing state on a concurrent
+  server.
 
 ### Fixed
 
