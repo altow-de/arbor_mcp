@@ -92,14 +92,18 @@ CONFORMANCE_ALPHA_VERSION=0.2.0-alpha.11 ./scripts/conformance.sh modern
 ./scripts/conformance.sh all-versions
 
 # Official TypeScript SDK interop. test/interop/package-lock.json pins the
-# legacy SDK separately from @modelcontextprotocol/{client,server,node}@2.0.0
-# (Node.js 20+ for SDK interop; Node.js 22+ for the modern conformance harness).
+# legacy SDK separately from @modelcontextprotocol/{client,server}@2.4.0 and
+# @modelcontextprotocol/node@2.1.2, and pins the everything reference server
+# at 2.0.1 (Node.js 24+ for test/interop; Node.js 22+ for the modern
+# conformance harness).
 mix test --only interop_ts_client
 mix test --only interop_ex_mcp_client
 mix test --only interop_modern_ts_client
 mix test --only interop_modern_ex_mcp_client
 mix test --only interop_modern_ts_http_client
 mix test --only interop_modern_ex_mcp_http_client
+mix test --only interop_everything_legacy
+mix test --only interop_everything_modern
 
 # After doc or example changes, re-verify key snippets and the getting-started demo:
 #   elixir examples/getting_started/demo_client.exs

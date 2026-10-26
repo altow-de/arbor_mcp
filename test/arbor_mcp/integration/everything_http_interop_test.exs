@@ -5,16 +5,16 @@ defmodule Arbor.MCP.Integration.EverythingHTTPInteropTest do
   Tests Arbor.MCP's HTTP transport against @modelcontextprotocol/server-everything,
   the canonical reference implementation that exercises all MCP protocol features.
 
-  The everything server exposes tools (echo, add, etc.), prompts, resources,
-  and resource templates over streamable HTTP transport.
+  The everything server exposes tools (echo, get-sum, etc.), prompts, resources,
+  and resource templates over streamable HTTP transport, in both protocol eras.
 
   Run with: mix test test/arbor_mcp/integration/everything_http_interop_test.exs --include interop
+  One era: mix test --only interop_everything_legacy (or interop_everything_modern)
   """
 
   use ExUnit.Case, async: false
 
   @moduletag :interop
-  @moduletag :integration
   @moduletag timeout: 60_000
 
   defmodule ProgressRecorder do
@@ -71,254 +71,273 @@ defmodule Arbor.MCP.Integration.EverythingHTTPInteropTest do
     {:ok, server_port: server.port}
   end
 
-  describe "Arbor.MCP Client -> Everything Server (non-SSE mode)" do
-    test "connects and initializes", %{server_port: port} do
-      {:ok, client} = connect_client(port)
+  # The same server process serves both eras: 2025-era sessions (initialize,
+  # GET stream, DELETE) and session-less 2026-07-28 requests.
+  for {era, mode, version} <- [
+        {:legacy, :legacy_only, "2025-11-25"},
+        {:modern, :modern_only, "2026-07-28"}
+      ] do
+    describe "Arbor.MCP #{era} client -> Everything Server" do
+      @describetag :"interop_everything_#{era}"
 
-      try do
-        # If we got here, initialization succeeded
-        assert Process.alive?(client)
-      after
-        Arbor.MCP.Client.disconnect(client)
+      test "connects and settles the #{era} era", %{server_port: port} do
+        {:ok, client} = connect_client(port, mode: unquote(mode))
+
+        try do
+          assert {:ok, unquote(version)} = Arbor.MCP.Client.negotiated_version(client)
+        after
+          Arbor.MCP.Client.disconnect(client)
+        end
       end
-    end
 
-    test "lists tools", %{server_port: port} do
-      {:ok, client} = connect_client(port)
+      test "lists tools", %{server_port: port} do
+        {:ok, client} = connect_client(port, mode: unquote(mode))
 
-      try do
-        {:ok, result} = Arbor.MCP.Client.list_tools(client, timeout: 10_000, format: :map)
-        tools = result["tools"] || []
-        tool_names = Enum.map(tools, fn t -> t["name"] end)
+        try do
+          {:ok, result} = Arbor.MCP.Client.list_tools(client, timeout: 10_000, format: :map)
+          tools = result["tools"] || []
+          tool_names = Enum.map(tools, fn t -> t["name"] end)
 
-        # The everything server exposes many tools
-        assert "echo" in tool_names
-        assert "add" in tool_names
-        assert "longRunningOperation" in tool_names
-        assert "getTinyImage" in tool_names
-        assert "annotatedMessage" in tool_names
-        assert length(tools) >= 10
-      after
-        Arbor.MCP.Client.disconnect(client)
+          # The everything server exposes many tools
+          assert "echo" in tool_names
+          assert "get-sum" in tool_names
+          assert "trigger-long-running-operation" in tool_names
+          assert "get-tiny-image" in tool_names
+          assert "get-annotated-message" in tool_names
+          assert length(tools) >= 10
+        after
+          Arbor.MCP.Client.disconnect(client)
+        end
       end
-    end
 
-    test "calls echo tool", %{server_port: port} do
-      {:ok, client} = connect_client(port)
+      test "calls echo tool", %{server_port: port} do
+        {:ok, client} = connect_client(port, mode: unquote(mode))
 
-      try do
-        {:ok, result} =
-          Arbor.MCP.Client.call_tool(client, "echo", %{"message" => "hello from Elixir"},
-            timeout: 10_000,
-            format: :map
+        try do
+          {:ok, result} =
+            Arbor.MCP.Client.call_tool(client, "echo", %{"message" => "hello from Elixir"},
+              timeout: 10_000,
+              format: :map
+            )
+
+          content = get_content_text(result)
+          assert content =~ "Echo: hello from Elixir"
+        after
+          Arbor.MCP.Client.disconnect(client)
+        end
+      end
+
+      # The server sends each step's progress on the call's POST stream, ahead
+      # of the result.
+      test "receives a long-running tool's progress while it runs", %{server_port: port} do
+        {:ok, client} =
+          connect_client(port,
+            mode: unquote(mode),
+            handler: {ProgressRecorder, [owner: self()]}
           )
 
-        content = get_content_text(result)
-        assert content =~ "Echo: hello from Elixir"
-      after
-        Arbor.MCP.Client.disconnect(client)
+        try do
+          call =
+            Task.async(fn ->
+              Arbor.MCP.Client.call_tool(
+                client,
+                "trigger-long-running-operation",
+                %{"duration" => 2, "steps" => 4},
+                timeout: 10_000,
+                format: :map,
+                meta: %{"progressToken" => "long-running"}
+              )
+            end)
+
+          assert_receive {:progress, %{"progress" => 1, "total" => 4}}, 5_000
+          assert Task.yield(call, 0) == nil
+
+          assert {:ok, result} = Task.await(call, 10_000)
+          assert get_content_text(result) =~ "Long running operation completed"
+          for step <- 2..4, do: assert_received({:progress, %{"progress" => ^step}})
+        after
+          Arbor.MCP.Client.disconnect(client)
+        end
       end
-    end
 
-    # The server sends each step's progress on the call's POST stream, ahead
-    # of the result.
-    test "receives a long-running tool's progress while it runs", %{server_port: port} do
-      {:ok, client} = connect_client(port, handler: {ProgressRecorder, [owner: self()]})
+      # Six steps half a second apart: longer than the timeout, but never
+      # that long without progress.
+      test "progress keeps a long-running call alive past its timeout", %{server_port: port} do
+        {:ok, client} =
+          connect_client(port,
+            mode: unquote(mode),
+            handler: {ProgressRecorder, [owner: self()]}
+          )
 
-      try do
-        call =
-          Task.async(fn ->
+        args = %{"duration" => 3, "steps" => 6}
+
+        try do
+          assert {:ok, result} =
+                   Arbor.MCP.Client.call_tool(client, "trigger-long-running-operation", args,
+                     timeout: 1_000,
+                     reset_timeout_on_progress: true,
+                     format: :map
+                   )
+
+          assert get_content_text(result) =~ "Long running operation completed"
+
+          assert {:error, :timeout} =
+                   Arbor.MCP.Client.call_tool(client, "trigger-long-running-operation", args,
+                     timeout: 1_000,
+                     format: :map
+                   )
+        after
+          Arbor.MCP.Client.disconnect(client)
+        end
+      end
+
+      test "calls get-sum tool", %{server_port: port} do
+        {:ok, client} = connect_client(port, mode: unquote(mode))
+
+        try do
+          {:ok, result} =
+            Arbor.MCP.Client.call_tool(client, "get-sum", %{"a" => 10, "b" => 32},
+              timeout: 10_000,
+              format: :map
+            )
+
+          content = get_content_text(result)
+          assert content =~ "42"
+        after
+          Arbor.MCP.Client.disconnect(client)
+        end
+      end
+
+      test "lists resources", %{server_port: port} do
+        {:ok, client} = connect_client(port, mode: unquote(mode))
+
+        try do
+          {:ok, result} = Arbor.MCP.Client.list_resources(client, timeout: 10_000, format: :map)
+          resources = result["resources"] || []
+          uris = Enum.map(resources, fn r -> r["uri"] end)
+
+          # The static resources are the server's own documentation files.
+          assert "demo://resource/static/document/architecture.md" in uris
+          assert Enum.all?(uris, &String.starts_with?(&1, "demo://resource/static/document/"))
+        after
+          Arbor.MCP.Client.disconnect(client)
+        end
+      end
+
+      test "reads a resource", %{server_port: port} do
+        {:ok, client} = connect_client(port, mode: unquote(mode))
+
+        try do
+          {:ok, result} =
+            Arbor.MCP.Client.read_resource(client, "demo://resource/dynamic/text/1",
+              timeout: 10_000,
+              format: :map
+            )
+
+          contents = result["contents"] || []
+          assert length(contents) > 0
+
+          first = hd(contents)
+          assert first["uri"] == "demo://resource/dynamic/text/1"
+          assert first["text"] =~ "Resource 1"
+        after
+          Arbor.MCP.Client.disconnect(client)
+        end
+      end
+
+      test "lists resource templates", %{server_port: port} do
+        {:ok, client} = connect_client(port, mode: unquote(mode))
+
+        try do
+          {:ok, result} =
+            Arbor.MCP.Client.list_resource_templates(client, timeout: 10_000, format: :map)
+
+          templates = result["resourceTemplates"] || []
+
+          assert %{"name" => "Dynamic Text Resource"} =
+                   Enum.find(
+                     templates,
+                     &(&1["uriTemplate"] == "demo://resource/dynamic/text/{resourceId}")
+                   )
+        after
+          Arbor.MCP.Client.disconnect(client)
+        end
+      end
+
+      test "lists prompts", %{server_port: port} do
+        {:ok, client} = connect_client(port, mode: unquote(mode))
+
+        try do
+          {:ok, result} = Arbor.MCP.Client.list_prompts(client, timeout: 10_000, format: :map)
+          prompts = result["prompts"] || []
+          prompt_names = Enum.map(prompts, fn p -> p["name"] end)
+
+          assert "simple-prompt" in prompt_names
+          assert "args-prompt" in prompt_names
+          assert "resource-prompt" in prompt_names
+          assert length(prompts) >= 3
+        after
+          Arbor.MCP.Client.disconnect(client)
+        end
+      end
+
+      test "gets a prompt", %{server_port: port} do
+        {:ok, client} = connect_client(port, mode: unquote(mode))
+
+        try do
+          {:ok, result} =
+            Arbor.MCP.Client.get_prompt(client, "simple-prompt", %{},
+              timeout: 10_000,
+              format: :map
+            )
+
+          messages = result["messages"] || []
+          assert length(messages) > 0
+
+          first = hd(messages)
+          assert first["role"] == "user"
+          assert get_in(first, ["content", "text"]) =~ "simple prompt"
+        after
+          Arbor.MCP.Client.disconnect(client)
+        end
+      end
+
+      test "ping succeeds", %{server_port: port} do
+        {:ok, client} = connect_client(port, mode: unquote(mode))
+
+        try do
+          assert {:ok, _} = Arbor.MCP.Client.ping(client, timeout: 10_000)
+        after
+          Arbor.MCP.Client.disconnect(client)
+        end
+      end
+
+      test "calls get-annotated-message tool", %{server_port: port} do
+        {:ok, client} = connect_client(port, mode: unquote(mode))
+
+        try do
+          {:ok, result} =
             Arbor.MCP.Client.call_tool(
               client,
-              "longRunningOperation",
-              %{"duration" => 2, "steps" => 4},
+              "get-annotated-message",
+              %{"messageType" => "error", "includeImage" => false},
               timeout: 10_000,
-              format: :map,
-              meta: %{"progressToken" => "long-running"}
+              format: :map
             )
-          end)
 
-        assert_receive {:progress, %{"progress" => 1, "total" => 4}}, 5_000
-        assert Task.yield(call, 0) == nil
-
-        assert {:ok, result} = Task.await(call, 10_000)
-        assert get_content_text(result) =~ "Long running operation completed"
-        for step <- 2..4, do: assert_received({:progress, %{"progress" => ^step}})
-      after
-        Arbor.MCP.Client.disconnect(client)
-      end
-    end
-
-    # Six steps half a second apart: longer than the timeout, but never
-    # that long without progress.
-    test "progress keeps a long-running call alive past its timeout", %{server_port: port} do
-      {:ok, client} = connect_client(port, handler: {ProgressRecorder, [owner: self()]})
-      args = %{"duration" => 3, "steps" => 6}
-
-      try do
-        assert {:ok, result} =
-                 Arbor.MCP.Client.call_tool(client, "longRunningOperation", args,
-                   timeout: 1_000,
-                   reset_timeout_on_progress: true,
-                   format: :map
-                 )
-
-        assert get_content_text(result) =~ "Long running operation completed"
-
-        assert {:error, :timeout} =
-                 Arbor.MCP.Client.call_tool(client, "longRunningOperation", args,
-                   timeout: 1_000,
-                   format: :map
-                 )
-      after
-        Arbor.MCP.Client.disconnect(client)
-      end
-    end
-
-    test "calls add tool", %{server_port: port} do
-      {:ok, client} = connect_client(port)
-
-      try do
-        {:ok, result} =
-          Arbor.MCP.Client.call_tool(client, "add", %{"a" => 10, "b" => 32},
-            timeout: 10_000,
-            format: :map
-          )
-
-        content = get_content_text(result)
-        assert content =~ "42"
-      after
-        Arbor.MCP.Client.disconnect(client)
-      end
-    end
-
-    test "lists resources", %{server_port: port} do
-      {:ok, client} = connect_client(port)
-
-      try do
-        {:ok, result} = Arbor.MCP.Client.list_resources(client, timeout: 10_000, format: :map)
-        resources = result["resources"] || []
-
-        # Everything server has 100 resources, paginated at 10 per page
-        assert length(resources) == 10
-
-        # First resource should be test://static/resource/1
-        first = hd(resources)
-        assert first["uri"] == "test://static/resource/1"
-        assert first["name"] == "Resource 1"
-      after
-        Arbor.MCP.Client.disconnect(client)
-      end
-    end
-
-    test "reads a resource", %{server_port: port} do
-      {:ok, client} = connect_client(port)
-
-      try do
-        {:ok, result} =
-          Arbor.MCP.Client.read_resource(client, "test://static/resource/1",
-            timeout: 10_000,
-            format: :map
-          )
-
-        contents = result["contents"] || []
-        assert length(contents) > 0
-
-        first = hd(contents)
-        assert first["uri"] == "test://static/resource/1"
-        # Odd-indexed resources (1-based, so resource 1 is index 0) are text
-        assert first["text"] =~ "Resource 1"
-      after
-        Arbor.MCP.Client.disconnect(client)
-      end
-    end
-
-    test "lists resource templates", %{server_port: port} do
-      {:ok, client} = connect_client(port)
-
-      try do
-        {:ok, result} =
-          Arbor.MCP.Client.list_resource_templates(client, timeout: 10_000, format: :map)
-
-        templates = result["resourceTemplates"] || []
-
-        assert length(templates) > 0
-
-        template = hd(templates)
-        assert template["uriTemplate"] == "test://static/resource/{id}"
-        assert template["name"] == "Static Resource"
-      after
-        Arbor.MCP.Client.disconnect(client)
-      end
-    end
-
-    test "lists prompts", %{server_port: port} do
-      {:ok, client} = connect_client(port)
-
-      try do
-        {:ok, result} = Arbor.MCP.Client.list_prompts(client, timeout: 10_000, format: :map)
-        prompts = result["prompts"] || []
-        prompt_names = Enum.map(prompts, fn p -> p["name"] end)
-
-        assert "simple_prompt" in prompt_names
-        assert "complex_prompt" in prompt_names
-        assert "resource_prompt" in prompt_names
-        assert length(prompts) >= 3
-      after
-        Arbor.MCP.Client.disconnect(client)
-      end
-    end
-
-    test "gets a prompt", %{server_port: port} do
-      {:ok, client} = connect_client(port)
-
-      try do
-        {:ok, result} =
-          Arbor.MCP.Client.get_prompt(client, "simple_prompt", %{}, timeout: 10_000, format: :map)
-
-        messages = result["messages"] || []
-        assert length(messages) > 0
-
-        first = hd(messages)
-        assert first["role"] == "user"
-        assert get_in(first, ["content", "text"]) =~ "simple prompt"
-      after
-        Arbor.MCP.Client.disconnect(client)
-      end
-    end
-
-    test "ping succeeds", %{server_port: port} do
-      {:ok, client} = connect_client(port)
-
-      try do
-        assert {:ok, _} = Arbor.MCP.Client.ping(client, timeout: 10_000)
-      after
-        Arbor.MCP.Client.disconnect(client)
-      end
-    end
-
-    test "calls annotatedMessage tool", %{server_port: port} do
-      {:ok, client} = connect_client(port)
-
-      try do
-        {:ok, result} =
-          Arbor.MCP.Client.call_tool(
-            client,
-            "annotatedMessage",
-            %{"messageType" => "error", "includeImage" => false},
-            timeout: 10_000,
-            format: :map
-          )
-
-        content = get_content_text(result)
-        assert content =~ "Error"
-      after
-        Arbor.MCP.Client.disconnect(client)
+          content = get_content_text(result)
+          assert content =~ "Error"
+        after
+          Arbor.MCP.Client.disconnect(client)
+        end
       end
     end
   end
 
-  describe "Arbor.MCP Client -> Everything Server (SSE mode)" do
+  # 2026-07-28 has no GET stream, so this is the legacy era only.
+  describe "Arbor.MCP legacy client -> Everything Server (SSE GET stream)" do
+    @describetag :interop_everything_legacy
+
     test "connects with SSE enabled", %{server_port: port} do
       {:ok, client} = connect_client(port, use_sse: true)
 
@@ -333,20 +352,12 @@ defmodule Arbor.MCP.Integration.EverythingHTTPInteropTest do
       {:ok, client} = connect_client(port, use_sse: true)
 
       try do
-        case Arbor.MCP.Client.list_tools(client, timeout: 10_000, format: :map) do
-          {:ok, result} ->
-            tools = result["tools"] || []
-            tool_names = Enum.map(tools, fn t -> t["name"] end)
+        {:ok, result} = Arbor.MCP.Client.list_tools(client, timeout: 10_000, format: :map)
+        tool_names = Enum.map(result["tools"] || [], fn t -> t["name"] end)
 
-            assert "echo" in tool_names
-            assert "add" in tool_names
-            assert length(tools) >= 10
-
-          {:error, %{"code" => _code, "message" => msg}} ->
-            # Some versions of the everything server have issues with SSE mode
-            # (e.g., missing 'roots' capability). Log and skip gracefully.
-            IO.puts("SSE list_tools returned server error: #{msg} (skipping assertion)")
-        end
+        assert "echo" in tool_names
+        assert "get-sum" in tool_names
+        assert length(tool_names) >= 10
       after
         Arbor.MCP.Client.disconnect(client)
       end
@@ -356,17 +367,13 @@ defmodule Arbor.MCP.Integration.EverythingHTTPInteropTest do
       {:ok, client} = connect_client(port, use_sse: true)
 
       try do
-        case Arbor.MCP.Client.call_tool(client, "echo", %{"message" => "hello SSE"},
-               timeout: 10_000,
-               format: :map
-             ) do
-          {:ok, result} ->
-            content = get_content_text(result)
-            assert content =~ "Echo: hello SSE"
+        {:ok, result} =
+          Arbor.MCP.Client.call_tool(client, "echo", %{"message" => "hello SSE"},
+            timeout: 10_000,
+            format: :map
+          )
 
-          {:error, %{"code" => _code, "message" => msg}} ->
-            IO.puts("SSE call_tool returned server error: #{msg} (skipping assertion)")
-        end
+        assert get_content_text(result) =~ "Echo: hello SSE"
       after
         Arbor.MCP.Client.disconnect(client)
       end
@@ -375,7 +382,7 @@ defmodule Arbor.MCP.Integration.EverythingHTTPInteropTest do
 
   # --- Helpers ---
 
-  defp connect_client(port, opts \\ []) do
+  defp connect_client(port, opts) do
     use_sse = Keyword.get(opts, :use_sse, false)
 
     Arbor.MCP.Client.start_link(
@@ -384,8 +391,7 @@ defmodule Arbor.MCP.Integration.EverythingHTTPInteropTest do
         url: "http://127.0.0.1:#{port}",
         endpoint: "/mcp",
         use_sse: use_sse,
-        # This fixture uses the session-based SDK 1.x transport.
-        protocol_mode: :legacy_only,
+        protocol_mode: Keyword.get(opts, :mode, :legacy_only),
         timeout: 10_000,
         request_timeout: 10_000,
         stream_handshake_timeout: 10_000

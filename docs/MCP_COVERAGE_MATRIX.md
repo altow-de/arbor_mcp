@@ -46,9 +46,9 @@ and advance the pinned gate only after the new harness passes.
 ## Official SDK Interoperability
 
 `test/interop/package.json` and its committed lockfile pin the official MCP
-TypeScript SDK v2 packages at `@modelcontextprotocol/client@2.0.0`,
-`@modelcontextprotocol/server@2.0.0`, and
-`@modelcontextprotocol/node@2.0.0`. The following CI lanes negotiate exactly
+TypeScript SDK v2 packages at `@modelcontextprotocol/client@2.4.0`,
+`@modelcontextprotocol/server@2.4.0`, and
+`@modelcontextprotocol/node@2.1.2`. The following CI lanes negotiate exactly
 `2026-07-28`:
 
 | ArborMCP role | Official SDK v2 role | Transport | CI tag |
@@ -65,6 +65,15 @@ rejection. Their assertions live in
 `integration/modern_interop_test.exs`; the official-SDK fixtures live in
 `test/interop/modern_ts_*.mjs`. Legacy interop remains separately pinned and
 tested so SDK v2 coverage cannot mask a regression in an older protocol era.
+
+The official everything reference server,
+`@modelcontextprotocol/server-everything@2.0.1`, serves both eras from one
+Streamable HTTP endpoint. ArborMCP's HTTP client runs the same tools,
+progress, resources, templates, prompts and ping checks against it in each era:
+`interop_everything_legacy` negotiates `2025-11-25` (and also covers the
+session's GET stream) and `interop_everything_modern` negotiates
+`2026-07-28`. The assertions live in
+`integration/everything_http_interop_test.exs`.
 
 The totals above are dated maintainer-recorded snapshots, not live badges.
 The rc.8 CI workflow preserves the complete modern conformance output as a
