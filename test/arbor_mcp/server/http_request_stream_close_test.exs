@@ -23,6 +23,38 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
       do: {:ok, %{content: [%{type: "text", text: "fast"}]}, test_pid}
   end
 
+  # A borrowed adapter that reports every write to the test process and can
+  # hold or fail a keepalive comment. Its callbacks run in the request process.
+  defmodule StubAdapter do
+    alias Plug.Adapters.Test.Conn
+
+    defdelegate read_req_body(state, opts), to: Conn
+    defdelegate send_resp(state, status, headers, body), to: Conn
+
+    def send_chunked(state, status, headers) do
+      send(state.observer, {:stream_headers, self(), status})
+      Conn.send_chunked(state, status, headers)
+    end
+
+    def chunk(state, body) do
+      wire = IO.iodata_to_binary(body)
+      send(state.observer, {:stream_wire, self(), wire})
+
+      cond do
+        wire == ":\r\n\r\n" and state.fail_keepalive ->
+          {:error, :closed}
+
+        wire == ":\r\n\r\n" and state.hold_keepalive ->
+          send(state.observer, {:keepalive_entered, self()})
+          receive do: (:return_io -> :ok)
+          Conn.chunk(%{state | hold_keepalive: false}, body)
+
+        true ->
+          Conn.chunk(state, body)
+      end
+    end
+  end
+
   for adapter <- [:cowboy, :bandit] do
     @tag :physical_http
     test "#{adapter} cancels a blocked tool when its request SSE stream closes" do
@@ -169,6 +201,113 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
       assert plug[:request_keepalive_interval_ms] == 40
       assert plug[:subscription_keepalive_interval_ms] == 50
     end
+  end
+
+  test "a handler timeout during an in-flight keepalive still writes the timeout error" do
+    runtime = start_runtime(request_timeout_ms: 1_000)
+    socket = stream_request(runtime, "hold", hold_keepalive: true)
+    assert_receive {:tool_started, worker}, 1_000
+    monitor = Process.monitor(worker)
+    assert_receive {:keepalive_entered, ^socket}, 1_000
+    assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}, 3_000
+
+    # The comment is not the request's output, so the gateway still queues
+    # the failure response behind it instead of abandoning the stream.
+    domain = writer_domain(runtime)
+
+    Arbor.MCP.TestHelpers.wait_until(fn ->
+      match?(%{in_flight: 1, queued: 1}, HTTPWriterRegistry.stats(domain))
+    end)
+
+    send(socket, :return_io)
+    assert_receive {:stream_wire, ^socket, "data: " <> frame}, 1_000
+    assert %{"error" => %{"code" => _code, "message" => _message}} = Jason.decode!(frame)
+    assert_receive {:stream_result, ^socket, {:returned, conn}}, 1_000
+    assert conn.state == :chunked
+    assert_released(runtime)
+  end
+
+  defp start_runtime(opts) do
+    root =
+      start_supervised!(
+        {Runtime,
+         Keyword.merge(
+           [
+             handler: Handler,
+             handler_args: [test_pid: self()],
+             transport: :mounted_http,
+             protocol_mode: :modern_only
+           ],
+           opts
+         )},
+        id: make_ref()
+      )
+
+    {:ok, runtime} = Runtime.ref(root)
+    runtime
+  end
+
+  defp stream_request(runtime, name, adapter_opts, plug_opts \\ []) do
+    parent = self()
+
+    socket =
+      spawn(fn ->
+        conn =
+          Plug.Test.conn(:post, "/mcp", tool_body(name, true))
+          |> Plug.Conn.put_req_header("content-type", "application/json")
+          |> Plug.Conn.put_req_header("accept", "application/json, text/event-stream")
+          |> Plug.Conn.put_req_header("mcp-protocol-version", "2026-07-28")
+          |> Plug.Conn.put_req_header("mcp-method", "tools/call")
+          |> Plug.Conn.put_req_header("mcp-name", name)
+
+        {_adapter, state} = conn.adapter
+
+        stub =
+          Map.merge(
+            state,
+            Map.new(
+              Keyword.merge(
+                [observer: parent, hold_keepalive: false, fail_keepalive: false],
+                adapter_opts
+              )
+            )
+          )
+
+        opts =
+          Arbor.MCP.HttpPlug.init(
+            Keyword.merge(
+              [runtime: runtime, protocol_mode: :modern_only, request_keepalive_interval_ms: 20],
+              plug_opts
+            )
+          )
+
+        result =
+          try do
+            {:returned, Arbor.MCP.HttpPlug.call(%{conn | adapter: {StubAdapter, stub}}, opts)}
+          catch
+            kind, reason -> {:raised, kind, reason}
+          end
+
+        send(parent, {:stream_result, self(), result})
+      end)
+
+    on_exit(fn -> if Process.alive?(socket), do: Process.exit(socket, :kill) end)
+    socket
+  end
+
+  defp writer_domain(runtime) do
+    {:ok, runtime_ref} = Runtime.ref(runtime)
+    {:ok, domain} = HTTPWriterProxy.domain(runtime_ref)
+    domain
+  end
+
+  defp assert_released(runtime) do
+    domain = writer_domain(runtime)
+
+    Arbor.MCP.TestHelpers.wait_until(fn ->
+      Runtime.stats!(runtime).reserved == 0 and
+        match?(%{frames: 0, bytes: 0}, HTTPWriterRegistry.stats(domain))
+    end)
   end
 
   defp owned_port(root) do

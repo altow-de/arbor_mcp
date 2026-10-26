@@ -1541,15 +1541,8 @@ defmodule Arbor.MCP.HttpPlug do
     case RuntimeWriter.await(conn, opts.request_keepalive_interval_ms) do
       :idle ->
         case RuntimeWriter.request_keepalive(conn) do
-          {:ok, conn} ->
-            await_runtime_output(conn, :sse, opts)
-
-          {:error, :output_busy} ->
-            await_runtime_output(conn, :sse, opts)
-
-          _closed ->
-            cancel_closed_request(conn)
-            {:stream_closed, conn}
+          {:ok, conn} -> await_runtime_output(conn, :sse, opts)
+          {:not_entered, conn} -> await_runtime_output(conn, :sse, opts)
         end
 
       response ->

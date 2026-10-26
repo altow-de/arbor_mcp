@@ -113,16 +113,19 @@ defmodule Arbor.MCP.HttpPlug.RuntimeWriter do
     end
   end
 
+  # A request keepalive enters IO atomically or not at all. A comment that was
+  # not admitted (pending output, a failure tail, contention or expiry) is not
+  # evidence that the client left, so the caller keeps waiting for its output.
   def request_keepalive(conn) do
-    case HTTPWriterRegistry.prepare_request_keepalive(binding(conn)) do
+    case HTTPWriterRegistry.enter_request_keepalive(binding(conn)) do
       {:ok, effect, wire} ->
-        perform(conn, effect, wire, fn conn, wire ->
+        write_checked_out(conn, effect, wire, fn conn, wire ->
           conn = if conn.state == :chunked, do: conn, else: Plug.Conn.send_chunked(conn, 200)
           Plug.Conn.chunk(conn, wire)
         end)
 
-      {:error, _reason} ->
-        {:error, :output_busy}
+      {:error, _not_entered} ->
+        {:not_entered, conn}
     end
   end
 

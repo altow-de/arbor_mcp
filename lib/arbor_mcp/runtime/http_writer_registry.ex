@@ -1287,10 +1287,14 @@ defmodule Arbor.MCP.Server.Runtime.HTTPWriterRegistry do
     end
   end
 
-  # A request heartbeat is an ordinary, charged output frame. Claim and queue
-  # it in one gate update so a response cannot overtake it between prepare and
-  # publish. A pending response always wins before the heartbeat is admitted.
-  def prepare_request_keepalive(binding) do
+  # A request heartbeat is an ordinary, charged output frame that enters IO in
+  # the same gate update that admits it. It is admitted only while its binding
+  # has no other claim, so it never overtakes pending output, and no failure,
+  # completion or retirement transition can drop it between admission and IO.
+  # A heartbeat that is not admitted has no effect; its caller keeps waiting.
+  @spec enter_request_keepalive(HTTPWriterBinding.t()) ::
+          {:ok, HTTPWriteTicket.t(), binary()} | error()
+  def enter_request_keepalive(binding) do
     wire = ":\r\n\r\n"
 
     with {:ok, {domain, binding_token}} <- HTTPWriterBinding.address(binding),
@@ -1301,28 +1305,43 @@ defmodule Arbor.MCP.Server.Runtime.HTTPWriterRegistry do
          {:ok, deadline} <- output_deadline(info, []),
          :ok <- wire_valid(wire, domain.limits),
          :ok <- before_deadline(deadline),
-         entry <- candidate(make_ref(), binding_token, self(), self(), deadline, wire, %{}, 0),
-         {:ok, ticket} <-
-           update(domain, deadline, fn current ->
-             if Enum.any?(current.claims, fn {_token, claim} ->
-                  claim.binding == binding_token
-                end) do
-               {:error, :http_output_busy}
-             else
-               with {:ok, next, :ok} <- claim(current, entry, domain) do
-                 next = next_sequence(next)
-                 queued = %{entry | stage: :queued, sequence: next.sequence, payload: wire}
-                 next = %{next | claims: Map.put(next.claims, entry.token, queued)}
-                 {:ok, next, {:ok, ticket(domain, queued, info.writer)}}
-               end
-             end
-           end) do
+         metadata = %{request_keepalive: true},
+         entry = candidate(make_ref(), binding_token, self(), self(), deadline, wire, metadata, 0),
+         {:ok, ticket} <- update(domain, deadline, &enter_keepalive(&1, entry, wire, domain)) do
       {:ok, ticket, wire}
     else
       false -> {:error, :invalid_http_writer}
       error -> error
     end
   end
+
+  defp enter_keepalive(gate, entry, wire, domain) do
+    with {:ok, next, :ok} <- claim(gate, entry, domain) do
+      info = next.bindings[entry.binding]
+
+      busy? =
+        Enum.any?(next.claims, fn {token, claim} ->
+          token != entry.token and claim.binding == entry.binding
+        end)
+
+      if busy? or info.writer != self() do
+        {:error, :http_output_busy}
+      else
+        entered = %{entry | stage: :in_flight, payload: wire}
+
+        next = %{
+          next
+          | claims: Map.put(next.claims, entry.token, entered),
+            bindings: Map.put(next.bindings, info.token, %{info | notice: false})
+        }
+
+        {:ok, next, {:ok, ticket(domain, entered, info.writer)}}
+      end
+    end
+  end
+
+  defp request_keepalive?(%{metadata: %{request_keepalive: true}}), do: true
+  defp request_keepalive?(_entry), do: false
 
   def failure_deadline(binding, token) do
     with {:ok, {domain, id}} <- HTTPWriterBinding.address(binding),
@@ -1594,6 +1613,9 @@ defmodule Arbor.MCP.Server.Runtime.HTTPWriterRegistry do
   # Read-only receipt observation remains usable after the logical output scope
   # is gone. A missing claim is settled only after the guardian's atomic removal;
   # in-flight claims cannot be removed while their writer remains alive.
+  # A request keepalive is not the request's output: a gateway failing the
+  # request during that comment must still prepare its failure response, which
+  # then waits behind the comment.
   @spec in_flight_observation(HTTPWriterBinding.t()) ::
           {:ok, HTTPWriteTicket.observation()} | error()
   def in_flight_observation(binding) do
@@ -1603,7 +1625,8 @@ defmodule Arbor.MCP.Server.Runtime.HTTPWriterRegistry do
          %{writer: writer} <- gate.bindings[binding_token],
          {_token, entry} <-
            Enum.find(gate.claims, fn {_token, entry} ->
-             entry.binding == binding_token and entry.stage == :in_flight
+             entry.binding == binding_token and entry.stage == :in_flight and
+               not request_keepalive?(entry)
            end) do
       {:ok, HTTPWriteTicket.observation(ticket(domain, entry, writer))}
     else
