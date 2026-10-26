@@ -126,6 +126,14 @@ defmodule Arbor.MCP.Server.DispatchTest do
     def handle_read_resource("file:///list", state),
       do: {:ok, [%{uri: "file:///list", text: "a"}, %{uri: "file:///list", blob: "YQ=="}], state}
 
+    def handle_read_resource("file:///text-with-contents", state),
+      do: {:ok, %{uri: "file:///text-with-contents", text: "hello", contents: []}, state}
+
+    def handle_read_resource("file:///string-blob-with-contents", state),
+      do:
+        {:ok, %{"uri" => "file:///string-blob-with-contents", "blob" => "YQ==", "contents" => []},
+         state}
+
     def handle_read_resource("file:///whole", state),
       do: {:ok, %{contents: [%{uri: "file:///whole", text: "a"}], ttlMs: 5_000}, state}
 
@@ -343,6 +351,24 @@ defmodule Arbor.MCP.Server.DispatchTest do
                "contents" => [
                  %{"uri" => "file:///list", "text" => "a"},
                  %{"uri" => "file:///list", "blob" => "YQ=="}
+               ]
+             }
+    end
+
+    test "resources/read wraps an item with text or blob even beside a contents key" do
+      assert read("file:///text-with-contents") == %{
+               "contents" => [
+                 %{"uri" => "file:///text-with-contents", "text" => "hello", "contents" => []}
+               ]
+             }
+
+      assert read("file:///string-blob-with-contents") == %{
+               "contents" => [
+                 %{
+                   "uri" => "file:///string-blob-with-contents",
+                   "blob" => "YQ==",
+                   "contents" => []
+                 }
                ]
              }
     end

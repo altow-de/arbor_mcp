@@ -470,9 +470,10 @@ defmodule Arbor.MCP.Server.Handler do
   The success value is one content item (`%{uri, text}` or `%{uri, blob}`),
   a list of those items, or the whole read result `%{contents: [...]}` when
   the handler also sets fields such as cache hints. Keys may be atoms or
-  strings. The server wraps an item or a list as `%{"contents" => [...]}`.
-  A map whose `contents` is a list is sent as the whole result, with any
-  other keys it has. The modern era adds `resultType`, and `ttlMs` and
+  strings. The server wraps an item or a list as `%{"contents" => [...]}`;
+  a map with `text` or `blob` is always an item. Any other map whose
+  `contents` is a list is sent as the whole result, with any other keys it
+  has. The modern era adds `resultType`, and `ttlMs` and
   `cacheScope` when the result leaves them off.
   """
   @callback handle_read_resource(uri :: String.t(), state()) ::

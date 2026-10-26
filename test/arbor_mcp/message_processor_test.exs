@@ -198,6 +198,14 @@ defmodule Arbor.MCP.MessageProcessorTest do
     def handle_read_resource("file:///item", state),
       do: {:ok, %{uri: "file:///item", text: "a"}, state}
 
+    def handle_read_resource("file:///text-with-contents", state),
+      do: {:ok, %{uri: "file:///text-with-contents", text: "hello", contents: []}, state}
+
+    def handle_read_resource("file:///string-blob-with-contents", state),
+      do:
+        {:ok, %{"uri" => "file:///string-blob-with-contents", "blob" => "YQ==", "contents" => []},
+         state}
+
     def handle_read_resource("file:///whole", state),
       do: {:ok, %{contents: [%{uri: "file:///whole", text: "a"}], ttlMs: 5_000}, state}
 
@@ -383,6 +391,23 @@ defmodule Arbor.MCP.MessageProcessorTest do
 
       assert read.("file:///item") == %{
                "contents" => [%{"uri" => "file:///item", "text" => "a"}]
+             }
+
+      # text or blob marks a content item, even beside a contents key.
+      assert read.("file:///text-with-contents") == %{
+               "contents" => [
+                 %{"uri" => "file:///text-with-contents", "text" => "hello", "contents" => []}
+               ]
+             }
+
+      assert read.("file:///string-blob-with-contents") == %{
+               "contents" => [
+                 %{
+                   "uri" => "file:///string-blob-with-contents",
+                   "blob" => "YQ==",
+                   "contents" => []
+                 }
+               ]
              }
 
       # This path used to wrap every value, nesting a whole result inside

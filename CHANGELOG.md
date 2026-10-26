@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `contents` list used to be sent as one content item with neither `text`
   nor `blob`. Over HTTP with a handler module, every whole result used to
   be nested inside its own `contents` list. One content item or a list of
-  them is still wrapped as `contents`.
+  them is still wrapped as `contents`, and a map with `text` or `blob` is
+  always an item, even beside a `contents` key.
 
 ## [2.0.0-rc.6] — 2026-10-26
 
