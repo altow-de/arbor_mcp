@@ -108,7 +108,8 @@ defmodule Arbor.MCP.Authorization.OAuthFlow do
       %{client_id: params.client_id}
     )
 
-    with :ok <- reject_custom_state(params),
+    with :ok <- Validator.validate_scopes(params.scopes),
+         :ok <- reject_custom_state(params),
          :ok <- validate_additional_params(params),
          :ok <- Validator.validate_redirect_uri(redirect_uri),
          :ok <- Validator.validate_https_endpoint(auth_endpoint),

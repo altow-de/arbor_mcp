@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Authorization code flow rejects malformed `:scopes` instead of silently
+  turning a non-list value into an empty scope parameter.
+
 ## [2.0.0-rc.6] — 2026-10-26
 
 ### Added
