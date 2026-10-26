@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capacity. Over TCP the first write after a peer closes usually succeeds and
   the next one fails, so on Bandit a closed stream is usually noticed within
   two intervals. Cowboy cancels the request as soon as it sees the connection
-  close, by terminating the request process. JSON responses and legacy streams
-  are unchanged.
+  close, by terminating the request process. `subscriptions/listen` keeps
+  using only `:subscription_keepalive_interval_ms`. JSON responses and legacy
+  streams are unchanged.
 
 ## [2.0.0-rc.6] — 2026-10-26
 

@@ -1345,7 +1345,8 @@ Set `:subscription_keepalive_interval_ms` to a positive integer or
 `:infinity`. Disabling keepalives delays detection of a quiet peer disconnect
 until the next notification or server-initiated closure.
 
-Modern requests that use an SSE response stream also write comment keepalives.
+Other modern requests that use an SSE response stream also write comment
+keepalives; `subscriptions/listen` uses only the subscription interval above.
 Set `:request_keepalive_interval_ms` to a positive integer (default `15_000`)
 or `:infinity`, either on an `Arbor.MCP.HttpPlug` mount or in an owned
 server's `http:` options. A failed write cancels the request handler and

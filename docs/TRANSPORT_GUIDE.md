@@ -234,7 +234,8 @@ response stays open as SSE, begins with the subscription acknowledgement, and
 then carries only the notification categories selected by that request.
 Closing a modern request/subscription response stream is the cancellation
 signal; there is no session DELETE and no resumable `Last-Event-ID` cursor.
-For an SSE request response, the server writes comment keepalives every
+For an SSE request response other than `subscriptions/listen`, which has its
+own keepalive, the server writes comment keepalives every
 `:request_keepalive_interval_ms` (15 seconds by default). A failed write
 cancels the running handler and releases its Runtime capacity. Over TCP the
 first write after the client closes usually succeeds and the next one fails,
