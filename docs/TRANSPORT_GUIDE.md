@@ -96,6 +96,19 @@ sending `Last-Event-ID` after a connection settles modern. Modern request and
 subscription streams use SSE on the owning POST response automatically and do
 not require `use_sse: true`.
 
+In the legacy era an ArborMCP server answers a request that carries
+`_meta.progressToken` with request-owned SSE when the client's `Accept` header
+allows `text/event-stream`, as the TypeScript SDK's servers do: the request's
+progress, and its callback's other notifications, arrive ahead of the result.
+Other legacy requests get JSON. Their callback's progress, log messages and
+list changes, and every request a callback sends to the client (roots,
+sampling, elicitation), go to that session's GET stream and never to another
+session's; with no GET stream open they return `{:error, :stream_closed}`. A
+list change sent outside a callback reaches only modern `subscriptions/listen`
+streams, not legacy sessions. The server closes a GET stream at the Runtime's
+`:request_timeout_ms`; the client keeps its session and opens the stream again
+with `Last-Event-ID`.
+
 ```elixir
 {:ok, client} =
   Arbor.MCP.Client.start_link(
