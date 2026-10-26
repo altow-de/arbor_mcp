@@ -287,6 +287,57 @@ defmodule Arbor.MCP.Client.HTTPAsyncPostTest do
 
         json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => %{"content" => []}})
 
+      name when name in ["protected", "protected_held", "step_up"] ->
+        respond_protected(conn, name, id, test_pid)
+    end
+  end
+
+  defp respond(conn, %{"method" => "notifications/cancelled" = method} = message, test_pid) do
+    params = Map.get(message, "params", %{})
+    send(test_pid, {:notification, method, params})
+
+    case params["reason"] do
+      "stall" ->
+        send(test_pid, {:cancel_started, self()})
+        Process.flag(:trap_exit, true)
+
+        receive do
+          :release -> :ok
+          {:EXIT, _from, _reason} -> :ok
+        after
+          2_000 -> :ok
+        end
+
+        Plug.Conn.resp(conn, 202, "")
+
+      "auth" ->
+        if Plug.Conn.get_req_header(conn, "authorization") == ["Bearer fresh"] do
+          send(test_pid, {:authenticated_notification, method})
+          Plug.Conn.resp(conn, 202, "")
+        else
+          conn
+          |> Plug.Conn.put_resp_header("www-authenticate", ~s(Bearer realm="mcp"))
+          |> Plug.Conn.resp(401, "")
+        end
+
+      _other ->
+        Plug.Conn.resp(conn, 202, "")
+    end
+  end
+
+  defp respond(conn, %{"method" => method} = message, test_pid) do
+    send(test_pid, {:notification, method, Map.get(message, "params", %{})})
+    Plug.Conn.resp(conn, 202, "")
+  end
+
+  defp respond(conn, %{"id" => id, "result" => _result}, test_pid) do
+    send(test_pid, {:client_answered, id})
+    Plug.Conn.resp(conn, 202, "")
+  end
+
+  # Tools that need a bearer token the stub's providers hand out.
+  defp respond_protected(conn, name, id, test_pid) do
+    case name do
       # Once authenticated, asks the client something on the stream and
       # waits to be released.
       "protected_held" ->
@@ -337,49 +388,6 @@ defmodule Arbor.MCP.Client.HTTPAsyncPostTest do
           |> Plug.Conn.resp(401, "")
         end
     end
-  end
-
-  defp respond(conn, %{"method" => "notifications/cancelled" = method} = message, test_pid) do
-    params = Map.get(message, "params", %{})
-    send(test_pid, {:notification, method, params})
-
-    case params["reason"] do
-      "stall" ->
-        send(test_pid, {:cancel_started, self()})
-        Process.flag(:trap_exit, true)
-
-        receive do
-          :release -> :ok
-          {:EXIT, _from, _reason} -> :ok
-        after
-          2_000 -> :ok
-        end
-
-        Plug.Conn.resp(conn, 202, "")
-
-      "auth" ->
-        if Plug.Conn.get_req_header(conn, "authorization") == ["Bearer fresh"] do
-          send(test_pid, {:authenticated_notification, method})
-          Plug.Conn.resp(conn, 202, "")
-        else
-          conn
-          |> Plug.Conn.put_resp_header("www-authenticate", ~s(Bearer realm="mcp"))
-          |> Plug.Conn.resp(401, "")
-        end
-
-      _other ->
-        Plug.Conn.resp(conn, 202, "")
-    end
-  end
-
-  defp respond(conn, %{"method" => method} = message, test_pid) do
-    send(test_pid, {:notification, method, Map.get(message, "params", %{})})
-    Plug.Conn.resp(conn, 202, "")
-  end
-
-  defp respond(conn, %{"id" => id, "result" => _result}, test_pid) do
-    send(test_pid, {:client_answered, id})
-    Plug.Conn.resp(conn, 202, "")
   end
 
   defp text_result(conn, id, text) do
