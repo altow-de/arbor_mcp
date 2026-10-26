@@ -1,10 +1,11 @@
 # Arbor package roadmap
 
 The accepted ArborMCP v2 scope is implemented and available in
-`arbor_mcp` `2.0.0-rc.5`. ArborACP, ArborACP adapters and ArborRPC are newly
-extracted libraries on independent `1.0.0-rc.1` lines. Their original
-`2.0.0-rc.1` candidates are retired; existing archives and tags remain available.
-The maintained ExMCP line has released `ex_mcp` `1.6.0`.
+`arbor_mcp` `2.0.0-rc.6`. ArborACP, ArborACP adapters and ArborRPC are newly
+extracted libraries on independent `1.0.0` lines, at `1.0.0-rc.3`, `1.0.0-rc.3`
+and `1.0.0-rc.2`. Their original `2.0.0-rc.1` candidates are retired; existing
+archives and tags remain available. The maintained ExMCP line has released
+`ex_mcp` `1.7.3`.
 
 ## Delivered scope
 
