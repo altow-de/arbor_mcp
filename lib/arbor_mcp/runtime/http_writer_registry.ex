@@ -1287,6 +1287,43 @@ defmodule Arbor.MCP.Server.Runtime.HTTPWriterRegistry do
     end
   end
 
+  # A request heartbeat is an ordinary, charged output frame. Claim and queue
+  # it in one gate update so a response cannot overtake it between prepare and
+  # publish. A pending response always wins before the heartbeat is admitted.
+  def prepare_request_keepalive(binding) do
+    wire = ":\r\n\r\n"
+
+    with {:ok, {domain, binding_token}} <- HTTPWriterBinding.address(binding),
+         {:ok, domain} <- valid(domain),
+         {:ok, gate} <- read(domain),
+         {:ok, info} <- open_binding(gate, binding_token),
+         true <- info.writer == self(),
+         {:ok, deadline} <- output_deadline(info, []),
+         :ok <- wire_valid(wire, domain.limits),
+         :ok <- before_deadline(deadline),
+         entry <- candidate(make_ref(), binding_token, self(), self(), deadline, wire, %{}, 0),
+         {:ok, ticket} <-
+           update(domain, deadline, fn current ->
+             if Enum.any?(current.claims, fn {_token, claim} ->
+                  claim.binding == binding_token
+                end) do
+               {:error, :http_output_busy}
+             else
+               with {:ok, next, :ok} <- claim(current, entry, domain) do
+                 next = next_sequence(next)
+                 queued = %{entry | stage: :queued, sequence: next.sequence, payload: wire}
+                 next = %{next | claims: Map.put(next.claims, entry.token, queued)}
+                 {:ok, next, {:ok, ticket(domain, queued, info.writer)}}
+               end
+             end
+           end) do
+      {:ok, ticket, wire}
+    else
+      false -> {:error, :invalid_http_writer}
+      error -> error
+    end
+  end
+
   def failure_deadline(binding, token) do
     with {:ok, {domain, id}} <- HTTPWriterBinding.address(binding),
          true <- registered_actor?(domain, :output_controller, self()),

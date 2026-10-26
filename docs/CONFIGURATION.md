@@ -1345,6 +1345,14 @@ Set `:subscription_keepalive_interval_ms` to a positive integer or
 `:infinity`. Disabling keepalives delays detection of a quiet peer disconnect
 until the next notification or server-initiated closure.
 
+Modern requests that use an SSE response stream also write comment keepalives.
+Set `:request_keepalive_interval_ms` to a positive integer (default
+`15_000`) or `:infinity` on the HTTP mount. A failed write cancels the
+request handler and releases its scheduler and writer capacity. This setting
+does not change JSON responses or the original request deadline. A quiet
+disconnect on a JSON response is detected only when the server writes or the
+request deadline expires.
+
 ## Legacy notifications (MCP 2024-11-05 through 2025-11-25)
 
 Legacy peers deliver `notifications/tools/list_changed`,

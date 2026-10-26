@@ -61,23 +61,26 @@ defmodule Arbor.MCP.HttpPlug.RuntimeWriter do
 
   defp admitted(conn, wire, write), do: write.(conn, wire)
 
-  def await(conn) do
+  def await(conn, idle_timeout \\ :infinity) do
     binding = binding(conn)
+
+    idle_deadline =
+      if idle_timeout == :infinity, do: :infinity, else: Deadline.now() + idle_timeout
 
     with {:ok, deadline} <- HTTPWriterRegistry.wait_deadline(binding),
          {:ok, {domain, _token}} <- HTTPWriterBinding.address(binding) do
-      await(binding, domain, deadline)
+      await(binding, domain, deadline, idle_deadline)
     end
   end
 
-  defp await(binding, domain, deadline) do
+  defp await(binding, domain, deadline, idle_deadline) do
     case HTTPWriterRegistry.listener_setup(binding) do
       {:listener, _cap, _pid, _token} = listener -> listener
-      :empty -> await_output(binding, domain, deadline)
+      :empty -> await_output(binding, domain, deadline, idle_deadline)
     end
   end
 
-  defp await_output(binding, domain, deadline) do
+  defp await_output(binding, domain, deadline, idle_deadline) do
     case HTTPWriterRegistry.peek(binding) do
       {:ok, _ticket, _wire} = ready ->
         ready
@@ -85,22 +88,41 @@ defmodule Arbor.MCP.HttpPlug.RuntimeWriter do
       waiting
       when waiting in [:empty, {:error, :http_invocation_closed}, {:error, :http_write_in_flight}] ->
         remaining = Deadline.remaining(deadline)
+        idle_remaining = Deadline.remaining(idle_deadline)
 
-        if remaining == 0 do
-          {:error, :http_invocation_closed}
-        else
-          receive do
-            {:mcp_http_output_wake, ^domain, nonce} ->
-              HTTPWriterRegistry.acknowledge_wake(domain, nonce)
-          after
-            min(remaining, 10) -> :ok
-          end
+        cond do
+          remaining == 0 ->
+            {:error, :http_invocation_closed}
 
-          await(binding, domain, deadline)
+          idle_remaining == 0 ->
+            :idle
+
+          true ->
+            receive do
+              {:mcp_http_output_wake, ^domain, nonce} ->
+                HTTPWriterRegistry.acknowledge_wake(domain, nonce)
+            after
+              min(min(remaining, idle_remaining), 10) -> :ok
+            end
+
+            await(binding, domain, deadline, idle_deadline)
         end
 
       error ->
         error
+    end
+  end
+
+  def request_keepalive(conn) do
+    case HTTPWriterRegistry.prepare_request_keepalive(binding(conn)) do
+      {:ok, effect, wire} ->
+        perform(conn, effect, wire, fn conn, wire ->
+          conn = if conn.state == :chunked, do: conn, else: Plug.Conn.send_chunked(conn, 200)
+          Plug.Conn.chunk(conn, wire)
+        end)
+
+      {:error, _reason} ->
+        {:error, :output_busy}
     end
   end
 

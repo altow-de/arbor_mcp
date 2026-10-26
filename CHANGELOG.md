@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Modern HTTP request SSE streams now send configurable comment keepalives
+  (`:request_keepalive_interval_ms`, default 15 seconds). A closed peer is
+  detected on the next write, cancelling the handler and freeing its Runtime
+  capacity. JSON responses and legacy streams are unchanged.
+
 ## [2.0.0-rc.6] — 2026-10-26
 
 ### Added

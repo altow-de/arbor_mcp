@@ -120,9 +120,11 @@ defmodule Arbor.MCP.HttpPlug do
   An ordinary modern request that opts into progress or request logs also owns
   its POST response stream. `notifications/progress` and
   `notifications/message` are written only there, followed by one final
-  JSON-RPC response that closes the stream. A disconnect or chunk failure
-  cancels that request's worker without affecting other
-  requests or subscriptions.
+  JSON-RPC response that closes the stream. SSE comment keepalives are sent
+  every `:request_keepalive_interval_ms` milliseconds (default: `15_000`;
+  set `:infinity` to disable). A failed write cancels that request's worker
+  without affecting other requests or subscriptions. JSON responses do not
+  send keepalives.
 
   Mount subscription authorizers are composed with the Runtime service policy;
   both must authorize. Mount queue, message-byte, aggregate-byte and lifetime
@@ -163,6 +165,7 @@ defmodule Arbor.MCP.HttpPlug do
   alias Arbor.MCP.Plugs.ProtectedResourceMetadata
   alias Arbor.MCP.Protocol.{ErrorCodes, Methods}
   alias Arbor.MCP.Server.{AuthInfo, RequestContext, Subscriptions}
+  alias Arbor.MCP.Server.Runtime
 
   alias Arbor.MCP.Server.Runtime.{
     HTTPGateway,
@@ -212,6 +215,8 @@ defmodule Arbor.MCP.HttpPlug do
         subscription_keepalive_interval!(
           Keyword.get(opts, :subscription_keepalive_interval_ms, 15_000)
         ),
+      request_keepalive_interval_ms:
+        request_keepalive_interval!(Keyword.get(opts, :request_keepalive_interval_ms, 15_000)),
       legacy_http_sse: legacy_http_sse,
       legacy_http_sse_path:
         normalize_legacy_http_sse_path(Keyword.get(opts, :legacy_http_sse_path, "/sse")),
@@ -1451,6 +1456,7 @@ defmodule Arbor.MCP.HttpPlug do
          {:ok, conn} <- runtime_protocol_version(conn, request, session),
          :ok <- RuntimeWriter.current(conn),
          format = runtime_output_format(conn, request),
+         conn = maybe_prepare_runtime_stream(conn, format, opts, session, request),
          {:ok, _token} <-
            HTTPGateway.submit(runtime, binding, request,
              format: format,
@@ -1460,21 +1466,13 @@ defmodule Arbor.MCP.HttpPlug do
                |> Map.put(:session_id, RuntimeSession.id(session))
                |> runtime_dispatch_opts(conn)
            ),
-         response <- RuntimeWriter.await(conn),
+         {:ok, response, conn} <- await_runtime_output(conn, format, opts),
          :ok <- runtime_response_ready(response) do
-      conn =
-        conn
-        |> Plug.Conn.put_private(
-          :arbor_mcp_http_initialization,
-          not is_nil(RuntimeSession.initialization_request(request))
-        )
-        |> maybe_add_cors_headers(opts)
-        |> add_protocol_version_header()
-        |> maybe_put_session_header(RuntimeSession.id(session))
+      conn = maybe_prepare_runtime_response(conn, format, opts, session, request)
 
       case response do
         {:ok, effect, wire} ->
-          write_runtime_output(conn, effect, wire, format, session, request)
+          write_runtime_output(conn, effect, wire, format, session, request, opts)
 
         {:listener, binding, listener, registration} ->
           Arbor.MCP.HttpPlug.RuntimeSubscriptionStream.serve(
@@ -1486,6 +1484,9 @@ defmodule Arbor.MCP.HttpPlug do
           )
       end
     else
+      {:stream_closed, conn} ->
+        conn
+
       {:error, reason} = error
       when reason in [
              :http_invocation_closed,
@@ -1509,6 +1510,68 @@ defmodule Arbor.MCP.HttpPlug do
   defp runtime_response_ready({:ok, _effect, _wire}), do: :ok
   defp runtime_response_ready({:listener, _binding, _pid, _registration}), do: :ok
   defp runtime_response_ready(error), do: error
+
+  defp maybe_prepare_runtime_stream(conn, :sse, opts, session, request) do
+    conn
+    |> prepare_runtime_response(opts, session, request)
+    |> put_resp_header("content-type", "text/event-stream")
+    |> put_resp_header("x-accel-buffering", "no")
+    |> put_resp_header("cache-control", "no-cache")
+  end
+
+  defp maybe_prepare_runtime_stream(conn, _format, _opts, _session, _request), do: conn
+
+  defp maybe_prepare_runtime_response(conn, :sse, _opts, _session, _request), do: conn
+
+  defp maybe_prepare_runtime_response(conn, _format, opts, session, request),
+    do: prepare_runtime_response(conn, opts, session, request)
+
+  defp prepare_runtime_response(conn, opts, session, request) do
+    conn
+    |> Plug.Conn.put_private(
+      :arbor_mcp_http_initialization,
+      not is_nil(RuntimeSession.initialization_request(request))
+    )
+    |> maybe_add_cors_headers(opts)
+    |> add_protocol_version_header()
+    |> maybe_put_session_header(RuntimeSession.id(session))
+  end
+
+  defp await_runtime_output(conn, :sse, opts) do
+    case RuntimeWriter.await(conn, opts.request_keepalive_interval_ms) do
+      :idle ->
+        case RuntimeWriter.request_keepalive(conn) do
+          {:ok, conn} ->
+            await_runtime_output(conn, :sse, opts)
+
+          {:error, :output_busy} ->
+            await_runtime_output(conn, :sse, opts)
+
+          _closed ->
+            cancel_closed_request(conn)
+            {:stream_closed, conn}
+        end
+
+      response ->
+        {:ok, response, conn}
+    end
+  rescue
+    RuntimeWriter.AdmissionError ->
+      cancel_closed_request(conn)
+      {:stream_closed, conn}
+  end
+
+  defp await_runtime_output(conn, _format, _opts), do: {:ok, RuntimeWriter.await(conn), conn}
+
+  defp cancel_closed_request(conn) do
+    binding = RuntimeWriter.binding(conn)
+
+    with {:ok, proof} <- HTTPWriterBinding.validate(binding, RuntimeWriter.runtime(conn)) do
+      Runtime.cancel_scope(RuntimeWriter.runtime(conn), proof.scope)
+    end
+
+    HTTPWriterRegistry.retire(binding, :request_stream_closed)
+  end
 
   defp runtime_json(body) do
     case Jason.decode(body) do
@@ -1739,7 +1802,7 @@ defmodule Arbor.MCP.HttpPlug do
 
   defp decode_runtime_wire(wire), do: Jason.decode!(wire)
 
-  defp write_runtime_output(conn, effect, wire, format, session, request) do
+  defp write_runtime_output(conn, effect, wire, format, session, request, opts) do
     kind = HTTPWriterRegistry.kind(effect)
 
     if kind != :notification and finalize_runtime_session(session, request, wire, conn) != :ok,
@@ -1756,9 +1819,15 @@ defmodule Arbor.MCP.HttpPlug do
     conn = write_runtime_response(conn, effect, wire, format)
 
     if kind == :notification do
-      case RuntimeWriter.await(conn) do
-        {:ok, effect, wire} -> write_runtime_output(conn, effect, wire, format, session, request)
-        _closed -> raise RuntimeWriter.AdmissionError
+      case await_runtime_output(conn, format, opts) do
+        {:ok, {:ok, effect, wire}, conn} ->
+          write_runtime_output(conn, effect, wire, format, session, request, opts)
+
+        {:stream_closed, conn} ->
+          conn
+
+        _closed ->
+          raise RuntimeWriter.AdmissionError
       end
     else
       if initialization_error?, do: RuntimeSession.terminate(session)
@@ -3210,6 +3279,17 @@ defmodule Arbor.MCP.HttpPlug do
   defp subscription_keepalive_interval!(interval) do
     raise ArgumentError,
           ":subscription_keepalive_interval_ms must be a positive integer or :infinity, " <>
+            "got: #{inspect(interval)}"
+  end
+
+  defp request_keepalive_interval!(:infinity), do: :infinity
+
+  defp request_keepalive_interval!(interval) when is_integer(interval) and interval > 0,
+    do: interval
+
+  defp request_keepalive_interval!(interval) do
+    raise ArgumentError,
+          ":request_keepalive_interval_ms must be a positive integer or :infinity, " <>
             "got: #{inspect(interval)}"
   end
 
