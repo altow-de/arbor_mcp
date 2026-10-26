@@ -182,24 +182,38 @@ defmodule Arbor.MCP.Reliability.RetryTest do
 
   describe "linear retry" do
     test "uses fixed delay between attempts" do
-      start_time = System.monotonic_time(:millisecond)
-      counter = start_counter()
+      # The delay is the argument passed to sleep, twice, not a wall-clock
+      # band around 2 * 50ms. Scheduler delay stretches the sleep; it does
+      # not change the charged delay. Exponential backoff would sleep a
+      # larger value on the second retry. Call traces are delivered to a
+      # separate tracer: the traced process does not receive its own.
+      parent = self()
+      tracer = spawn(fn -> forward_traces(parent) end)
+      :erlang.trace_pattern({Process, :sleep, 1}, true, [])
+      :erlang.trace(self(), true, [:call, {:tracer, tracer}])
 
-      Retry.with_linear_retry(
-        fn ->
-          increment_counter(counter)
-          {:error, :failure}
-        end,
-        max_attempts: 3,
-        delay: 50
-      )
+      try do
+        counter = start_counter()
 
-      duration = System.monotonic_time(:millisecond) - start_time
+        assert {:error, :failure} =
+                 Retry.with_linear_retry(
+                   fn ->
+                     increment_counter(counter)
+                     {:error, :failure}
+                   end,
+                   max_attempts: 3,
+                   delay: 50
+                 )
 
-      # Should have 2 delays of ~50ms
-      assert duration >= 100
-      assert duration < 200
-      assert get_counter(counter) == 3
+        assert get_counter(counter) == 3
+        assert_receive {:trace, _, :call, {Process, :sleep, [50]}}, 5_000
+        assert_receive {:trace, _, :call, {Process, :sleep, [50]}}, 5_000
+        refute_receive {:trace, _, :call, {Process, :sleep, _}}, 0
+      after
+        :erlang.trace(self(), false, [:call])
+        :erlang.trace_pattern({Process, :sleep, 1}, false, [])
+        send(tracer, :stop)
+      end
     end
   end
 
@@ -344,6 +358,17 @@ defmodule Arbor.MCP.Reliability.RetryTest do
 
   defp get_counter(agent) do
     Agent.get(agent, & &1)
+  end
+
+  defp forward_traces(parent) do
+    receive do
+      :stop ->
+        :ok
+
+      message ->
+        send(parent, message)
+        forward_traces(parent)
+    end
   end
 
   defp reset_counter(agent) do
