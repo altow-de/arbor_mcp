@@ -94,7 +94,7 @@ defmodule Arbor.MCP.Authorization.OAuthFlowTest do
       authorization_endpoint: "https://auth.example.com/authorize"
     }
 
-    for scopes <- [%{}, nil, "tools:read", [123]] do
+    for scopes <- [%{}, nil, "tools:read", [123], ["read" | :bad]] do
       assert {:error, :invalid_scopes} =
                OAuthFlow.start_authorization_flow(Map.put(params, :scopes, scopes))
     end

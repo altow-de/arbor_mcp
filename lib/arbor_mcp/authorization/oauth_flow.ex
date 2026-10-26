@@ -368,11 +368,17 @@ defmodule Arbor.MCP.Authorization.OAuthFlow do
 
   # Private helpers
 
-  defp validate_scope_list(scopes) when is_list(scopes) do
-    if Enum.all?(scopes, &is_binary/1), do: :ok, else: {:error, :invalid_scopes}
+  defp validate_scope_list(scopes) do
+    if proper_list_of_strings?(scopes), do: :ok, else: {:error, :invalid_scopes}
   end
 
-  defp validate_scope_list(_), do: {:error, :invalid_scopes}
+  defp proper_list_of_strings?([]), do: true
+
+  defp proper_list_of_strings?([item | rest]) when is_binary(item) do
+    proper_list_of_strings?(rest)
+  end
+
+  defp proper_list_of_strings?(_other), do: false
 
   defp build_auth_query_params(params, code_challenge, state) do
     base_params = [
@@ -386,7 +392,7 @@ defmodule Arbor.MCP.Authorization.OAuthFlow do
 
     # Add scope if present
     base_params =
-      if params[:scopes] && params.scopes != [] do
+      if proper_list_of_strings?(params[:scopes]) && params.scopes != [] do
         base_params ++ [{"scope", Enum.join(params.scopes, " ")}]
       else
         base_params
