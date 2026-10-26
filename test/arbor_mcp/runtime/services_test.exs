@@ -1,6 +1,11 @@
 defmodule Arbor.MCP.Server.RuntimeServicesTest do
   use ExUnit.Case, async: false
 
+  # How long past its charged cutoff a forced stop may take to return. On a
+  # loaded machine forced stops returned up to 615 ms late; a stop that waits
+  # on the blocked process instead of its budget never returns at all.
+  @stop_return_margin_ms 1_000
+
   alias Arbor.MCP.Server.{HandlerServer, ReplayCache, Runtime, Subscriptions}
 
   alias Arbor.MCP.Server.Runtime.{
@@ -761,10 +766,11 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
 
   defp monitor(pid), do: {pid, Process.monitor(pid)}
 
-  # Stop charges its whole budget once, when it is called, and never outlives
-  # it. It returns :ok only after the observer has confirmed every owned DOWN,
-  # and an unconfirmed cleanup only once that charged cutoff has passed; the
-  # observer still confirms the cleanup (phase 3) and then exits.
+  # Stop charges its whole budget once, when it is called. It returns :ok only
+  # after the observer has confirmed every owned DOWN, and an unconfirmed
+  # cleanup only once that charged cutoff has passed, either way no later than
+  # @stop_return_margin_ms past it. The observer still confirms the cleanup
+  # (phase 3) and then exits.
   defp stop_within_budget(runtime, budget) do
     {:ok, control} = ShutdownControl.lookup(Ref.table(runtime))
     observer = Process.monitor(ShutdownControl.observer(control))
@@ -773,6 +779,7 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
     returned = Deadline.now()
     cutoff = :atomics.get(control.cells, 1)
     assert (cutoff - budget) in called..returned
+    assert returned <= cutoff + @stop_return_margin_ms
 
     case result do
       :ok -> assert :atomics.get(control.cells, 2) == 3
