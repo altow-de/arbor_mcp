@@ -22,9 +22,17 @@ defmodule Arbor.MCP.Transport.HTTP.PostStreamTest do
     end
   end
 
+  defp consumer(parent, max_buffer \\ 1_024) do
+    PostStream.consumer(parent,
+      max_buffer_bytes: max_buffer,
+      max_kept_bytes: 4_096,
+      deadline: System.monotonic_time(:millisecond) + 5_000
+    )
+  end
+
   defp feed(chunks, opts \\ []) do
     parent = Keyword.get_lazy(opts, :parent, &client/0)
-    {acc, fun} = PostStream.consumer(parent, Keyword.get(opts, :max_buffer, 1_024), 4_096)
+    {acc, fun} = consumer(parent, Keyword.get(opts, :max_buffer, 1_024))
 
     Enum.reduce_while(chunks, {:ok, acc}, fn chunk, {:ok, acc} ->
       case fun.(chunk, acc) do
@@ -39,7 +47,7 @@ defmodule Arbor.MCP.Transport.HTTP.PostStreamTest do
   end
 
   test "hands over each message as its event completes and keeps the response" do
-    {acc, fun} = PostStream.consumer(client(), 1_024, 4_096)
+    {acc, fun} = consumer(client())
 
     {:ok, acc} = fun.("data: " <> @progress <> "\n", acc)
     refute_receive {:handed_over, _}, 50
@@ -64,7 +72,7 @@ defmodule Arbor.MCP.Transport.HTTP.PostStreamTest do
   # A server that waits for its ping to be answered sends nothing more.
   test "an event ended by CRs is handed over without waiting for the next chunk" do
     ping = ~s({"jsonrpc":"2.0","id":"p","method":"ping","params":{}})
-    {acc, fun} = PostStream.consumer(client(), 1_024, 4_096)
+    {acc, fun} = consumer(client())
 
     assert {:ok, _acc} = fun.("data: " <> ping <> "\r\r", acc)
     assert_receive {:handed_over, ^ping}

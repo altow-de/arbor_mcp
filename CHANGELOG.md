@@ -187,7 +187,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the stream is now handled as it arrives, so progress reaches
   `handle_progress/3` while the call runs, and the stream's length is no
   longer limited by `:max_response_bytes` (each incomplete event is limited
-  by `:max_stream_buffer_bytes`).
+  by `:max_stream_buffer_bytes`). The SSE parser also reads an `id`,
+  `retry` or `event` field written without a space after the colon, as the
+  format allows; such an event id used to be ignored for resumption.
 - A notification sent before the answer to `initialize` or
   `server/discover`, such as a log message, was taken for the answer, and
   the client failed to connect. It now skips notifications until the answer

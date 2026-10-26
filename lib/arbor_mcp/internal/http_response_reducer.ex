@@ -30,7 +30,16 @@ defmodule Arbor.MCP.Internal.HTTPResponseReducer do
   """
   @type header_check :: (headers(), headers() -> :ok | {:error, term()})
 
-  @type limits :: [max_bytes: pos_integer(), validate_headers: header_check()]
+  @typedoc """
+  `:max_bytes` limits the body. `:max_bytes_for`, when given, decides that
+  limit from the response so far (its status and headers), as for a body
+  its caller consumes as it arrives.
+  """
+  @type limits :: [
+          max_bytes: pos_integer(),
+          max_bytes_for: (acc() -> pos_integer()),
+          validate_headers: header_check()
+        ]
 
   @type result :: {:cont, acc()} | {:done, acc()} | {:error, term()}
 
@@ -48,10 +57,11 @@ defmodule Arbor.MCP.Internal.HTTPResponseReducer do
   @spec reduce([tuple()], Mint.Types.request_ref(), acc(), limits()) :: result()
   def reduce(events, request_ref, acc, limits) do
     max_bytes = Keyword.fetch!(limits, :max_bytes)
+    body_limit = Keyword.get(limits, :max_bytes_for, fn _acc -> max_bytes end)
     validate = Keyword.get(limits, :validate_headers, fn _new, _all -> :ok end)
 
     events
-    |> Enum.reduce_while(acc, &step(&1, request_ref, &2, max_bytes, validate))
+    |> Enum.reduce_while(acc, &step(&1, request_ref, &2, body_limit, validate))
     |> case do
       {:done, _acc} = done -> done
       {:error, _reason} = error -> error
@@ -59,13 +69,13 @@ defmodule Arbor.MCP.Internal.HTTPResponseReducer do
     end
   end
 
-  defp step({:status, ref, status}, ref, acc, _max_bytes, _validate),
+  defp step({:status, ref, status}, ref, acc, _body_limit, _validate),
     do: {:cont, %{acc | status: status}}
 
-  defp step({:status_reason, ref, reason}, ref, acc, _max_bytes, _validate),
+  defp step({:status_reason, ref, reason}, ref, acc, _body_limit, _validate),
     do: {:cont, %{acc | reason: reason}}
 
-  defp step({:headers, ref, headers}, ref, acc, _max_bytes, validate) do
+  defp step({:headers, ref, headers}, ref, acc, _body_limit, validate) do
     headers = normalize_headers(headers)
     all_headers = acc.headers ++ headers
 
@@ -75,18 +85,18 @@ defmodule Arbor.MCP.Internal.HTTPResponseReducer do
     end
   end
 
-  defp step({:data, ref, data}, ref, acc, max_bytes, _validate) do
+  defp step({:data, ref, data}, ref, acc, body_limit, _validate) do
     size = acc.size + byte_size(data)
 
-    if size > max_bytes do
+    if size > body_limit.(acc) do
       {:halt, {:error, :response_too_large}}
     else
       {:cont, %{acc | chunks: [data | acc.chunks], size: size}}
     end
   end
 
-  defp step({:done, ref}, ref, acc, _max_bytes, _validate), do: {:halt, {:done, acc}}
-  defp step(_event, _ref, acc, _max_bytes, _validate), do: {:cont, acc}
+  defp step({:done, ref}, ref, acc, _body_limit, _validate), do: {:halt, {:done, acc}}
+  defp step(_event, _ref, acc, _body_limit, _validate), do: {:cont, acc}
 
   @doc "Joins the accumulated chunks into the response body in arrival order."
   @spec body(acc()) :: binary()

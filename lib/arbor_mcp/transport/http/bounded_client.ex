@@ -5,6 +5,8 @@ defmodule Arbor.MCP.Transport.HTTP.BoundedClient do
   alias Arbor.MCP.Internal.HTTPResponseReducer, as: Reducer
   alias Arbor.MCP.Transport.HTTP.TargetPolicy
 
+  @max_declared_length Integer.pow(2, 62)
+
   @type response :: {
           {charlist(), pos_integer(), charlist()},
           [{String.t(), String.t()}],
@@ -127,8 +129,13 @@ defmodule Arbor.MCP.Transport.HTTP.BoundedClient do
         {:ok, next_conn, request_ref} ->
           deadline = response_deadline(opts)
           max_bytes = Keyword.fetch!(opts, :max_response_bytes)
-          limits = [max_bytes: max_bytes, validate_headers: header_policy(max_bytes)]
           stream = Keyword.get(opts, :event_stream)
+
+          limits = [
+            max_bytes: max_bytes,
+            max_bytes_for: body_limit(max_bytes, stream),
+            validate_headers: header_policy(max_bytes, stream)
+          ]
 
           receive_response(
             next_conn,
@@ -205,20 +212,37 @@ defmodule Arbor.MCP.Transport.HTTP.BoundedClient do
 
   defp finish_stream(response, nil), do: {:ok, response}
 
-  defp event_stream?(%{status: status, headers: headers}) when status in 200..299 do
+  defp event_stream?(%{status: status, headers: headers}) when status in 200..299,
+    do: event_stream_type?(headers)
+
+  defp event_stream?(_response), do: false
+
+  defp event_stream_type?(headers) do
     case List.keyfind(headers, "content-type", 0) do
       {_name, value} -> String.contains?(String.downcase(value), "text/event-stream")
       nil -> false
     end
   end
 
-  defp event_stream?(_response), do: false
-
   # Applied to the accumulated header list, trailers included: compression
   # and conflicting framing are refused, and the strict single-value
   # content-length rule decides the size limit.
-  defp header_policy(max_bytes) do
+  # A streamed event-stream body is limited as it's consumed (each read is
+  # handed to the hook), not by its whole length.
+  defp body_limit(max_bytes, nil), do: fn _response -> max_bytes end
+
+  defp body_limit(max_bytes, _stream) do
+    fn response -> if event_stream?(response), do: @max_declared_length, else: max_bytes end
+  end
+
+  # Nor by the length it declares.
+  defp header_policy(max_bytes, stream) do
     fn _batch, accumulated ->
+      length_limit =
+        if is_nil(stream) or not event_stream_type?(accumulated),
+          do: max_bytes,
+          else: @max_declared_length
+
       cond do
         Reducer.compressed?(accumulated) ->
           {:error, :compressed_response}
@@ -226,7 +250,7 @@ defmodule Arbor.MCP.Transport.HTTP.BoundedClient do
         Reducer.conflicting_framing?(accumulated) ->
           {:error, :invalid_response_framing}
 
-        Reducer.invalid_or_oversized_content_length?(accumulated, max_bytes) ->
+        Reducer.invalid_or_oversized_content_length?(accumulated, length_limit) ->
           {:error, :response_too_large}
 
         true ->

@@ -70,14 +70,16 @@ defmodule Arbor.MCP.Client.HTTPPostStreamEventsTest do
 
     {:ok, client} =
       Client.start_link(
-        transport: :http,
-        url: "http://127.0.0.1:#{bypass.port}/mcp",
-        protocol_mode: :legacy_only,
-        protocol_version: "2025-11-25",
-        use_sse: false,
-        handler: {ProgressHandler, [owner: test]},
-        health_check_interval: nil,
-        reconnect: false
+        [
+          transport: :http,
+          url: "http://127.0.0.1:#{bypass.port}/mcp",
+          protocol_mode: :legacy_only,
+          protocol_version: "2025-11-25",
+          use_sse: false,
+          handler: {ProgressHandler, [owner: test]},
+          health_check_interval: nil,
+          reconnect: false
+        ] ++ Keyword.get(opts, :client, [])
       )
 
     client
@@ -134,10 +136,11 @@ defmodule Arbor.MCP.Client.HTTPPostStreamEventsTest do
       {:ok, conn} = Plug.Conn.chunk(conn, event(first))
       send(test, {:holding, self()})
 
+      # A watchdog well past the test's own timeouts.
       receive do
         :release -> :ok
       after
-        5_000 -> :ok
+        30_000 -> :ok
       end
 
       {:ok, conn} = Plug.Conn.chunk(conn, event(done(id)))
@@ -193,6 +196,24 @@ defmodule Arbor.MCP.Client.HTTPPostStreamEventsTest do
     transport = :sys.get_state(client).transport_state
     assert transport.last_event_id == "e1"
     assert transport.retry_delay == 250
+  end
+
+  # Its declared length is above the limit; what the client keeps isn't.
+  test "a stream of handed-over messages isn't limited by :max_response_bytes" do
+    client =
+      start(
+        fn %{"id" => id}, conn ->
+          body = Enum.map_join(1..40, &event(progress("t1", &1))) <> event(done(id))
+
+          conn
+          |> Plug.Conn.put_resp_content_type("text/event-stream")
+          |> Plug.Conn.resp(200, body)
+        end,
+        client: [max_response_bytes: 2_048]
+      )
+
+    assert {:ok, %{"content" => [%{"text" => "done"}]}} = Task.await(call(client))
+    assert_received {:progress, _request_id, %{"progress" => 40}}
   end
 
   test "a notification ahead of the initialize response doesn't stop the client connecting" do

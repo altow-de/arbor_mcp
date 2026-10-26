@@ -8,29 +8,43 @@ defmodule Arbor.MCP.Transport.HTTP.PostStream do
   # fields of the other events, stay in the body for the transport.
   #
   # The client acknowledges each message before the next is read, as with a
-  # modern request stream, so a fast stream can't fill its mailbox.
+  # modern request stream, so a fast stream can't fill its mailbox. It may
+  # take until the POST's deadline to do so.
 
   alias Arbor.MCP.Client.Lifetime
   alias Arbor.MCP.Internal.SSE
 
-  @ack_timeout 5_000
-
   @type t :: {map(), (binary() | :done, map() -> {:ok, term()} | {:error, term()})}
 
-  @spec consumer(pid(), pos_integer(), pos_integer()) :: t()
-  def consumer(parent, max_buffer_bytes, max_kept_bytes) do
+  @doc false
+  # Options: `:max_buffer_bytes` limits an incomplete event,
+  # `:max_kept_bytes` what's kept for the transport, and `:deadline`
+  # (monotonic milliseconds) how long the client may take to acknowledge.
+  @spec consumer(pid(), keyword()) :: t()
+  def consumer(parent, opts) do
+    limits = %{
+      parent: parent,
+      max_buffer: Keyword.fetch!(opts, :max_buffer_bytes),
+      max_kept: Keyword.fetch!(opts, :max_kept_bytes),
+      deadline: Keyword.fetch!(opts, :deadline)
+    }
+
     acc = %{rest: "", after_cr: false, kept: [], kept_bytes: 0}
-    {acc, &consume(&1, &2, parent, max_buffer_bytes, max_kept_bytes)}
+    {acc, &consume(&1, &2, limits)}
   end
 
-  defp consume(:done, acc, _parent, _max_buffer, _max_kept) do
+  defp consume(:done, acc, limits) do
     blocks = Enum.map(acc.kept, &render/1)
-    {:ok, Enum.join(Enum.reverse([acc.rest | blocks]), "\n\n")}
+    body = Enum.join(Enum.reverse([acc.rest | blocks]), "\n\n")
+
+    if byte_size(body) > limits.max_kept,
+      do: {:error, :response_too_large},
+      else: {:ok, body}
   end
 
-  defp consume("", acc, _parent, _max_buffer, _max_kept), do: {:ok, acc}
+  defp consume("", acc, _limits), do: {:ok, acc}
 
-  defp consume(chunk, acc, parent, max_buffer, max_kept) do
+  defp consume(chunk, acc, limits) do
     # A CR ends a line at once; an LF right after it is the rest of a CRLF.
     chunk =
       case {acc.after_cr, chunk} do
@@ -41,10 +55,10 @@ defmodule Arbor.MCP.Transport.HTTP.PostStream do
     {blocks, rest} = split_blocks(acc.rest <> chunk)
     acc = %{acc | rest: rest, after_cr: String.ends_with?(chunk, "\r")}
 
-    with {:ok, acc} <- take_blocks(blocks, acc, parent) do
+    with {:ok, acc} <- take_blocks(blocks, acc, limits) do
       cond do
-        byte_size(rest) > max_buffer -> {:error, :stream_buffer_limit_exceeded}
-        acc.kept_bytes > max_kept -> {:error, :response_too_large}
+        byte_size(rest) > limits.max_buffer -> {:error, :stream_buffer_limit_exceeded}
+        acc.kept_bytes > limits.max_kept -> {:error, :response_too_large}
         true -> {:ok, acc}
       end
     end
@@ -61,21 +75,21 @@ defmodule Arbor.MCP.Transport.HTTP.PostStream do
     {complete, rest}
   end
 
-  defp take_blocks(blocks, acc, parent) do
+  defp take_blocks(blocks, acc, limits) do
     Enum.reduce_while(blocks, {:ok, acc}, fn block, {:ok, acc} ->
-      case take_block(block, acc, parent) do
+      case take_block(block, acc, limits) do
         {:ok, acc} -> {:cont, {:ok, acc}}
         error -> {:halt, error}
       end
     end)
   end
 
-  defp take_block(block, acc, parent) do
+  defp take_block(block, acc, limits) do
     case SSE.parse_complete(block) do
       [%{data: data}] when data != "" ->
         case Jason.decode(data) do
           {:ok, %{"method" => method}} when is_binary(method) ->
-            with :ok <- deliver(parent, data), do: {:ok, keep_metadata(acc, metadata(block))}
+            with :ok <- deliver(data, limits), do: {:ok, keep_metadata(acc, metadata(block))}
 
           _response_or_invalid ->
             {:ok, keep(acc, block)}
@@ -87,7 +101,7 @@ defmodule Arbor.MCP.Transport.HTTP.PostStream do
     end
   end
 
-  defp deliver(parent, data) do
+  defp deliver(data, %{parent: parent, deadline: deadline}) do
     ref = make_ref()
     monitor = Process.monitor(parent)
     Lifetime.deliver(parent, {:http_post_stream_message, self(), ref, data})
@@ -100,7 +114,7 @@ defmodule Arbor.MCP.Transport.HTTP.PostStream do
       {:DOWN, ^monitor, :process, _pid, _reason} ->
         {:error, :stream_consumer_closed}
     after
-      @ack_timeout ->
+      max(deadline - System.monotonic_time(:millisecond), 0) ->
         Process.demonitor(monitor, [:flush])
         {:error, :stream_consumer_timeout}
     end

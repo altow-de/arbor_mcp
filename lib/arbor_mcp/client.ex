@@ -1870,12 +1870,12 @@ defmodule Arbor.MCP.Client do
   end
 
   # A notification or request on a legacy POST's event stream (see
-  # Arbor.MCP.Transport.HTTP.PostStream). The stream reads its next event
-  # once this one is handled.
+  # Arbor.MCP.Transport.HTTP.PostStream). Acknowledged on receipt, so a slow
+  # handler doesn't hold up the stream, and at most one more message from it
+  # waits here meanwhile.
   def handle_info({:http_post_stream_message, task, ref, message}, state) do
-    result = RequestHandler.parse_transport_message(message, state)
     send(task, {:http_post_stream_ack, ref})
-    result
+    RequestHandler.parse_transport_message(message, state)
   end
 
   def handle_info(
