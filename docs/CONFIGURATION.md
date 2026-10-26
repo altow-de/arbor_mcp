@@ -987,6 +987,33 @@ The resource server authenticates to introspection with
 issuer, audience/resource, `exp`, and optional `nbf` satisfy this configuration.
 Only migration deployments should use `legacy_unbound_tokens: true`.
 
+When the authorization server issues JWT access tokens (RFC 9068), the server
+can check them locally against its published keys instead of introspecting
+each one:
+
+```elixir
+auth_config: %{
+  jwks_uri: "https://auth.example.com/.well-known/jwks.json",
+  expected_issuer: "https://auth.example.com",
+  expected_audience: "https://mcp.example.com/mcp"
+}
+```
+
+`Arbor.MCP.Authorization.JWTVerifier` checks the signature with an asymmetric
+algorithm (RSA, RSA-PSS or ECDSA; never `none` or a shared secret) and a `typ`
+of `at+jwt` or `JWT`; the guard then checks the issuer, audience, `exp`, `nbf`
+and scopes as for an introspected token, reading a `scp` claim as the scopes.
+The key set is fetched through the same hardened client as OAuth metadata,
+kept for ten minutes, and fetched again for a token signed with a key it
+lacks, at most once a minute; if fetching fails, the last set is used for up
+to an hour. Tune these, or require `typ: at+jwt`, under `:jwt`, for example
+`jwt: [require_at_jwt_typ: true, jwks_cache_ttl_ms: 300_000]`.
+
+Any other check plugs in as an `Arbor.MCP.Authorization.TokenVerifier`, as with
+the TypeScript SDK's `OAuthTokenVerifier`: `token_verifier: {MyApp.Verifier,
+opts}`. Either way the issuer and audience/resource must be configured, and
+the client credentials for introspection aren't needed.
+
 ### Session storage
 
 HTTP Runtimes that support legacy sessions create their own session service.

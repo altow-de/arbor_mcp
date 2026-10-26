@@ -9,7 +9,10 @@ defmodule Arbor.MCP.Authorization.ServerGuard do
   ## Features
 
   - Extracts bearer tokens from the `Authorization` header.
-  - Validates tokens using OAuth 2.0 Token Introspection (RFC 7662).
+  - Validates tokens using OAuth 2.0 Token Introspection (RFC 7662), or
+    locally: JWT access tokens against the authorization server's JWKS
+    (`:jwks_uri`, see `Arbor.MCP.Authorization.JWTVerifier`), or with any
+    `Arbor.MCP.Authorization.TokenVerifier` (`:token_verifier`).
   - Authenticates the resource server to the introspection endpoint.
   - Binds active tokens to the configured issuer and audience/resource.
   - Enforces `exp` and `nbf` NumericDate claims with bounded clock skew.
@@ -48,14 +51,17 @@ defmodule Arbor.MCP.Authorization.ServerGuard do
   """
 
   alias Arbor.MCP.Authorization
-  alias Arbor.MCP.Authorization.{ScopeValidator, Validator}
+  alias Arbor.MCP.Authorization.{JWTVerifier, ScopeValidator, Validator}
   alias Arbor.MCP.FeatureFlags
   alias Arbor.MCP.Internal.Headers
 
   @type auth_config :: %{
-          required(:introspection_endpoint) => String.t(),
-          required(:client_id) => String.t(),
-          required(:client_secret) => String.t(),
+          optional(:introspection_endpoint) => String.t(),
+          optional(:client_id) => String.t(),
+          optional(:client_secret) => String.t(),
+          optional(:jwks_uri) => String.t(),
+          optional(:jwt) => keyword(),
+          optional(:token_verifier) => {module(), keyword()},
           required(:expected_issuer) => String.t(),
           optional(:expected_audience) => String.t() | [String.t()],
           optional(:expected_resource) => String.t() | [String.t()],
@@ -214,6 +220,23 @@ defmodule Arbor.MCP.Authorization.ServerGuard do
     end
   end
 
+  # Checked locally, by a verifier: there's no introspection client to
+  # authenticate, and the token is always bound to the issuer and audience.
+  defp validate_config(%{} = config) when not is_map_key(config, :introspection_endpoint) do
+    with {:ok, {module, _opts}} <- verifier(config),
+         true <-
+           Code.ensure_loaded?(module) and function_exported?(module, :verify_access_token, 2),
+         :ok <- validate_jwks_uri(Map.get(config, :jwks_uri)),
+         :ok <- validate_realm(Map.get(config, :realm)),
+         :ok <- validate_clock_skew(Map.get(config, :clock_skew_seconds, 30)),
+         :ok <- non_empty_string(Map.get(config, :expected_issuer)),
+         :ok <- validate_expected_targets(config) do
+      :ok
+    else
+      _invalid -> {:error, :invalid_auth_config}
+    end
+  end
+
   defp validate_config(%{introspection_endpoint: endpoint} = config) when is_binary(endpoint) do
     with :ok <- Validator.validate_https_endpoint(endpoint),
          :ok <- validate_realm(Map.get(config, :realm)),
@@ -229,6 +252,25 @@ defmodule Arbor.MCP.Authorization.ServerGuard do
   defp validate_config(_) do
     {:error, :invalid_auth_config}
   end
+
+  defp verifier(%{token_verifier: {module, opts}}) when is_atom(module) and is_list(opts),
+    do: {:ok, {module, opts}}
+
+  defp verifier(%{jwks_uri: uri} = config) when is_binary(uri) do
+    opts =
+      config
+      |> Map.get(:jwt, [])
+      |> Keyword.put(:jwks_uri, uri)
+      |> Keyword.put_new(:oauth_http, secure_http_options(config))
+
+    {:ok, {JWTVerifier, opts}}
+  end
+
+  defp verifier(_config), do: :error
+
+  defp validate_jwks_uri(nil), do: :ok
+  defp validate_jwks_uri(uri) when is_binary(uri), do: Validator.validate_https_endpoint(uri)
+  defp validate_jwks_uri(_uri), do: {:error, :invalid_auth_config}
 
   defp validate_bound_config(config) do
     auth_method = Map.get(config, :introspection_auth_method, :client_secret_basic)
@@ -281,6 +323,24 @@ defmodule Arbor.MCP.Authorization.ServerGuard do
 
       _ ->
         {:error, :missing_token}
+    end
+  end
+
+  defp validate_token(token, config) when not is_map_key(config, :introspection_endpoint) do
+    {:ok, {module, opts}} = verifier(config)
+
+    case module.verify_access_token(token, opts) do
+      {:ok, %{} = claims} ->
+        {:ok, claims}
+
+      {:error, :invalid_token} ->
+        {:error, :invalid_token, "The access token is invalid."}
+
+      {:error, reason} ->
+        {:error, :token_validation_failed, reason}
+
+      _other ->
+        {:error, :token_validation_failed, :invalid_verifier_result}
     end
   end
 
