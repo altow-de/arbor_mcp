@@ -364,15 +364,18 @@ defmodule Arbor.MCP.Client.Internal.Request do
     min(total, cap || total)
   end
 
-  # Progress is only sent for a request that carries a token.
+  # Progress is only sent for a request that carries a token. A token given
+  # under an atom key (`meta: %{progressToken: ...}`) is kept, under the
+  # string key the client tracks it by.
   defp ensure_progress_token(params) when is_map(params) do
-    if get_in(params, ["_meta", "progressToken"]) do
-      params
-    else
-      token = "progress-" <> Integer.to_string(System.unique_integer([:positive]))
-      meta = params |> Map.get("_meta", %{}) |> Map.put("progressToken", token)
-      Map.put(params, "_meta", meta)
-    end
+    meta = Map.get(params, "_meta") || %{}
+
+    token =
+      Map.get(meta, "progressToken") || Map.get(meta, :progressToken) ||
+        "progress-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    meta = meta |> Map.delete(:progressToken) |> Map.put("progressToken", token)
+    Map.put(params, "_meta", meta)
   end
 
   defp ensure_progress_token(params), do: params

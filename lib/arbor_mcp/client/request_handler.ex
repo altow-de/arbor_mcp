@@ -593,10 +593,22 @@ defmodule Arbor.MCP.Client.RequestHandler do
   # progress update starts that again. Its deadline still caps it. The tag
   # tells the current timer from one a reset replaced.
   defp start_progress_timeout(id, %{progress_timeout: ms}, state)
-       when is_integer(ms) and ms > 0 do
+       when is_integer(ms) and ms >= 0 do
     tag = make_ref()
     timer = Process.send_after(self(), {:progress_timeout, id, tag}, ms)
-    Map.put(state, :progress_timeouts, Map.put(progress_timeouts(state), id, {timer, tag, ms}))
+
+    # Settled requests' timers are dropped here too, so the map never holds
+    # more than the pending requests that asked for one.
+    {timers, settled} =
+      Map.split_with(progress_timeouts(state), fn {request_id, _timer} ->
+        Map.has_key?(state.pending_requests, request_id)
+      end)
+
+    Enum.each(settled, fn {_request_id, {old_timer, _tag, _ms}} ->
+      Process.cancel_timer(old_timer)
+    end)
+
+    Map.put(state, :progress_timeouts, Map.put(timers, id, {timer, tag, ms}))
   end
 
   defp start_progress_timeout(_id, _meta, state), do: state
@@ -628,6 +640,17 @@ defmodule Arbor.MCP.Client.RequestHandler do
   end
 
   defp progress_timeouts(state), do: Map.get(state, :progress_timeouts) || %{}
+
+  defp cancel_progress_timeout(state, request_id) do
+    case Map.pop(progress_timeouts(state), request_id) do
+      {{timer, _tag, _ms}, timers} ->
+        Process.cancel_timer(timer)
+        Map.put(state, :progress_timeouts, timers)
+
+      {nil, _timers} ->
+        state
+    end
+  end
 
   @doc """
   Handles batch MCP requests.
@@ -1101,6 +1124,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
           %{state | pending_requests: new_pending_requests}
           |> remember_tool_schemas(method, response_id, response_data)
+          |> cancel_progress_timeout(response_id)
 
         {:ok, {from, :single}} ->
           :telemetry.execute(

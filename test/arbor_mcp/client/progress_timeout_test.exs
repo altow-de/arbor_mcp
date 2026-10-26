@@ -34,7 +34,8 @@ defmodule Arbor.MCP.Client.ProgressTimeoutTest do
       end
 
       Process.sleep(Map.get(args, "then", 0))
-      {:ok, %{content: [%{type: "text", text: "done"}]}, state}
+      text = if args["echo_token"], do: Context.progress_token(), else: "done"
+      {:ok, %{content: [%{type: "text", text: text}]}, state}
     end
   end
 
@@ -105,6 +106,35 @@ defmodule Arbor.MCP.Client.ProgressTimeoutTest do
              work(client, %{"every" => 50, "then" => 3_000}, reset_timeout_on_progress: true)
 
     assert System.monotonic_time(:millisecond) - started < 2_000
+  end
+
+  test "a zero timeout times out at once" do
+    client = client(:legacy_only)
+
+    assert {:error, :timeout} =
+             work(client, %{"every" => 1_000}, timeout: 0, reset_timeout_on_progress: true)
+  end
+
+  test "a settled request leaves no timer behind" do
+    client = client(:legacy_only)
+
+    assert {:ok, _} =
+             work(client, %{"every" => 10}, timeout: 60_000, reset_timeout_on_progress: true)
+
+    assert :sys.get_state(client).progress_timeouts == %{}
+  end
+
+  # The server reports against the token the call gave, so it must be the
+  # one the client tracks, not a second one it generated.
+  test "a token given under an atom key is the one tracked" do
+    client = client(:legacy_only)
+
+    assert {:ok, %{"content" => [%{"text" => "job-1"}]}} =
+             work(client, %{"steps" => 6, "every" => 100, "echo_token" => true},
+               timeout: 400,
+               reset_timeout_on_progress: true,
+               meta: %{progressToken: "job-1"}
+             )
   end
 
   test "invalid options are refused before anything is sent" do
