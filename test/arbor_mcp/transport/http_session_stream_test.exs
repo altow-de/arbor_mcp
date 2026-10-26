@@ -1,10 +1,11 @@
 defmodule Arbor.MCP.Transport.HTTPSessionStreamTest do
   # The legacy Streamable HTTP session GET stream on the client side: the SSE
   # client hands each event to whichever process reads the stream, and the
-  # HTTP transport's reader skips events that aren't MCP messages and outlives
-  # the stream closing.
+  # HTTP transport's reader skips events that aren't MCP messages, outlives
+  # the stream closing, and stops when the server no longer offers it.
   use ExUnit.Case, async: true
 
+  alias Arbor.MCP.Client.ConnectionManager
   alias Arbor.MCP.Transport.{HTTP, SSEClient}
 
   describe "SSEClient consumer" do
@@ -82,6 +83,36 @@ defmodule Arbor.MCP.Transport.HTTPSessionStreamTest do
     test "still ends on a stream error", %{state: state, sse: sse} do
       send(self(), {:sse_error, sse, {:http_error, 404}})
       assert {:error, {:sse_error, {:http_error, 404}}} = HTTP.receive_message(state)
+    end
+
+    # A 405 for the reopened GET: the SSE client gives up, so the reader must
+    # stop rather than wait for events that won't come.
+    test "stops when the server no longer offers the stream", %{state: state, sse: sse} do
+      reader =
+        Task.async(fn ->
+          receive do
+            :read -> HTTP.receive_message(state)
+          end
+        end)
+
+      send(reader.pid, {:sse_closed, sse})
+      send(reader.pid, {:sse_not_supported, sse})
+      send(reader.pid, :read)
+
+      assert {:ok, {:error, :stream_withdrawn}} =
+               Task.yield(reader, 1_000) || Task.shutdown(reader, :brutal_kill)
+    end
+  end
+
+  describe "ConnectionManager.receive_loop/3" do
+    defmodule WithdrawnTransport do
+      def receive_message(:withdrawn), do: {:error, :stream_withdrawn}
+    end
+
+    test "ends without closing the connection when its stream is withdrawn" do
+      assert :ok = ConnectionManager.receive_loop(self(), WithdrawnTransport, :withdrawn)
+      assert_received {:transport_receiver_stopped, reader} when reader == self()
+      refute_received {:transport_closed, _reason}
     end
   end
 

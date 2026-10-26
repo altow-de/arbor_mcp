@@ -107,7 +107,8 @@ session's; with no GET stream open they return `{:error, :stream_closed}`. A
 list change sent outside a callback reaches only modern `subscriptions/listen`
 streams, not legacy sessions. The server closes a GET stream at the Runtime's
 `:request_timeout_ms`; the client keeps its session and opens the stream again
-with `Last-Event-ID`.
+with `Last-Event-ID`. A server that answers that GET with 405 no longer offers
+the stream, and the client carries on POST-only.
 
 ```elixir
 {:ok, client} =

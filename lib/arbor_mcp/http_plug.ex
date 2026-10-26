@@ -114,7 +114,8 @@ defmodule Arbor.MCP.HttpPlug do
   decides, and the legacy `:arbor_mcp, :test_mode` flag makes it `:oneshot`;
   pass `sse_mode: :stream` to a test listener whose clients read the GET
   stream. A `:stream` GET lasts until the Runtime's `:request_timeout_ms`, and
-  an ArborMCP client then opens it again with `Last-Event-ID`.
+  an ArborMCP client then opens it again with `Last-Event-ID`; if that GET is
+  refused with 405, the client carries on POST-only.
 
   In the legacy Streamable HTTP revisions, a request that carries
   `_meta.progressToken`, from a client whose `Accept` header allows

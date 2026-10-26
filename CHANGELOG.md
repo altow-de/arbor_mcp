@@ -21,7 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unparseable, and keeps its session when the server closes the GET stream,
   which an ArborMCP server does at its `:request_timeout_ms`: it opens the
   stream again with `Last-Event-ID`, where it used to reconnect, start a new
-  session and fail every pending request.
+  session and fail every pending request. If the server answers the reopened
+  GET with 405, it no longer offers the stream, and the client carries on
+  POST-only, as with a server that never offered one.
 - An ArborMCP server answered every legacy Streamable HTTP request with JSON,
   so a request's progress could only travel on the session's GET stream, and
   `Context.report_progress/3` and `Server.notify_progress/4` returned
