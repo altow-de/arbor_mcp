@@ -119,6 +119,23 @@ defmodule Arbor.MCP.Server.MRTR do
     end
   end
 
+  @doc false
+  # Validates a handler's input requests for a legacy client, which gets
+  # them as server-to-client requests rather than an input_required result.
+  @spec legacy_input_requests(RequestContext.t(), map(), keyword()) ::
+          {:ok, map()} | {:error, Error.ProtocolError.t()}
+  def legacy_input_requests(%RequestContext{method: method}, input_requests, opts) do
+    if method in @supported_methods do
+      with {:ok, requests} <- normalize_input_requests(input_requests),
+           :ok <- validate_request_count(requests, opts),
+           :ok <- validate_size(requests, opts),
+           do: {:ok, requests}
+    else
+      {:error,
+       invalid("input_required is only valid for tools/call, resources/read, and prompts/get")}
+    end
+  end
+
   @spec build_result(RequestContext.t(), map(), map(), term(), keyword()) ::
           {:ok, map()} | {:error, Error.ProtocolError.t()}
   def build_result(context, params, input_requests, application_state, opts \\ []) do
