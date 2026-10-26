@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The client keeps results the server marks fresh, as the TypeScript SDK's
+  client does: each `tools/list`, `prompts/list`, `resources/list` and
+  `resources/templates/list` page and each `resources/read` is answered from
+  the cache for its `ttlMs` (at most a day). `list_changed` and
+  `resources/updated` notifications drop what they make stale, including a
+  request still in flight, and reconnecting clears it. Per call,
+  `cache_mode: :refresh` or `:bypass` skips it; `response_cache: false` turns
+  it off, and `:default_cache_ttl_ms` keeps results that carry no `ttlMs`.
+- Servers take `:cache_hints`, per method, for the `ttlMs` and `cacheScope` of
+  cacheable results a handler doesn't set, such as the lists, as the
+  TypeScript SDK's `cacheHints` option does. A `resources/read` handler may
+  also return the whole result, with its own hints, instead of just the
+  contents.
 - `Client.call_tool/4` checks a result against the tool's `outputSchema`, as
   the TypeScript and Python SDKs do. Once `list_tools/2` has shown a tool
   with one, a successful result must carry `structuredContent` that

@@ -174,6 +174,7 @@ defmodule Arbor.MCP.Client.Internal.Convenience do
       extra_keys ++
         [
           :timeout,
+          :cache_mode,
           :format,
           :http_stream_retry,
           :http_stream_retry_delay,

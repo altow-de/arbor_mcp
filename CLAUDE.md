@@ -266,6 +266,9 @@ The client stack emits telemetry such as:
 [:arbor_mcp, :client, :receiver, :started]
 [:arbor_mcp, :client, :receiver, :message]
 
+# Response cache
+[:arbor_mcp, :client, :cache, :hit]
+
 # Reconnection
 [:arbor_mcp, :client, :reconnect, :attempt]
 [:arbor_mcp, :client, :reconnect, :success]

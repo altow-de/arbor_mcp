@@ -43,17 +43,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
         ) ::
           {:ok, any()} | {:error, any()}
   def make_request(client, method, params, opts, default_timeout, deadline_cap \\ nil) do
-    case Keyword.get(opts, :format, :struct) do
-      format when format in [:map, :struct] -> :ok
-      _invalid -> raise ArgumentError, "format must be :map or :struct"
-    end
-
-    case Keyword.fetch(opts, :timeout) do
-      :error -> :ok
-      {:ok, timeout} when is_integer(timeout) and timeout >= 0 and timeout <= 4_294_967_295 -> :ok
-      _invalid -> raise ArgumentError, "timeout must be a finite non-negative millisecond value"
-    end
-
+    validate_options!(opts)
     stream_retry_mode = Keyword.get(opts, :http_stream_retry, :at_least_once)
 
     case validate_http_stream_retry_mode(client, stream_retry_mode) do
@@ -70,6 +60,24 @@ defmodule Arbor.MCP.Client.Internal.Request do
 
       {:error, _reason} = error ->
         handle_request_result(error, opts)
+    end
+  end
+
+  defp validate_options!(opts) do
+    case Keyword.get(opts, :format, :struct) do
+      format when format in [:map, :struct] -> :ok
+      _invalid -> raise ArgumentError, "format must be :map or :struct"
+    end
+
+    case Keyword.get(opts, :cache_mode, :use) do
+      mode when mode in [:use, :refresh, :bypass] -> :ok
+      _invalid -> raise ArgumentError, "cache_mode must be :use, :refresh or :bypass"
+    end
+
+    case Keyword.fetch(opts, :timeout) do
+      :error -> :ok
+      {:ok, timeout} when is_integer(timeout) and timeout >= 0 and timeout <= 4_294_967_295 -> :ok
+      _invalid -> raise ArgumentError, "timeout must be a finite non-negative millisecond value"
     end
   end
 
@@ -95,7 +103,8 @@ defmodule Arbor.MCP.Client.Internal.Request do
         control = %{
           deadline: deadline,
           scope_ref: scope_ref,
-          stream_retry_mode: stream_retry_mode
+          stream_retry_mode: stream_retry_mode,
+          cache_mode: Keyword.get(opts, :cache_mode, :use)
         }
 
         do_mrtr_request(
@@ -109,13 +118,14 @@ defmodule Arbor.MCP.Client.Internal.Request do
           control
         )
       else
-        first_operation = fn -> request_once(client, method, params, nil) end
+        cache_mode = Keyword.get(opts, :cache_mode, :use)
+        first_operation = fn -> request_once(client, method, params, nil, cache_mode) end
 
         retry_operation = fn ->
           deadline = started_at + fetch_default_timeout(client, default_timeout)
 
           with {:ok, remaining} <- remaining_timeout(deadline) do
-            request_once(client, method, params, remaining)
+            request_once(client, method, params, remaining, cache_mode)
           end
         end
 
@@ -136,7 +146,8 @@ defmodule Arbor.MCP.Client.Internal.Request do
               control = %{
                 deadline: deadline,
                 scope_ref: scope_ref,
-                stream_retry_mode: stream_retry_mode
+                stream_retry_mode: stream_retry_mode,
+                cache_mode: cache_mode
               }
 
               continue_mrtr(
@@ -176,7 +187,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
        ) do
     operation = fn ->
       with {:ok, remaining} <- remaining_timeout(control.deadline) do
-        request_before(client, method, round_params, remaining, control.deadline)
+        request_before(client, method, round_params, remaining, control)
       end
     end
 
@@ -297,24 +308,22 @@ defmodule Arbor.MCP.Client.Internal.Request do
 
   # The absolute deadline travels with the request so the client does not
   # send it after the caller has given up (see RequestHandler.handle_request/5).
-  defp request_once(client, method, params, timeout) when is_integer(timeout) do
+  defp request_once(client, method, params, timeout, cache_mode) when is_integer(timeout) do
     deadline = System.monotonic_time(:millisecond) + timeout
-    meta = %{timeout: timeout, deadline: deadline}
+    meta = %{timeout: timeout, deadline: deadline, cache_mode: cache_mode}
     GenServer.call(client, {:request, method, params, meta}, timeout)
   catch
     :exit, {:timeout, _} -> {:error, :timeout}
   end
 
-  defp request_once(client, method, params, nil) do
-    GenServer.call(client, {:request, method, params, %{timeout: nil}}, :infinity)
+  defp request_once(client, method, params, nil, cache_mode) do
+    meta = %{timeout: nil, cache_mode: cache_mode}
+    GenServer.call(client, {:request, method, params, meta}, :infinity)
   end
 
-  defp request_before(client, method, params, timeout, deadline) do
-    GenServer.call(
-      client,
-      {:request, method, params, %{timeout: timeout, deadline: deadline}},
-      timeout
-    )
+  defp request_before(client, method, params, timeout, control) do
+    meta = %{timeout: timeout, deadline: control.deadline, cache_mode: control.cache_mode}
+    GenServer.call(client, {:request, method, params, meta}, timeout)
   catch
     :exit, {:timeout, _call} -> {:error, :timeout}
   end

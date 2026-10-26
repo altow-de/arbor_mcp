@@ -8,7 +8,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
   require Logger
   alias Arbor.MCP.Client.{ConnectionScope, Lifetime}
-  alias Arbor.MCP.Client.{Deadline, InputDispatcher, MRTR, NotificationListener}
+  alias Arbor.MCP.Client.{Deadline, InputDispatcher, MRTR, NotificationListener, ResponseCache}
   alias Arbor.MCP.Error
   alias Arbor.MCP.Internal.{Maps, Protocol, RequestParams, VersionRegistry}
   alias Arbor.RPC.{JSONRPC, LogSummary}
@@ -47,13 +47,52 @@ defmodule Arbor.MCP.Client.RequestHandler do
   def handle_request(method, params, from, state, meta \\ %{timeout: :caller_enforced}) do
     case undeliverable(from, meta) do
       nil ->
-        id = Protocol.generate_id()
-        send_built_request(method, params, id, from, state, meta)
+        case cached_result(method, params, meta, state) do
+          {:ok, result} ->
+            {:reply, {:ok, result}, state}
+
+          :miss ->
+            id = Protocol.generate_id()
+            send_built_request(method, params, id, from, state, meta)
+        end
 
       cause ->
         {:reply, {:error, not_sent_error(cause, state)}, state}
     end
   end
+
+  # A result the server said is still fresh is answered without asking it
+  # again (see ResponseCache), unless the call asked to refresh or bypass it.
+  defp cached_result(method, params, meta, state) do
+    with :use <- Map.get(meta, :cache_mode, :use),
+         %ResponseCache{} = cache <- Map.get(state, :response_cache),
+         {:ok, result} <- ResponseCache.lookup(cache, ResponseCache.key(method, params), now()) do
+      :telemetry.execute([:arbor_mcp, :client, :cache, :hit], %{}, %{method: method})
+      {:ok, result}
+    else
+      _miss_or_not_used -> :miss
+    end
+  end
+
+  # Remembers what a cacheable request in flight will answer.
+  defp track_cacheable(state, id, request, meta) do
+    case {Map.get(meta, :cache_mode, :use), Map.get(state, :response_cache)} do
+      {mode, %ResponseCache{} = cache} when mode != :bypass ->
+        key = ResponseCache.key(request["method"], request["params"])
+        pending? = &Map.has_key?(state.pending_requests, &1)
+        %{state | response_cache: ResponseCache.track(cache, id, key, pending?)}
+
+      _bypassed_or_none ->
+        state
+    end
+  end
+
+  defp cache_result(%{response_cache: %ResponseCache{} = cache} = state, id, reply),
+    do: %{state | response_cache: ResponseCache.store(cache, id, reply, now())}
+
+  defp cache_result(state, _id, _reply), do: state
+
+  defp now, do: System.monotonic_time(:millisecond)
 
   # Liveness and monotonic time are only comparable on the caller's own node.
   defp undeliverable({caller, _tag}, meta) when is_pid(caller) and node(caller) == node() do
@@ -267,11 +306,13 @@ defmodule Arbor.MCP.Client.RequestHandler do
     case result do
       {:ok, updated_state, response_data} ->
         # Non-SSE HTTP returns response immediately
+        updated_state = track_cacheable(updated_state, id, request, meta)
         inline_request_response(response_data, method, id, updated_state)
 
       {:ok, updated_state} ->
         # SSE and streaming transports - track pending request
         maybe_schedule_request_timeout(id, meta, updated_state)
+        updated_state = track_cacheable(updated_state, id, request, meta)
         pending_requests = Map.put(updated_state.pending_requests, id, {from, :single, method})
         new_state = %{updated_state | pending_requests: pending_requests}
         {:noreply, remember_progress_token(request, id, new_state)}
@@ -324,6 +365,8 @@ defmodule Arbor.MCP.Client.RequestHandler do
           if match?({:ok, _result}, reply),
             do: remember_tool_schemas(updated_state, method, id, reply),
             else: updated_state
+
+        updated_state = cache_result(updated_state, id, reply)
 
         {:reply, reply, updated_state}
 
@@ -1053,6 +1096,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
           %{state | pending_requests: new_pending_requests}
           |> remember_tool_schemas(method, response_id, response_data)
+          |> cache_result(response_id, response_data)
 
         {:ok, {from, :single}} ->
           :telemetry.execute(
@@ -1089,7 +1133,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
               "notifications/resources/list_changed",
               "notifications/resources/updated"
             ],
-       do: route_change_notification(method, params, forget_tool_schemas(state, method))
+       do: route_change_notification(method, params, forget_changed(state, method, params))
 
   defp route_notification("notifications/tasks" = method, params, state),
     do: route_task_subscription_event(method, params, state)
@@ -1195,6 +1239,18 @@ defmodule Arbor.MCP.Client.RequestHandler do
   # In-process transports deliver maps that may still have atom keys.
   defp field(%{} = map, key, atom), do: Map.get(map, key) || Map.get(map, atom)
   defp field(_other, _key, _atom), do: nil
+
+  defp forget_changed(state, method, params) do
+    state = forget_tool_schemas(state, method)
+
+    case Map.get(state, :response_cache) do
+      %ResponseCache{} = cache ->
+        %{state | response_cache: ResponseCache.invalidate(cache, method, params)}
+
+      nil ->
+        state
+    end
+  end
 
   # A changed tool list may change a schema; validate again once relisted.
   defp forget_tool_schemas(state, "notifications/tools/list_changed"),

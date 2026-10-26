@@ -53,6 +53,7 @@ defmodule Arbor.MCP.Client do
     NotificationListener,
     Pagination,
     RequestHandler,
+    ResponseCache,
     Subscription
   }
 
@@ -120,6 +121,8 @@ defmodule Arbor.MCP.Client do
     # Each listed tool's outputSchema, from the tools/list results this client
     # has seen, so call_tool/4 can check structuredContent against it.
     tool_output_schemas: %{},
+    # Results the server marked fresh for a while (see ResponseCache).
+    response_cache: nil,
     # Linked processes of a transport (or receiver) this client has since
     # dropped, and that were still alive when it did. Their exit signals are
     # expected and are ignored rather than read as a foreign link's exit.
@@ -204,6 +207,10 @@ defmodule Arbor.MCP.Client do
     `baggage` values to attach to modern requests.
   - `:health_check_interval` - Interval in milliseconds between idle health
     check pings (default: 30_000). Set to `nil` or `0` to disable.
+  - `:response_cache` - Keep results the server marks fresh (see "Response
+    cache" below; default: `true`)
+  - `:default_cache_ttl_ms` - How long to keep a cacheable result that carries
+    no `ttlMs` (default: `0`, not kept)
   - `:reliability` - Reliability features configuration (optional)
   - `:retry_policy` - Default retry policy for all client operations (optional)
   - `:reconnect` - Automatically reconnect when the transport closes
@@ -227,6 +234,23 @@ defmodule Arbor.MCP.Client do
 
   Explicit `disconnect/1` or `stop/2` calls never trigger reconnection.
   Passing `reconnect: false` disables the behavior entirely.
+
+  ## Response cache
+
+  Like the TypeScript SDK's client, the client keeps each `tools/list`,
+  `prompts/list`, `resources/list` and `resources/templates/list` page (by
+  cursor) and each `resources/read` (by URI) for as long as its `ttlMs` says
+  it stays fresh (2026-07-28 "Caching"), at most a day, and answers a repeat
+  request from it. A result without `ttlMs`, as from a legacy server, is kept
+  for `:default_cache_ttl_ms`. A `list_changed` notification drops the lists
+  it names and a `resources/updated` notification drops that resource, even
+  while a request for them is in flight; reconnecting drops everything. The
+  cache holds at most 512 results and belongs to one client, so a
+  `cacheScope: "private"` result is never shared.
+
+  Pass `cache_mode: :refresh` to ask the server again and keep the new
+  result, or `cache_mode: :bypass` to ask without using or changing the
+  cache. A cache hit emits `[:arbor_mcp, :client, :cache, :hit]`.
 
   ## Health Checks
 
@@ -498,6 +522,8 @@ defmodule Arbor.MCP.Client do
 
   - `:timeout` - Request timeout (default: 5000)
   - `:format` - Return format (:map or :struct, default: :struct)
+  - `:cache_mode` - `:use`, `:refresh` or `:bypass` (see "Response cache"
+    in the module docs; default: `:use`)
   """
   @spec list_tools(t(), keyword() | timeout()) ::
           {:ok, Arbor.MCP.Response.t() | map()} | {:error, term()}
@@ -653,7 +679,7 @@ defmodule Arbor.MCP.Client do
   end
 
   @doc """
-  Lists available resources.
+  Lists available resources. Takes `:cache_mode`, as `list_tools/2` does.
   """
   @spec list_resources(t(), keyword() | timeout()) ::
           {:ok, Arbor.MCP.Response.t() | map()} | {:error, term()}
@@ -695,7 +721,7 @@ defmodule Arbor.MCP.Client do
   Lists available resource templates.
 
   Sends a `resources/templates/list` request to the server to retrieve the list of
-  available resource templates.
+  available resource templates. Takes `:cache_mode`, as `list_tools/2` does.
   """
   @spec list_resource_templates(t(), keyword() | timeout()) ::
           {:ok, Arbor.MCP.Response.t() | map()} | {:error, term()}
@@ -711,7 +737,7 @@ defmodule Arbor.MCP.Client do
   end
 
   @doc """
-  Reads a resource by URI.
+  Reads a resource by URI. Takes `:cache_mode`, as `list_tools/2` does.
   """
   @spec read_resource(t(), String.t(), keyword() | timeout()) ::
           {:ok, Arbor.MCP.Response.t() | map()} | {:error, term()}
@@ -903,7 +929,7 @@ defmodule Arbor.MCP.Client do
   end
 
   @doc """
-  Lists available prompts.
+  Lists available prompts. Takes `:cache_mode`, as `list_tools/2` does.
   """
   @spec list_prompts(t(), keyword() | timeout()) ::
           {:ok, Arbor.MCP.Response.t() | map()} | {:error, term()}
@@ -1347,7 +1373,8 @@ defmodule Arbor.MCP.Client do
       initialized: false,
       default_retry_policy: Keyword.get(opts, :retry_policy, []),
       default_timeout: Keyword.get(opts, :timeout, 5_000),
-      async_post_tasks: %{}
+      async_post_tasks: %{},
+      response_cache: ResponseCache.new(opts)
     }
   end
 
@@ -1400,7 +1427,8 @@ defmodule Arbor.MCP.Client do
           updated_state
           | connection_status: :ready,
             initialized: true,
-            tool_output_schemas: %{}
+            tool_output_schemas: %{},
+            response_cache: ResponseCache.clear(updated_state.response_cache)
         }
 
         {:ok, schedule_next_health_check(final_state)}
@@ -3270,7 +3298,8 @@ defmodule Arbor.MCP.Client do
               cleanup_result: :ok,
               health_check_id: nil,
               # A new connection may be to a changed server.
-              tool_output_schemas: %{}
+              tool_output_schemas: %{},
+              response_cache: ResponseCache.clear(connected_state.response_cache)
           })
 
         notify_subscription_processes(reconnected_state, :client_subscription_reconnect)
