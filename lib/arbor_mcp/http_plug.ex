@@ -1469,7 +1469,8 @@ defmodule Arbor.MCP.HttpPlug do
                |> Map.put(:session_id, RuntimeSession.id(session))
                |> runtime_dispatch_opts(conn)
            ),
-         {:ok, response, conn} <- await_runtime_output(conn, format, opts),
+         keepalive = request_keepalive_interval(request, opts),
+         {:ok, response, conn} <- await_runtime_output(conn, format, keepalive),
          :ok <- runtime_response_ready(response) do
       conn = maybe_prepare_runtime_response(conn, format, opts, session, request)
 
@@ -1540,24 +1541,31 @@ defmodule Arbor.MCP.HttpPlug do
     |> maybe_put_session_header(RuntimeSession.id(session))
   end
 
+  # subscriptions/listen has its own keepalive once its listener is set up,
+  # and its stream sends the SSE headers itself. A request keepalive during a
+  # slow listener setup would send them first, so the listen request gets none.
+  defp request_keepalive_interval(%{"method" => "subscriptions/listen"}, _opts), do: :infinity
+  defp request_keepalive_interval(_request, opts), do: opts.request_keepalive_interval_ms
+
   # Every recursive call is a tail call: a request can wait through one
   # keepalive per interval for its whole deadline without growing its stack.
-  defp await_runtime_output(conn, :sse, opts) do
-    case RuntimeWriter.await(conn, opts.request_keepalive_interval_ms) do
-      :idle -> keepalive_runtime_output(conn, opts)
+  defp await_runtime_output(conn, :sse, keepalive) do
+    case RuntimeWriter.await(conn, keepalive) do
+      :idle -> keepalive_runtime_output(conn, keepalive)
       response -> {:ok, response, conn}
     end
   end
 
-  defp await_runtime_output(conn, _format, _opts), do: {:ok, RuntimeWriter.await(conn), conn}
+  defp await_runtime_output(conn, _format, _keepalive),
+    do: {:ok, RuntimeWriter.await(conn), conn}
 
-  defp keepalive_runtime_output(conn, opts) do
+  defp keepalive_runtime_output(conn, keepalive) do
     case RuntimeWriter.request_keepalive(conn) do
       {:ok, conn} ->
-        await_runtime_output(conn, :sse, opts)
+        await_runtime_output(conn, :sse, keepalive)
 
       {:not_entered, conn} ->
-        await_runtime_output(conn, :sse, opts)
+        await_runtime_output(conn, :sse, keepalive)
 
       {:closed, conn} ->
         cancel_closed_request(conn)
@@ -1825,7 +1833,7 @@ defmodule Arbor.MCP.HttpPlug do
     conn = write_runtime_response(conn, effect, wire, format)
 
     if kind == :notification do
-      case await_runtime_output(conn, format, opts) do
+      case await_runtime_output(conn, format, request_keepalive_interval(request, opts)) do
         {:ok, {:ok, effect, wire}, conn} ->
           write_runtime_output(conn, effect, wire, format, session, request, opts)
 

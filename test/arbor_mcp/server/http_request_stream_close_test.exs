@@ -287,6 +287,32 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
     assert_released(runtime)
   end
 
+  test "a slow subscriptions/listen setup gets no request keepalive before its own stream" do
+    runtime = start_runtime([])
+    parent = self()
+
+    authorize = fn filter, _context ->
+      send(parent, {:authorizing_listen, self()})
+      receive do: (:authorize -> {:ok, filter})
+    end
+
+    socket = stream_listen(runtime, [], authorize_subscription_filter: authorize)
+    assert_receive {:authorizing_listen, authorizer}, 1_000
+
+    # Ten 20 ms request keepalive intervals pass while the listener is set up.
+    # A comment here would send the headers that the subscription stream sends
+    # itself, and its send_chunked would then raise Plug.Conn.AlreadySentError.
+    refute_receive {:stream_headers, ^socket, _status}, 200
+    refute_received {:stream_wire, ^socket, _wire}
+
+    send(authorizer, :authorize)
+    assert_receive {:stream_headers, ^socket, 200}, 1_000
+    assert_receive {:stream_wire, ^socket, acknowledgment}, 1_000
+    assert acknowledgment =~ "notifications/subscriptions/acknowledged"
+    refute_received {:stream_result, ^socket, _result}
+    assert Process.alive?(socket)
+  end
+
   test "a handler timeout during an in-flight keepalive still writes the timeout error" do
     runtime = start_runtime(request_timeout_ms: 1_000)
     socket = stream_request(runtime, "hold", hold_keepalive: true)
@@ -389,17 +415,52 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
   end
 
   defp stream_request(runtime, name, adapter_opts, plug_opts \\ []) do
+    headers = [{"mcp-method", "tools/call"}, {"mcp-name", name}]
+    stream_post(runtime, tool_body(name, true), headers, adapter_opts, plug_opts)
+  end
+
+  # A subscriptions/listen request that, with its progress token, also selects
+  # the request SSE wait before its listener is set up.
+  defp stream_listen(runtime, adapter_opts, plug_opts) do
+    body =
+      Jason.encode!(%{
+        jsonrpc: "2.0",
+        id: System.unique_integer([:positive]),
+        method: "subscriptions/listen",
+        params: %{
+          notifications: %{toolsListChanged: true},
+          _meta: %{
+            "io.modelcontextprotocol/protocolVersion" => "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities" => %{},
+            "progressToken" => "listen"
+          }
+        }
+      })
+
+    stream_post(
+      runtime,
+      body,
+      [{"mcp-method", "subscriptions/listen"}],
+      adapter_opts,
+      plug_opts
+    )
+  end
+
+  defp stream_post(runtime, body, headers, adapter_opts, plug_opts) do
     parent = self()
 
     socket =
       spawn(fn ->
         conn =
-          Plug.Test.conn(:post, "/mcp", tool_body(name, true))
-          |> Plug.Conn.put_req_header("content-type", "application/json")
-          |> Plug.Conn.put_req_header("accept", "application/json, text/event-stream")
-          |> Plug.Conn.put_req_header("mcp-protocol-version", "2026-07-28")
-          |> Plug.Conn.put_req_header("mcp-method", "tools/call")
-          |> Plug.Conn.put_req_header("mcp-name", name)
+          Enum.reduce(
+            [
+              {"content-type", "application/json"},
+              {"accept", "application/json, text/event-stream"},
+              {"mcp-protocol-version", "2026-07-28"} | headers
+            ],
+            Plug.Test.conn(:post, "/mcp", body),
+            fn {name, value}, conn -> Plug.Conn.put_req_header(conn, name, value) end
+          )
 
         {_adapter, state} = conn.adapter
 
