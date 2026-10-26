@@ -161,12 +161,12 @@ defmodule Arbor.MCP.Transport.HTTP.BoundedClient do
     case Mint.HTTP1.recv(conn, 0, timeout) do
       {:ok, next_conn, events} ->
         with {:done, completed} <- Reducer.reduce(events, request_ref, response, limits),
-             {:ok, completed, stream} <- consume_stream(completed, stream),
+             {:ok, completed, stream} <- consume_stream(completed, stream, deadline),
              {:ok, completed} <- finish_stream(completed, stream) do
           {{:ok, format_response(completed)}, next_conn}
         else
           {:cont, updated} ->
-            case consume_stream(updated, stream) do
+            case consume_stream(updated, stream, deadline) do
               {:ok, updated, stream} ->
                 receive_response(next_conn, request_ref, updated, deadline, limits, stream)
 
@@ -185,12 +185,13 @@ defmodule Arbor.MCP.Transport.HTTP.BoundedClient do
 
   # An `:event_stream` hook, `{acc, fun}`, takes the body of a 2xx
   # `text/event-stream` response as it arrives instead of it accumulating:
-  # `fun.(chunk, acc)` returns `{:ok, acc}` or `{:error, reason}`, and
-  # `fun.(:done, acc)` returns `{:ok, body}`, the body the response then
-  # carries. `:max_response_bytes` applies to each batch it is handed.
-  defp consume_stream(response, {acc, fun} = stream) do
+  # `fun.({:data, chunk, deadline}, acc)` returns `{:ok, acc}` or
+  # `{:error, reason}`, where `deadline` is the response's (monotonic
+  # milliseconds), and `fun.(:done, acc)` returns `{:ok, body}`, the body the
+  # response then carries.
+  defp consume_stream(response, {acc, fun} = stream, deadline) do
     if response.chunks != [] and event_stream?(response) do
-      case fun.(Reducer.body(response), acc) do
+      case fun.({:data, Reducer.body(response), deadline}, acc) do
         {:ok, acc} -> {:ok, %{response | chunks: [], size: 0}, {acc, fun}}
         {:error, _reason} = error -> error
       end
@@ -199,7 +200,7 @@ defmodule Arbor.MCP.Transport.HTTP.BoundedClient do
     end
   end
 
-  defp consume_stream(response, nil), do: {:ok, response, nil}
+  defp consume_stream(response, nil, _deadline), do: {:ok, response, nil}
 
   defp finish_stream(response, {acc, fun}) do
     if event_stream?(response) do
@@ -224,22 +225,22 @@ defmodule Arbor.MCP.Transport.HTTP.BoundedClient do
     end
   end
 
-  # Applied to the accumulated header list, trailers included: compression
-  # and conflicting framing are refused, and the strict single-value
-  # content-length rule decides the size limit.
-  # A streamed event-stream body is limited as it's consumed (each read is
-  # handed to the hook), not by its whole length.
+  # A 2xx event-stream body handed to an `:event_stream` hook is limited as
+  # the hook takes it, so neither one read of it nor the length it declares
+  # counts against `:max_response_bytes`.
   defp body_limit(max_bytes, nil), do: fn _response -> max_bytes end
 
   defp body_limit(max_bytes, _stream) do
     fn response -> if event_stream?(response), do: @max_declared_length, else: max_bytes end
   end
 
-  # Nor by the length it declares.
+  # Applied to the accumulated header list, trailers included: compression
+  # and conflicting framing are refused, and the strict single-value
+  # content-length rule decides the size limit.
   defp header_policy(max_bytes, stream) do
-    fn _batch, accumulated ->
+    fn _batch, accumulated, status ->
       length_limit =
-        if is_nil(stream) or not event_stream_type?(accumulated),
+        if is_nil(stream) or not event_stream?(%{status: status, headers: accumulated}),
           do: max_bytes,
           else: @max_declared_length
 

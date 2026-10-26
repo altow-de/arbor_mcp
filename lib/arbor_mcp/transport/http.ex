@@ -474,13 +474,10 @@ defmodule Arbor.MCP.Transport.HTTP do
   # the OAuth flow. It hands an auth challenge back to the client process,
   # which re-sends that request with send_authenticated/2.
   defp perform_async(message, state, parent) do
-    deadline = state.deadline || System.monotonic_time(:millisecond) + state.timeouts.request
-
     stream =
       PostStream.consumer(parent,
         max_buffer_bytes: state.max_stream_buffer_bytes,
-        max_kept_bytes: state.max_response_bytes,
-        deadline: deadline
+        max_kept_bytes: state.max_response_bytes
       )
 
     case perform_http_request(message, state, event_stream: stream) do

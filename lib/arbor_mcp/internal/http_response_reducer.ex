@@ -25,10 +25,13 @@ defmodule Arbor.MCP.Internal.HTTPResponseReducer do
 
   @typedoc """
   Called for every `:headers` event with the normalized headers from that
-  event and the accumulated list including them. Returning `{:error, reason}`
-  halts reduction with that reason untouched.
+  event and the accumulated list including them, and the status too when it
+  takes three arguments. Returning `{:error, reason}` halts reduction with
+  that reason untouched.
   """
-  @type header_check :: (headers(), headers() -> :ok | {:error, term()})
+  @type header_check ::
+          (headers(), headers() -> :ok | {:error, term()})
+          | (headers(), headers(), non_neg_integer() | nil -> :ok | {:error, term()})
 
   @typedoc """
   `:max_bytes` limits the body. `:max_bytes_for`, when given, decides that
@@ -79,7 +82,12 @@ defmodule Arbor.MCP.Internal.HTTPResponseReducer do
     headers = normalize_headers(headers)
     all_headers = acc.headers ++ headers
 
-    case validate.(headers, all_headers) do
+    result =
+      if is_function(validate, 3),
+        do: validate.(headers, all_headers, acc.status),
+        else: validate.(headers, all_headers)
+
+    case result do
       :ok -> {:cont, %{acc | headers: all_headers}}
       {:error, reason} -> {:halt, {:error, reason}}
     end

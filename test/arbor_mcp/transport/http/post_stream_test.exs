@@ -23,11 +23,14 @@ defmodule Arbor.MCP.Transport.HTTP.PostStreamTest do
   end
 
   defp consumer(parent, max_buffer \\ 1_024) do
-    PostStream.consumer(parent,
-      max_buffer_bytes: max_buffer,
-      max_kept_bytes: 4_096,
-      deadline: System.monotonic_time(:millisecond) + 5_000
-    )
+    {acc, fun} = PostStream.consumer(parent, max_buffer_bytes: max_buffer, max_kept_bytes: 4_096)
+    deadline = System.monotonic_time(:millisecond) + 5_000
+
+    {acc,
+     fn
+       :done, acc -> fun.(:done, acc)
+       chunk, acc -> fun.({:data, chunk, deadline}, acc)
+     end}
   end
 
   defp feed(chunks, opts \\ []) do
@@ -87,6 +90,17 @@ defmodule Arbor.MCP.Transport.HTTP.PostStreamTest do
     assert body =~ "id: e500"
     refute body =~ "id: e499"
     assert byte_size(body) < 200
+  end
+
+  test "a complete event read at once is limited too" do
+    big =
+      ~s({"jsonrpc":"2.0","method":"notifications/message","params":{"data":") <>
+        String.duplicate("x", 200) <> ~s("}})
+
+    assert {:error, :stream_buffer_limit_exceeded} =
+             feed(["data: " <> big <> "\n\n"], max_buffer: 100)
+
+    refute_receive {:handed_over, _}, 50
   end
 
   test "an event that never ends can't grow without bound" do

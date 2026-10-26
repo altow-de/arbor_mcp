@@ -9,24 +9,23 @@ defmodule Arbor.MCP.Transport.HTTP.PostStream do
   #
   # The client acknowledges each message before the next is read, as with a
   # modern request stream, so a fast stream can't fill its mailbox. It may
-  # take until the POST's deadline to do so.
+  # take until the response's deadline to do so.
 
   alias Arbor.MCP.Client.Lifetime
   alias Arbor.MCP.Internal.SSE
 
-  @type t :: {map(), (binary() | :done, map() -> {:ok, term()} | {:error, term()})}
+  @type input :: {:data, binary(), integer()} | :done
+  @type t :: {map(), (input(), map() -> {:ok, term()} | {:error, term()})}
 
   @doc false
-  # Options: `:max_buffer_bytes` limits an incomplete event,
-  # `:max_kept_bytes` what's kept for the transport, and `:deadline`
-  # (monotonic milliseconds) how long the client may take to acknowledge.
+  # Options: `:max_buffer_bytes` limits each event, complete or not, and
+  # `:max_kept_bytes` what's kept for the transport.
   @spec consumer(pid(), keyword()) :: t()
   def consumer(parent, opts) do
     limits = %{
       parent: parent,
       max_buffer: Keyword.fetch!(opts, :max_buffer_bytes),
-      max_kept: Keyword.fetch!(opts, :max_kept_bytes),
-      deadline: Keyword.fetch!(opts, :deadline)
+      max_kept: Keyword.fetch!(opts, :max_kept_bytes)
     }
 
     acc = %{rest: "", after_cr: false, kept: [], kept_bytes: 0}
@@ -42,9 +41,9 @@ defmodule Arbor.MCP.Transport.HTTP.PostStream do
       else: {:ok, body}
   end
 
-  defp consume("", acc, _limits), do: {:ok, acc}
+  defp consume({:data, "", _deadline}, acc, _limits), do: {:ok, acc}
 
-  defp consume(chunk, acc, limits) do
+  defp consume({:data, chunk, deadline}, acc, limits) do
     # A CR ends a line at once; an LF right after it is the rest of a CRLF.
     chunk =
       case {acc.after_cr, chunk} do
@@ -55,13 +54,9 @@ defmodule Arbor.MCP.Transport.HTTP.PostStream do
     {blocks, rest} = split_blocks(acc.rest <> chunk)
     acc = %{acc | rest: rest, after_cr: String.ends_with?(chunk, "\r")}
 
-    with {:ok, acc} <- take_blocks(blocks, acc, limits) do
-      cond do
-        byte_size(rest) > limits.max_buffer -> {:error, :stream_buffer_limit_exceeded}
-        acc.kept_bytes > limits.max_kept -> {:error, :response_too_large}
-        true -> {:ok, acc}
-      end
-    end
+    if byte_size(rest) > limits.max_buffer,
+      do: {:error, :stream_buffer_limit_exceeded},
+      else: take_blocks(blocks, acc, Map.put(limits, :deadline, deadline))
   end
 
   defp split_blocks(raw) do
@@ -75,14 +70,21 @@ defmodule Arbor.MCP.Transport.HTTP.PostStream do
     {complete, rest}
   end
 
+  # Each event is checked before it's read, and what's kept as it grows.
   defp take_blocks(blocks, acc, limits) do
     Enum.reduce_while(blocks, {:ok, acc}, fn block, {:ok, acc} ->
-      case take_block(block, acc, limits) do
-        {:ok, acc} -> {:cont, {:ok, acc}}
+      with :ok <- within(byte_size(block), limits.max_buffer, :stream_buffer_limit_exceeded),
+           {:ok, acc} <- take_block(block, acc, limits),
+           :ok <- within(acc.kept_bytes, limits.max_kept, :response_too_large) do
+        {:cont, {:ok, acc}}
+      else
         error -> {:halt, error}
       end
     end)
   end
+
+  defp within(size, limit, _reason) when size <= limit, do: :ok
+  defp within(_size, _limit, reason), do: {:error, reason}
 
   defp take_block(block, acc, limits) do
     case SSE.parse_complete(block) do
