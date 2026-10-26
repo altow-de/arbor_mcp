@@ -109,7 +109,7 @@ The stable 48-hour qualification remains open.
 
 The next candidate, not yet published, makes servers handle the requests on a
 connection concurrently, as the other MCP SDKs do, and lets the caller decide how
-long a request runs. Six changes can break existing code. The
+long a request runs. Seven changes can break existing code. The
 [changelog](../../CHANGELOG.md) lists the rest, including the client changes.
 
 ### Request callbacks no longer change handler state by default
@@ -234,6 +234,16 @@ is never asked:
 
 %{"message" => "Continue?", "requestedSchema" => %{"type" => "object", "properties" => %{}}}
 ```
+
+### Owned Bandit listeners need Bandit 1.14.0
+
+Bandit 1.14.0 fixes eleven HTTP/1, HTTP/2 and WebSocket advisories that are open
+against 1.13.1, so ArborMCP now requires Bandit `~> 1.14`. An owned Bandit
+listener qualifies exact Bandit `1.14.0` with Thousand Island `1.6.0`; with
+the `1.13.1` pin, startup returns `:unsupported_owned_bandit_constructor`.
+Change the pin to `{:bandit, "== 1.14.0"}`. Bandit 1.14.0 also limits each
+HTTP/2 connection to 500 concurrent streams and 262,144 bytes of headers by
+default.
 
 ## Limits to exercise in downstream tests
 

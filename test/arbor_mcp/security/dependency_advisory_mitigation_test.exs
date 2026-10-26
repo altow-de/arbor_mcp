@@ -30,14 +30,14 @@ defmodule Arbor.MCP.Security.DependencyAdvisoryMitigationTest do
     assert Version.compare(locked_version, "3.1.2") in [:eq, :gt]
   end
 
-  test "Bandit requirement and lock include the October security and Phoenix fixes" do
+  test "Bandit requirement and lock include the October 26 HTTP/1, HTTP/2 and WebSocket fixes" do
     requirement = Project.config()[:deps] |> List.keyfind(:bandit, 0) |> elem(1)
-    assert Version.match?("1.13.1", requirement)
+    assert Version.match?("1.14.0", requirement)
+    refute Version.match?("1.13.1", requirement)
     refute Version.match?("1.13.0", requirement)
-    refute Version.match?("1.12.5", requirement)
 
     lock = Lock.read()
-    assert elem(lock[:bandit], 2) == "1.13.1"
+    assert elem(lock[:bandit], 2) == "1.14.0"
     assert elem(lock[:thousand_island], 2) == "1.6.0"
     assert Version.compare(elem(lock[:hpax], 2), "1.1.0") in [:eq, :gt]
   end

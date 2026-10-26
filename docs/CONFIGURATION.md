@@ -25,7 +25,7 @@ the [source-install policy](RELEASING.md).
 
 For a standalone Cowboy HTTP server, add `{:plug_cowboy, "~> 2.7"}` and
 `{:ranch, "== 1.8.1"}` to the host dependencies. For an owned Bandit listener, pin
-`{:bandit, "== 1.13.1"}` and `{:thousand_island, "== 1.6.0"}`. Select Bandit
+`{:bandit, "== 1.14.0"}` and `{:thousand_island, "== 1.6.0"}`. Select Bandit
 with `http_adapter: :bandit`; Cowboy remains the default. HTTP clients and
 mounting `Arbor.MCP.HttpPlug` in an existing host need no additional listener.
 See the [HTTP listener guide](HTTP_LISTENERS.md).
