@@ -511,25 +511,18 @@ defmodule Arbor.MCP.Server.Runtime.ShutdownControlTest do
       monitors = Enum.map(children, &{&1, Process.monitor(&1)})
       Enum.each(children, &send(&1, :release))
 
-      for {pid, monitor} <- monitors do
-        assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
-      end
+      for {pid, monitor} <- monitors,
+          do: assert_receive({:DOWN, ^monitor, :process, ^pid, :normal})
 
-      # Reaping is the synchronization point. The poll bound is not a budget.
-      eventually(
-        fn ->
-          length(:ets.match_object(table, {{:runtime_owned, :_}, :_})) == baseline and
-            ShutdownControl.stats(table).owned == baseline_slots
-        end,
-        1_000
-      )
+      eventually(fn ->
+        length(:ets.match_object(table, {{:runtime_owned, :_}, :_})) == baseline and
+          ShutdownControl.stats(table).owned == baseline_slots
+      end)
     end
 
     :sys.resume(guard)
-
-    assert Runtime.stop(root) in [:ok, {:error, :shutdown_cleanup_unconfirmed}]
-
-    eventually(fn -> not Process.alive?(observer) end, 1_000)
+    assert :ok = stop_released(root)
+    eventually(fn -> not Process.alive?(observer) end)
   end
 
   test "child DOWN retains a pending publication until its last metadata write is fenced" do
@@ -547,7 +540,7 @@ defmodule Arbor.MCP.Server.Runtime.ShutdownControlTest do
       Enum.find(collected.monitors, fn {_ref, entry} -> elem(entry, 0) == child end)
 
     send(child, :release)
-    assert_receive {:DOWN, ^monitor, :process, ^child, :normal}, 5_000
+    assert_receive {:DOWN, ^monitor, :process, ^child, :normal}
 
     {:noreply, pending, _timeout} =
       ShutdownControl.handle_info({:DOWN, monitor, :process, child, :normal}, collected)
@@ -563,7 +556,20 @@ defmodule Arbor.MCP.Server.Runtime.ShutdownControlTest do
     assert retired.pending_publications == %{}
     :sys.resume(observer)
     :sys.resume(guard)
-    assert Runtime.stop(root) in [:ok, {:error, :shutdown_cleanup_unconfirmed}]
+    assert :ok = stop_released(root)
+  end
+
+  # The owned fixture holds terminate until released. Releasing it as soon as
+  # stop reaches it lets cleanup finish gracefully, far inside the 500 ms
+  # budget, so stop has to confirm it. Left held, cleanup could only finish by
+  # force in the last 25 ms, which a loaded machine misses.
+  defp stop_released(root) do
+    parent = self()
+    stopper = spawn(fn -> send(parent, {:stopped, self(), Runtime.stop(root)}) end)
+    assert_receive {:held_terminate, owned}, 1_000
+    send(owned, :release)
+    assert_receive {:stopped, ^stopper, result}, 1_000
+    result
   end
 
   defp control_ledger(observer) do
