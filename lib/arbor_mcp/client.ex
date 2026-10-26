@@ -117,6 +117,9 @@ defmodule Arbor.MCP.Client do
     # Progress tokens of pending requests, mapped to their request ids, so a
     # connection-level notifications/progress reaches the request it reports on.
     progress_requests: %{},
+    # Each listed tool's outputSchema, from the tools/list results this client
+    # has seen, so call_tool/4 can check structuredContent against it.
+    tool_output_schemas: %{},
     # Linked processes of a transport (or receiver) this client has since
     # dropped, and that were still alive when it did. Their exit signals are
     # expected and are ignored rather than read as a foreign link's exit.
@@ -1393,7 +1396,13 @@ defmodule Arbor.MCP.Client do
           %{transport: updated_state.transport_mod}
         )
 
-        final_state = %{updated_state | connection_status: :ready, initialized: true}
+        final_state = %{
+          updated_state
+          | connection_status: :ready,
+            initialized: true,
+            tool_output_schemas: %{}
+        }
+
         {:ok, schedule_next_health_check(final_state)}
 
       {:error, reason} ->
@@ -1743,6 +1752,9 @@ defmodule Arbor.MCP.Client do
     Process.delete({__MODULE__, :cleanup_deadline})
     {:reply, cleanup_result, new_state}
   end
+
+  def handle_call({:tool_output_schema, name}, _from, state),
+    do: {:reply, Map.get(state.tool_output_schemas, name), state}
 
   def handle_call(:get_status, _from, state) do
     status = %{
@@ -3256,7 +3268,9 @@ defmodule Arbor.MCP.Client do
               initialized: true,
               reconnect_attempts: 0,
               cleanup_result: :ok,
-              health_check_id: nil
+              health_check_id: nil,
+              # A new connection may be to a changed server.
+              tool_output_schemas: %{}
           })
 
         notify_subscription_processes(reconnected_state, :client_subscription_reconnect)

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Client.call_tool/4` checks a result against the tool's `outputSchema`, as
+  the TypeScript and Python SDKs do. Once `list_tools/2` has shown a tool
+  with one, a successful result must carry `structuredContent` that
+  conforms, or the call returns `{:error, %Arbor.MCP.Error.ValidationError{}}`.
+  Only complete results are checked, not `isError` ones, task handles or MRTR
+  rounds; a `null` `structuredContent` counts as present. `validate_output:
+  false` turns it off for a call. A first-page `tools/list` replaces the
+  recorded schemas, a new connection starts without any, and a
+  `tools/list_changed` notification forgets them until tools are listed
+  again.
 - One handler serves both protocol eras when it asks for input. A callback
   that returns an MRTR `input_required` result to a legacy client no longer
   fails with "input_required requires MCP 2026-07-28": the server sends each
@@ -167,6 +177,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-object `structuredContent` in a legacy era, raised in the server and
   reached the client as an opaque `handler_crash`. It's now a `-32603`
   error with `%{"type" => "invalid_result"}`, and the server logs why.
+- A notification sent before the answer to `initialize` or
+  `server/discover`, such as a log message, was taken for the answer, and
+  the client failed to connect. It now skips notifications until the answer
+  arrives or its deadline passes.
 - The client sent `"capabilities": {}` in a legacy `initialize`, whatever its
   `:capabilities` option said, so a server that respects declared
   capabilities never sent it elicitation, sampling or roots requests. It now

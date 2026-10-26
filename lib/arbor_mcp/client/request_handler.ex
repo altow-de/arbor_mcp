@@ -252,6 +252,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
   end
 
   defp send_unique_request(request, method, id, from, state, meta) do
+    state = mark_tool_listing(state, method, id, request)
     {deadline, meta} = request_send_context(from, state, meta)
 
     result =
@@ -317,7 +318,14 @@ defmodule Arbor.MCP.Client.RequestHandler do
           %{method: method, request_id: id}
         )
 
-        {:reply, validate_result(result, updated_state, method), updated_state}
+        reply = validate_result(result, updated_state, method)
+
+        updated_state =
+          if match?({:ok, _result}, reply),
+            do: remember_tool_schemas(updated_state, method, id, reply),
+            else: updated_state
+
+        {:reply, reply, updated_state}
 
       {:error, error_data, _id} ->
         :telemetry.execute(
@@ -1042,7 +1050,9 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
           GenServer.reply(from, response_data)
           new_pending_requests = Map.delete(pending_requests, response_id)
+
           %{state | pending_requests: new_pending_requests}
+          |> remember_tool_schemas(method, response_id, response_data)
 
         {:ok, {from, :single}} ->
           :telemetry.execute(
@@ -1079,7 +1089,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
               "notifications/resources/list_changed",
               "notifications/resources/updated"
             ],
-       do: route_change_notification(method, params, state)
+       do: route_change_notification(method, params, forget_tool_schemas(state, method))
 
   defp route_notification("notifications/tasks" = method, params, state),
     do: route_task_subscription_event(method, params, state)
@@ -1136,6 +1146,61 @@ defmodule Arbor.MCP.Client.RequestHandler do
         state
     end
   end
+
+  # Each tools/list page records its tools' output schemas; a tool listed
+  # without one has none to check.
+  # A first-page listing (no cursor) replaces what earlier listings recorded,
+  # so a removed or changed tool isn't checked against an old schema; later
+  # pages add to it.
+  defp mark_tool_listing(state, "tools/list", id, request) do
+    if get_in(request, ["params", "cursor"]),
+      do: state,
+      else: Map.update(state, :tool_listings, MapSet.new([id]), &MapSet.put(&1, id))
+  end
+
+  defp mark_tool_listing(state, _method, _id, _request), do: state
+
+  defp remember_tool_schemas(state, "tools/list", id, response_data) do
+    {fresh?, listings} =
+      state
+      |> Map.get(:tool_listings, MapSet.new())
+      |> then(&{MapSet.member?(&1, id), MapSet.delete(&1, id)})
+
+    state = Map.put(state, :tool_listings, listings)
+    known = if fresh?, do: %{}, else: Map.get(state, :tool_output_schemas) || %{}
+
+    with %{} = result <- list_result(response_data),
+         tools when is_list(tools) <- field(result, "tools", :tools) do
+      schemas =
+        Enum.reduce(tools, known, fn tool, acc ->
+          case {field(tool, "name", :name), field(tool, "outputSchema", :outputSchema)} do
+            {name, schema} when is_binary(name) and is_map(schema) -> Map.put(acc, name, schema)
+            {name, _none} when is_binary(name) -> Map.delete(acc, name)
+            _other -> acc
+          end
+        end)
+
+      Map.put(state, :tool_output_schemas, schemas)
+    else
+      _other -> state
+    end
+  end
+
+  defp remember_tool_schemas(state, _method, _id, _response_data), do: state
+
+  # Both paths hand over the response already parsed and validated.
+  defp list_result({:ok, %{} = result}), do: result
+  defp list_result(_rejected), do: nil
+
+  # In-process transports deliver maps that may still have atom keys.
+  defp field(%{} = map, key, atom), do: Map.get(map, key) || Map.get(map, atom)
+  defp field(_other, _key, _atom), do: nil
+
+  # A changed tool list may change a schema; validate again once relisted.
+  defp forget_tool_schemas(state, "notifications/tools/list_changed"),
+    do: Map.put(state, :tool_output_schemas, %{})
+
+  defp forget_tool_schemas(state, _method), do: state
 
   defp forget_progress_token(state, token),
     do: Map.update(state, :progress_requests, %{}, &Map.delete(&1, token))
