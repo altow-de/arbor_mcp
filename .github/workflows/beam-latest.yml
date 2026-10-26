@@ -36,11 +36,11 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         persist-credentials: false
-    - name: Check out unpublished shared RPC
+    - name: Check out shared RPC at its release commit
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         repository: trust-arbor/arbor_rpc
-        ref: b2e4abee581b060310202c0b8b4d9a5d0e2e3995
+        ref: 5867936bcc8c21a92806babd731d4a884f700240
         path: .arbor-v2/rpc
         persist-credentials: false
     - id: beam

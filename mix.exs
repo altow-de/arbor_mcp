@@ -1,8 +1,8 @@
 defmodule Arbor.MCP.MixProject do
   use Mix.Project
 
-  @version "2.0.0-rc.5"
-  @rpc_requirement "~> 1.0.0-rc.1"
+  @version "2.0.0-rc.6"
+  @rpc_requirement "~> 1.0.0-rc.3"
   @github_url "https://github.com/trust-arbor/arbor_mcp"
 
   def project do

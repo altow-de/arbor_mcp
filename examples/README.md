@@ -1,11 +1,12 @@
 # ArborMCP Examples
 
-This directory contains MCP examples for the version 2 API. RC1 publication is
-pending; examples are learning fixtures rather than a substitute for the
-qualification described in the [RC notes](../docs/guides/V2_RELEASE_CANDIDATE.md).
+This directory contains MCP examples for the version 2 API, which is published
+as release candidates. The examples are learning fixtures rather than a
+substitute for the qualification described in the
+[RC notes](../docs/guides/V2_RELEASE_CANDIDATE.md).
 
-Set `ARBOR_RPC_PATH` to your shared RPC checkout while developing the unpublished
-split. Source installation requires C17 on qualified macOS/Linux platforms.
+`arbor_rpc` resolves from Hex; set `ARBOR_RPC_PATH` only to try a local RPC
+checkout. Source installation requires C17 on qualified macOS/Linux platforms.
 The standalone scripts load the local MCP project through `Mix.install/1`.
 
 **First runs:** Standalone scripts call `Mix.install/1`; its cache avoids repeated
