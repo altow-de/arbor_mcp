@@ -149,6 +149,32 @@ defmodule Arbor.MCP.Integration.EverythingHTTPInteropTest do
       end
     end
 
+    # Six steps half a second apart: longer than the timeout, but never
+    # that long without progress.
+    test "progress keeps a long-running call alive past its timeout", %{server_port: port} do
+      {:ok, client} = connect_client(port, handler: {ProgressRecorder, [owner: self()]})
+      args = %{"duration" => 3, "steps" => 6}
+
+      try do
+        assert {:ok, result} =
+                 Arbor.MCP.Client.call_tool(client, "longRunningOperation", args,
+                   timeout: 1_000,
+                   reset_timeout_on_progress: true,
+                   format: :map
+                 )
+
+        assert get_content_text(result) =~ "Long running operation completed"
+
+        assert {:error, :timeout} =
+                 Arbor.MCP.Client.call_tool(client, "longRunningOperation", args,
+                   timeout: 1_000,
+                   format: :map
+                 )
+      after
+        Arbor.MCP.Client.disconnect(client)
+      end
+    end
+
     test "calls add tool", %{server_port: port} do
       {:ok, client} = connect_client(port)
 
