@@ -1,6 +1,11 @@
 defmodule Arbor.MCP.Server.Runtime.ShutdownControlTest do
   use ExUnit.Case, async: false
 
+  # How long past its charged cutoff a forced stop may take to return. On a
+  # loaded machine forced stops returned up to 615 ms late; a stop that waits
+  # on the held owner instead of its budget never returns at all.
+  @stop_return_margin_ms 1_000
+
   alias Arbor.MCP.Server.Runtime
 
   alias Arbor.MCP.Server.Runtime.{
@@ -521,7 +526,7 @@ defmodule Arbor.MCP.Server.Runtime.ShutdownControlTest do
     end
 
     :sys.resume(guard)
-    assert :ok = stop_released(root)
+    stop_forced(root, table, producer, 500)
     eventually(fn -> not Process.alive?(observer) end)
   end
 
@@ -556,19 +561,34 @@ defmodule Arbor.MCP.Server.Runtime.ShutdownControlTest do
     assert retired.pending_publications == %{}
     :sys.resume(observer)
     :sys.resume(guard)
-    assert :ok = stop_released(root)
+    stop_forced(root, table, producer, 500)
   end
 
-  # The owned fixture holds terminate until released. Releasing it as soon as
-  # stop reaches it lets cleanup finish gracefully, far inside the 500 ms
-  # budget, so stop has to confirm it. Left held, cleanup could only finish by
-  # force in the last 25 ms, which a loaded machine misses.
-  defp stop_released(root) do
-    parent = self()
-    stopper = spawn(fn -> send(parent, {:stopped, self(), Runtime.stop(root)}) end)
-    assert_receive {:held_terminate, owned}, 1_000
-    send(owned, :release)
-    assert_receive {:stopped, ^stopper, result}, 1_000
+  # The owned fixture holds terminate until released, so this stop can only
+  # end it by force. Stop charges its budget once, when called. It returns
+  # :ok only with the observer's confirmation recorded, or unconfirmed only
+  # at or after the charged cutoff, and either way no later than
+  # @stop_return_margin_ms past that cutoff. The held owner must die :killed,
+  # and the observer must still confirm every owned DOWN (phase 3).
+  defp stop_forced(root, table, owner, budget) do
+    {:ok, control} = ShutdownControl.lookup(table)
+    owner_monitor = Process.monitor(owner)
+    observer_monitor = Process.monitor(ShutdownControl.observer(control))
+    called = Deadline.now()
+    result = Runtime.stop(root)
+    returned = Deadline.now()
+    cutoff = :atomics.get(control.cells, 1)
+    assert (cutoff - budget) in called..returned
+    assert returned <= cutoff + @stop_return_margin_ms
+
+    case result do
+      :ok -> assert :atomics.get(control.cells, 2) == 3
+      {:error, :shutdown_cleanup_unconfirmed} -> assert returned >= cutoff
+    end
+
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :killed}, 1_000
+    assert_receive {:DOWN, ^observer_monitor, :process, _observer, :normal}, 2_000
+    assert :atomics.get(control.cells, 2) == 3
     result
   end
 
