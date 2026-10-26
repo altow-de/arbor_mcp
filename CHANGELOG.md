@@ -304,9 +304,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its stream couldn't be answered. As with a modern request stream, the
   client process now answers the challenge, one at a time across requests,
   and the request's own task sends it again.
-
-### Fixed
-
 - **Security:** a client's `logging/setLevel` changed the host application's
   global Logger level, because the default `handle_set_log_level/2` called
   `Logger.configure/1`; any connected client could silence or flood the host's
