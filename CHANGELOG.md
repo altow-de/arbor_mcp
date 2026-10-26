@@ -103,7 +103,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   -115269). An owned Bandit listener now qualifies exact Bandit `1.14.0` with
   Thousand Island `1.6.0`, so a host that pinned `1.13.1` must update the pin.
   Bandit 1.14.0 also limits each HTTP/2 connection to 500 concurrent streams
-  and 262,144 bytes of headers by default.
+  and 262,144 bytes of headers by default. `Arbor.MCP.HttpPlug` now reads one
+  byte past `body_limit`, so an HTTP/2 body exactly at the limit with no
+  `content-length` is still accepted (Bandit 1.14.0 stops such a read at the
+  limit), and a complete body an adapter returns past the limit gets 413.
 - **BREAKING:** Resource-template variables are percent-decoded, so a handler
   that decoded them itself now decodes twice. Template matching supports every
   RFC 6570 operator (`{+path}` and `{#frag}` span slashes, `{/a,b}`, `{.ext}`,
