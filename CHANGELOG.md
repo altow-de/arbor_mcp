@@ -192,12 +192,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- When a legacy Streamable HTTP request got a 401 or 403, the client sent it
-  again from its own process, after authenticating, and held every other
-  request and server message until that POST finished; a server request on
-  its stream couldn't be answered. As with a modern request stream, the
-  client process now answers the challenge, one at a time across requests,
-  and the request's own task sends it again.
 - The client took a request or notification without `params` for an invalid
   message and dropped it. JSON-RPC allows leaving `params` out, and the
   TypeScript SDK's servers send `ping` and `notifications/*/list_changed`
@@ -281,6 +275,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime supervisor. List changes now go to the runtime's
   `subscriptions/listen` streams, and calls and casts return
   `{:error, :runtime_unavailable}`.
+- When a legacy Streamable HTTP request got a 401 or 403, the client sent it
+  again from its own process, after authenticating, and held every other
+  request and server message until that POST finished; a server request on
+  its stream couldn't be answered. As with a modern request stream, the
+  client process now answers the challenge, one at a time across requests,
+  and the request's own task sends it again.
 
 ## [2.0.0-rc.5] — 2026-10-22
 
