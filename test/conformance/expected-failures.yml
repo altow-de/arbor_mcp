@@ -1,8 +1,8 @@
 # Expected conformance test failures.
 # Remove entries as they're fixed — stale entries cause CI failure.
 #
-# Last verified: 2026-07-11 with @modelcontextprotocol/conformance@0.1.16
-# (./scripts/conformance.sh — core suite)
+# Last verified: 2026-10-26 with @modelcontextprotocol/conformance@0.1.16
+# (./scripts/conformance.sh all — core suite, gated in CI)
 
 # Server: ALL PASSING (39/39)
 server: []

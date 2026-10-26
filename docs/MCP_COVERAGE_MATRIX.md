@@ -24,14 +24,16 @@ draft.
 
 | Target | Runner | Command | Last recorded result |
 |---|---|---|---|
-| MCP 2026-07-28, complete server suite | `@modelcontextprotocol/conformance@0.2.0-alpha.11`, Node.js 22+ | `./scripts/conformance.sh modern` | 149/149 checks passed |
-| MCP 2026-07-28, complete client suite | `@modelcontextprotocol/conformance@0.2.0-alpha.11`, Node.js 22+ | `./scripts/conformance.sh modern` | 387/387 checks passed |
+| MCP 2026-07-28, complete server suite | `@modelcontextprotocol/conformance@0.2.0-alpha.12`, Node.js 22+ | `./scripts/conformance.sh modern` | 150/150 checks passed |
+| MCP 2026-07-28, complete client suite | `@modelcontextprotocol/conformance@0.2.0-alpha.12`, Node.js 22+ | `./scripts/conformance.sh modern` | 411/411 checks passed |
 | Published legacy/core server suite | `@modelcontextprotocol/conformance@0.1.16` | `./scripts/conformance.sh server` | 39/39 checks passed |
 | Published legacy/core client suite | `@modelcontextprotocol/conformance@0.1.16` | `./scripts/conformance.sh client` | 218/218 checks passed |
 
 The modern results have zero warnings and no expected-failure entries. The
 legacy runner remains pinned separately because the published stable package
-does not exercise the 2026-07-28 wire model. `./scripts/conformance.sh
+does not exercise the 2026-07-28 wire model. CI's `MCP external conformance`
+job gates all four suites: the modern ones with `./scripts/conformance.sh
+modern` and the legacy core ones with `./scripts/conformance.sh all`. `./scripts/conformance.sh
 draft-alpha` is non-gating exploration for future draft scenarios; it is not
 the 2026-07-28 qualification command.
 
