@@ -126,7 +126,11 @@ defmodule Arbor.MCP.Client.Operations.Tools do
         30_000
       )
 
-    deadline = started_at + Keyword.get(opts, :timeout, 30_000)
+    # A call that progress keeps alive may run to its total limit.
+    deadline =
+      if Keyword.get(opts, :reset_timeout_on_progress, false),
+        do: started_at + Keyword.get(opts, :max_total_timeout, 4_294_967_295),
+        else: started_at + Keyword.get(opts, :timeout, 30_000)
 
     result
     |> maybe_retry_header_mismatch(client, params, enhanced_opts, deadline)
@@ -333,9 +337,14 @@ defmodule Arbor.MCP.Client.Operations.Tools do
                retry_policy: false
              ),
            {:ok, remaining} <- remaining_timeout(deadline) do
+        # What's left becomes the retry's limit: its total limit if
+        # progress keeps it alive, else its timeout.
+        limit =
+          if Keyword.get(opts, :reset_timeout_on_progress), do: :max_total_timeout, else: :timeout
+
         retry_opts =
           opts
-          |> Keyword.put(:timeout, remaining)
+          |> Keyword.put(limit, remaining)
           |> Keyword.put(:retry_policy, false)
 
         ClientRequest.make_request(

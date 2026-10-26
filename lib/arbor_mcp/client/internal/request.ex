@@ -6,6 +6,8 @@ defmodule Arbor.MCP.Client.Internal.Request do
   alias Arbor.MCP.Reliability.Retry
   alias Arbor.MCP.Response
   @default_max_mrtr_rounds 8
+  # The longest finite timeout Erlang accepts: no limit, in practice.
+  @max_timeout 4_294_967_295
 
   defp format_response(response, :struct, opts) do
     # Use the proper Response.from_raw_response/2 constructor
@@ -43,17 +45,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
         ) ::
           {:ok, any()} | {:error, any()}
   def make_request(client, method, params, opts, default_timeout, deadline_cap \\ nil) do
-    case Keyword.get(opts, :format, :struct) do
-      format when format in [:map, :struct] -> :ok
-      _invalid -> raise ArgumentError, "format must be :map or :struct"
-    end
-
-    case Keyword.fetch(opts, :timeout) do
-      :error -> :ok
-      {:ok, timeout} when is_integer(timeout) and timeout >= 0 and timeout <= 4_294_967_295 -> :ok
-      _invalid -> raise ArgumentError, "timeout must be a finite non-negative millisecond value"
-    end
-
+    validate_options!(opts)
     stream_retry_mode = Keyword.get(opts, :http_stream_retry, :at_least_once)
 
     case validate_http_stream_retry_mode(client, stream_retry_mode) do
@@ -73,6 +65,27 @@ defmodule Arbor.MCP.Client.Internal.Request do
     end
   end
 
+  defp validate_options!(opts) do
+    case Keyword.get(opts, :format, :struct) do
+      format when format in [:map, :struct] -> :ok
+      _invalid -> raise ArgumentError, "format must be :map or :struct"
+    end
+
+    case Keyword.get(opts, :reset_timeout_on_progress, false) do
+      reset when is_boolean(reset) -> :ok
+      _invalid -> raise ArgumentError, "reset_timeout_on_progress must be a boolean"
+    end
+
+    for key <- [:timeout, :max_total_timeout], Keyword.has_key?(opts, key) do
+      case Keyword.fetch!(opts, key) do
+        ms when is_integer(ms) and ms >= 0 and ms <= @max_timeout -> :ok
+        _invalid -> raise ArgumentError, "#{key} must be a finite non-negative millisecond value"
+      end
+    end
+
+    :ok
+  end
+
   defp do_make_request(
          client,
          method,
@@ -87,15 +100,19 @@ defmodule Arbor.MCP.Client.Internal.Request do
     retry_policy = Keyword.get(opts, :retry_policy, :use_default)
     scope_ref = make_ref()
 
+    progress_timeout = progress_timeout(client, opts, default_timeout)
+    params = if progress_timeout, do: ensure_progress_token(params), else: params
+
     result =
-      if explicit_timeout do
+      if explicit_timeout || progress_timeout do
         deadline =
-          min(started_at + explicit_timeout, deadline_cap || started_at + explicit_timeout)
+          request_deadline(started_at, explicit_timeout, progress_timeout, opts, deadline_cap)
 
         control = %{
           deadline: deadline,
           scope_ref: scope_ref,
-          stream_retry_mode: stream_retry_mode
+          stream_retry_mode: stream_retry_mode,
+          progress_timeout: progress_timeout
         }
 
         do_mrtr_request(
@@ -176,7 +193,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
        ) do
     operation = fn ->
       with {:ok, remaining} <- remaining_timeout(control.deadline) do
-        request_before(client, method, round_params, remaining, control.deadline)
+        request_before(client, method, round_params, remaining, control)
       end
     end
 
@@ -309,12 +326,16 @@ defmodule Arbor.MCP.Client.Internal.Request do
     GenServer.call(client, {:request, method, params, %{timeout: nil}}, :infinity)
   end
 
-  defp request_before(client, method, params, timeout, deadline) do
-    GenServer.call(
-      client,
-      {:request, method, params, %{timeout: timeout, deadline: deadline}},
-      timeout
-    )
+  defp request_before(client, method, params, timeout, control) do
+    meta =
+      %{timeout: timeout, deadline: control.deadline}
+      |> then(fn meta ->
+        if control[:progress_timeout],
+          do: Map.put(meta, :progress_timeout, control.progress_timeout),
+          else: meta
+      end)
+
+    GenServer.call(client, {:request, method, params, meta}, timeout)
   catch
     :exit, {:timeout, _call} -> {:error, :timeout}
   end
@@ -326,6 +347,38 @@ defmodule Arbor.MCP.Client.Internal.Request do
       GenServer.cast(client, {:cancel_mrtr_scope, scope_ref})
       {:error, :timeout}
   end
+
+  # With reset_timeout_on_progress, :timeout is how long the request may go
+  # without progress, and :max_total_timeout caps it overall, as in the
+  # TypeScript SDK. The client restarts its timer on each progress update.
+  defp progress_timeout(client, opts, default_timeout) do
+    if Keyword.get(opts, :reset_timeout_on_progress, false),
+      do: Keyword.get(opts, :timeout) || fetch_default_timeout(client, default_timeout)
+  end
+
+  defp request_deadline(started_at, timeout, nil, _opts, cap),
+    do: min(started_at + timeout, cap || started_at + timeout)
+
+  defp request_deadline(started_at, _timeout, _progress_timeout, opts, cap) do
+    total = started_at + Keyword.get(opts, :max_total_timeout, @max_timeout)
+    min(total, cap || total)
+  end
+
+  # Progress is only sent for a request that carries a token. A token given
+  # under an atom key (`meta: %{progressToken: ...}`) is kept, under the
+  # string key the client tracks it by.
+  defp ensure_progress_token(params) when is_map(params) do
+    meta = Map.get(params, "_meta") || %{}
+
+    token =
+      Map.get(meta, "progressToken") || Map.get(meta, :progressToken) ||
+        "progress-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    meta = meta |> Map.delete(:progressToken) |> Map.put("progressToken", token)
+    Map.put(params, "_meta", meta)
+  end
+
+  defp ensure_progress_token(params), do: params
 
   defp remaining_timeout(deadline) do
     case deadline - System.monotonic_time(:millisecond) do

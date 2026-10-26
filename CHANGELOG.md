@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Requests take `reset_timeout_on_progress: true`, as the TypeScript SDK's
+  `resetTimeoutOnProgress` does: `:timeout` then limits how long the request
+  may go without a progress update, each update starts it again, and
+  `:max_total_timeout` caps the whole request. The client adds a progress
+  token to a request that has none, and the HTTP transport's
+  `:request_timeout` doesn't cut such a request off.
 - `Client.call_tool/4` checks a result against the tool's `outputSchema`, as
   the TypeScript and Python SDKs do. Once `list_tools/2` has shown a tool
   with one, a successful result must carry `structuredContent` that
