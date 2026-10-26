@@ -278,6 +278,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries is refused with a `:not_sent` transport error
   (`cause: :duplicate_progress_token`), since its progress would be
   misrouted.
+- `Arbor.MCP.Content.Sanitizer.sanitize_path/1` stripped `..` before
+  removing illegal characters, so input such as `. .` or `.\\.` came out as
+  `..`. Illegal characters are now removed first, then `.`, `..` and empty
+  path segments are dropped. A regression test covers
+  cross-origin legacy HTTP+SSE GETs, which already met the same Origin and Host
+  checks as Streamable HTTP. The internal, uncalled
+  `Arbor.MCP.Internal.ServerManager.discover_and_start/1`, which launched every
+  server it found (workspace `mcp.json`, environment, well-known directories,
+  global npm packages) with no allowlist, is removed, and server discovery no
+  longer runs a configured command to test it.
 - The default OAuth provider kept no refresh token, so an expired access token
   started the full authorization flow again, which found the same authorization
   server and failed with `:auth_loop_detected`. It now refreshes the token

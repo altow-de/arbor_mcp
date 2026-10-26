@@ -25,7 +25,7 @@ defmodule Arbor.MCP.Internal.Discovery do
   #     # Discover using specific methods
   #     servers = Arbor.MCP.Internal.Discovery.discover_servers(methods: [:npm, :env, :config])
   #
-  #     # Test if a server is reachable
+  #     # Validate a discovered URL without executing a command
   #     Arbor.MCP.Internal.Discovery.test_server(server_config)
 
   import Bitwise
@@ -151,6 +151,9 @@ defmodule Arbor.MCP.Internal.Discovery do
   @doc """
   Test if a discovered server is reachable/valid.
 
+  Command-based configs are never executed. Only URL-shaped SSE configs are
+  checked, and only by parsing the URI.
+
   ## Examples
 
       iex> Arbor.MCP.Internal.Discovery.test_server(%{command: ["node", "server.js"]})
@@ -162,10 +165,8 @@ defmodule Arbor.MCP.Internal.Discovery do
   @spec test_server(map()) :: boolean()
   def test_server(server_config) do
     case server_config do
-      %{command: command} ->
-        test_stdio_server(command)
-
-      %{url: url} ->
+      # Discovery gives command configs `url: nil`.
+      %{url: url} when is_binary(url) ->
         test_sse_server(url)
 
       _ ->
@@ -504,24 +505,6 @@ defmodule Arbor.MCP.Internal.Discovery do
   end
 
   defp valid_server_config?(_), do: false
-
-  defp test_stdio_server(command) do
-    # Try to run the command with --help or --version
-    [cmd | args] = List.wrap(command)
-
-    case System.cmd(cmd, args ++ ["--version"], stderr_to_stdout: true) do
-      {_, 0} ->
-        true
-
-      _ ->
-        case System.cmd(cmd, args ++ ["--help"], stderr_to_stdout: true) do
-          {_, 0} -> true
-          _ -> false
-        end
-    end
-  rescue
-    _ -> false
-  end
 
   defp test_sse_server(url) do
     # Try to connect to the SSE endpoint
