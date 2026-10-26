@@ -8,7 +8,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
   require Logger
   alias Arbor.MCP.Client.{ConnectionScope, Lifetime}
-  alias Arbor.MCP.Client.{Deadline, InputDispatcher, MRTR, NotificationListener}
+  alias Arbor.MCP.Client.{Deadline, InputDispatcher, MRTR, NotificationListener, ResponseCache}
   alias Arbor.MCP.Error
   alias Arbor.MCP.Internal.{Maps, Protocol, RequestParams, VersionRegistry}
   alias Arbor.RPC.{JSONRPC, LogSummary}
@@ -47,13 +47,54 @@ defmodule Arbor.MCP.Client.RequestHandler do
   def handle_request(method, params, from, state, meta \\ %{timeout: :caller_enforced}) do
     case undeliverable(from, meta) do
       nil ->
-        id = Protocol.generate_id()
-        send_built_request(method, params, id, from, state, meta)
+        case cached_result(method, params, meta, state) do
+          {:ok, result} ->
+            {:reply, {:ok, result}, state}
+
+          :miss ->
+            id = Protocol.generate_id()
+            send_built_request(method, params, id, from, state, meta)
+        end
 
       cause ->
         {:reply, {:error, not_sent_error(cause, state)}, state}
     end
   end
+
+  # A result the server said is still fresh is answered without asking it
+  # again (see ResponseCache), unless the call asked to refresh or bypass it.
+  # Only while connected: a disconnected client says so.
+  defp cached_result(method, params, meta, state) do
+    with :use <- Map.get(meta, :cache_mode, :use),
+         :ready <- Map.get(state, :connection_status),
+         %ResponseCache{} = cache <- Map.get(state, :response_cache),
+         {:ok, result} <- ResponseCache.lookup(cache, ResponseCache.key(method, params), now()) do
+      :telemetry.execute([:arbor_mcp, :client, :cache, :hit], %{}, %{method: method})
+      {:ok, result}
+    else
+      _miss_or_not_used -> :miss
+    end
+  end
+
+  # Remembers what a cacheable request in flight will answer.
+  defp track_cacheable(state, id, request, meta) do
+    case {Map.get(meta, :cache_mode, :use), Map.get(state, :response_cache)} do
+      {mode, %ResponseCache{} = cache} when mode != :bypass ->
+        key = ResponseCache.key(request["method"], request["params"])
+        pending? = &Map.has_key?(state.pending_requests, &1)
+        %{state | response_cache: ResponseCache.track(cache, id, key, pending?)}
+
+      _bypassed_or_none ->
+        state
+    end
+  end
+
+  defp cache_result(%{response_cache: %ResponseCache{} = cache} = state, id, reply),
+    do: %{state | response_cache: ResponseCache.store(cache, id, reply, now())}
+
+  defp cache_result(state, _id, _reply), do: state
+
+  defp now, do: System.monotonic_time(:millisecond)
 
   # Liveness and monotonic time are only comparable on the caller's own node.
   defp undeliverable({caller, _tag}, meta) when is_pid(caller) and node(caller) == node() do
@@ -267,11 +308,14 @@ defmodule Arbor.MCP.Client.RequestHandler do
     case result do
       {:ok, updated_state, response_data} ->
         # Non-SSE HTTP returns response immediately
+        updated_state = track_cacheable(updated_state, id, request, meta)
         inline_request_response(response_data, method, id, updated_state)
 
       {:ok, updated_state} ->
         # SSE and streaming transports - track pending request
         maybe_schedule_request_timeout(id, meta, updated_state)
+        updated_state = track_cacheable(updated_state, id, request, meta)
+        updated_state = start_progress_timeout(id, meta, updated_state)
         pending_requests = Map.put(updated_state.pending_requests, id, {from, :single, method})
         new_state = %{updated_state | pending_requests: pending_requests}
         {:noreply, remember_progress_token(request, id, new_state)}
@@ -325,6 +369,8 @@ defmodule Arbor.MCP.Client.RequestHandler do
             do: remember_tool_schemas(updated_state, method, id, reply),
             else: updated_state
 
+        updated_state = cache_result(updated_state, id, reply)
+
         {:reply, reply, updated_state}
 
       {:error, error_data, _id} ->
@@ -356,9 +402,12 @@ defmodule Arbor.MCP.Client.RequestHandler do
         do: Deadline.after_ms(state.default_timeout || 5_000),
         else: deadline
 
-    deadline
-    |> Deadline.earliest(transport.deadline)
-    |> Deadline.earliest(Deadline.after_ms(transport.timeouts.request))
+    deadline = Deadline.earliest(deadline, transport.deadline)
+
+    # A request that its progress keeps alive runs to its own deadline.
+    if meta[:progress_timeout],
+      do: deadline,
+      else: Deadline.earliest(deadline, Deadline.after_ms(transport.timeouts.request))
   end
 
   defp remote_relative_deadline(%{timeout: ms}) when is_integer(ms) and ms >= 0,
@@ -576,11 +625,77 @@ defmodule Arbor.MCP.Client.RequestHandler do
   # caller-side timeout authoritative.
   defp maybe_schedule_request_timeout(id, %{timeout: caller_timeout}, _state)
        when is_integer(caller_timeout) do
-    Process.send_after(self(), {:request_timeout, id}, caller_timeout + @caller_timeout_grace)
+    # A request without a total limit has the longest timer Erlang allows.
+    after_ms = min(caller_timeout + @caller_timeout_grace, 4_294_967_295)
+    Process.send_after(self(), {:request_timeout, id}, after_ms)
     :ok
   end
 
   defp maybe_schedule_request_timeout(_id, _meta, _state), do: :ok
+
+  # With reset_timeout_on_progress, a request also times out once it has
+  # gone :progress_timeout ms without progress (see Internal.Request); each
+  # progress update starts that again. Its deadline still caps it. The tag
+  # tells the current timer from one a reset replaced.
+  defp start_progress_timeout(id, %{progress_timeout: ms}, state)
+       when is_integer(ms) and ms >= 0 do
+    tag = make_ref()
+    timer = Process.send_after(self(), {:progress_timeout, id, tag}, ms)
+
+    # Settled requests' timers are dropped here too, so the map never holds
+    # more than the pending requests that asked for one.
+    {timers, settled} =
+      Map.split_with(progress_timeouts(state), fn {request_id, _timer} ->
+        Map.has_key?(state.pending_requests, request_id)
+      end)
+
+    Enum.each(settled, fn {_request_id, {old_timer, _tag, _ms}} ->
+      Process.cancel_timer(old_timer)
+    end)
+
+    Map.put(state, :progress_timeouts, Map.put(timers, id, {timer, tag, ms}))
+  end
+
+  defp start_progress_timeout(_id, _meta, state), do: state
+
+  defp reset_progress_timeout(request_id, state) do
+    with {timer, _tag, ms} <- Map.get(progress_timeouts(state), request_id),
+         true <- Map.has_key?(state.pending_requests, request_id) do
+      Process.cancel_timer(timer)
+      start_progress_timeout(request_id, %{progress_timeout: ms}, state)
+    else
+      _no_timer_or_settled -> state
+    end
+  end
+
+  @doc false
+  # A settled request's timer is dropped when it runs out, so the map holds
+  # only timers still due.
+  @spec progress_timed_out(term(), reference(), map()) :: {:timed_out | :stale, map()}
+  def progress_timed_out(request_id, tag, state) do
+    timers = progress_timeouts(state)
+
+    case Map.get(timers, request_id) do
+      {_timer, ^tag, _ms} ->
+        {:timed_out, Map.put(state, :progress_timeouts, Map.delete(timers, request_id))}
+
+      _replaced_or_gone ->
+        {:stale, state}
+    end
+  end
+
+  defp progress_timeouts(state), do: Map.get(state, :progress_timeouts) || %{}
+
+  defp cancel_progress_timeout(state, request_id) do
+    case Map.pop(progress_timeouts(state), request_id) do
+      {{timer, _tag, _ms}, timers} ->
+        Process.cancel_timer(timer)
+        Map.put(state, :progress_timeouts, timers)
+
+      {nil, _timers} ->
+        state
+    end
+  end
 
   @doc """
   Handles batch MCP requests.
@@ -750,6 +865,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
         state
       )
       when is_map(params) do
+    state = reset_progress_timeout(request_id, state)
     dispatch_request_notification(:handle_progress, request_id, params, state)
   end
 
@@ -1053,6 +1169,8 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
           %{state | pending_requests: new_pending_requests}
           |> remember_tool_schemas(method, response_id, response_data)
+          |> cache_result(response_id, response_data)
+          |> cancel_progress_timeout(response_id)
 
         {:ok, {from, :single}} ->
           :telemetry.execute(
@@ -1089,7 +1207,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
               "notifications/resources/list_changed",
               "notifications/resources/updated"
             ],
-       do: route_change_notification(method, params, forget_tool_schemas(state, method))
+       do: route_change_notification(method, params, forget_changed(state, method, params))
 
   defp route_notification("notifications/tasks" = method, params, state),
     do: route_task_subscription_event(method, params, state)
@@ -1125,9 +1243,12 @@ defmodule Arbor.MCP.Client.RequestHandler do
         {:noreply, state}
 
       request_id ->
-        if Map.has_key?(state.pending_requests, request_id),
-          do: dispatch_request_notification(:handle_progress, request_id, params, state),
-          else: {:noreply, forget_progress_token(state, params["progressToken"])}
+        if Map.has_key?(state.pending_requests, request_id) do
+          state = reset_progress_timeout(request_id, state)
+          dispatch_request_notification(:handle_progress, request_id, params, state)
+        else
+          {:noreply, forget_progress_token(state, params["progressToken"])}
+        end
     end
   end
 
@@ -1195,6 +1316,18 @@ defmodule Arbor.MCP.Client.RequestHandler do
   # In-process transports deliver maps that may still have atom keys.
   defp field(%{} = map, key, atom), do: Map.get(map, key) || Map.get(map, atom)
   defp field(_other, _key, _atom), do: nil
+
+  defp forget_changed(state, method, params) do
+    state = forget_tool_schemas(state, method)
+
+    case Map.get(state, :response_cache) do
+      %ResponseCache{} = cache ->
+        %{state | response_cache: ResponseCache.invalidate(cache, method, params)}
+
+      nil ->
+        state
+    end
+  end
 
   # A changed tool list may change a schema; validate again once relisted.
   defp forget_tool_schemas(state, "notifications/tools/list_changed"),

@@ -134,10 +134,19 @@ defmodule Arbor.MCP.Server.Dispatch do
     end
   end
 
+  # A handler returns the contents, or the whole result when it sets more,
+  # such as cache hints. Every content item has a uri; a result has none.
+  defp read_result(%{} = result)
+       when (is_map_key(result, :contents) or is_map_key(result, "contents")) and
+              not is_map_key(result, :uri) and not is_map_key(result, "uri"),
+       do: result
+
+  defp read_result(contents), do: %{"contents" => List.wrap(contents)}
+
   defp handle(ctx, state) do
     ctx.method
     |> do_dispatch(ctx, state)
-    |> normalize_protocol_result(ctx.request_context, ctx.module, state)
+    |> normalize_protocol_result(ctx, state)
   end
 
   defp run_middleware(ctx, state, []), do: handle(ctx, state)
@@ -203,7 +212,7 @@ defmodule Arbor.MCP.Server.Dispatch do
 
   defp middleware_result({:ok, result}, ctx, state) when is_map(result) do
     {:response, %{"jsonrpc" => "2.0", "id" => ctx.id, "result" => result}, state}
-    |> normalize_protocol_result(ctx.request_context, ctx.module, state)
+    |> normalize_protocol_result(ctx, state)
   end
 
   defp middleware_result({:error, %Error.ProtocolError{} = error}, ctx, state),
@@ -378,7 +387,7 @@ defmodule Arbor.MCP.Server.Dispatch do
 
   defp do_dispatch("resources/read", ctx, state) do
     uri = Map.get(ctx.params, "uri")
-    on_ok = &%{"contents" => List.wrap(&1)}
+    on_ok = &read_result/1
 
     case registered_resource(Registry.current(), uri) do
       {:ok, entry, args} ->
@@ -767,15 +776,15 @@ defmodule Arbor.MCP.Server.Dispatch do
   # result must not commit what the callback changed.
   defp normalize_protocol_result(
          {:response, %{"result" => result} = response, state},
-         request_context,
-         handler_module,
+         %{request_context: request_context, module: handler_module} = ctx,
          before_state
        ) do
     case ResultNormalizer.validate_result_capabilities(result, request_context) do
       :ok ->
         result =
           ResultNormalizer.protocol_result(result, request_context,
-            server_info: handler_server_info(handler_module)
+            server_info: handler_server_info(handler_module),
+            cache_hints: Keyword.get(ctx.dispatch_opts, :cache_hints, %{})
           )
 
         {:response, Map.put(response, "result", result), state}
@@ -797,7 +806,7 @@ defmodule Arbor.MCP.Server.Dispatch do
        }), before_state}
   end
 
-  defp normalize_protocol_result(other, _request_context, _handler_module, _before_state),
+  defp normalize_protocol_result(other, _ctx, _before_state),
     do: other
 
   defp validate_http_initialize(

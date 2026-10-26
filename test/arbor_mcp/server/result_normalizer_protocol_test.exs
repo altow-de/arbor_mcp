@@ -116,6 +116,35 @@ defmodule Arbor.MCP.Server.ResultNormalizerProtocolTest do
     assert overridden["cacheScope"] == "public"
   end
 
+  test "the server's cache hints fill only the fields a handler leaves off" do
+    hints = %{"tools/list" => %{"ttlMs" => 60_000, "cacheScope" => "public"}}
+
+    filled =
+      ResultNormalizer.protocol_result(
+        %{"tools" => []},
+        %{era: :modern, method: "tools/list"},
+        cache_hints: hints
+      )
+
+    assert {filled["ttlMs"], filled["cacheScope"]} == {60_000, "public"}
+
+    partly =
+      ResultNormalizer.protocol_result(
+        %{"tools" => [], "ttlMs" => 5},
+        %{era: :modern, method: "tools/list"},
+        cache_hints: hints
+      )
+
+    assert {partly["ttlMs"], partly["cacheScope"]} == {5, "public"}
+
+    legacy =
+      ResultNormalizer.protocol_result(%{"tools" => []}, %{era: :legacy, method: "tools/list"},
+        cache_hints: hints
+      )
+
+    refute Map.has_key?(legacy, "ttlMs")
+  end
+
   test "repairs invalid cache hints and removes them from non-complete results" do
     repaired =
       ResultNormalizer.protocol_result(
