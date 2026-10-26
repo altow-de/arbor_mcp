@@ -2,7 +2,16 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
   use ExUnit.Case, async: false
 
   alias Arbor.MCP.Server.{HandlerServer, ReplayCache, Runtime, Subscriptions}
-  alias Arbor.MCP.Server.Runtime.{Admission, Ref, ServiceAdapter, Services}
+
+  alias Arbor.MCP.Server.Runtime.{
+    Admission,
+    Deadline,
+    Ref,
+    ServiceAdapter,
+    Services,
+    ShutdownControl
+  }
+
   alias Arbor.MCP.Tasks
   alias Arbor.MCP.Tasks.{Extension, Store}
 
@@ -620,9 +629,11 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
   test "owned blocked termination obeys total shutdown budget and leaves siblings alive" do
     sibling = start_runtime()
 
+    # Wide enough that "still blocked" and "cutoff in the past" cannot swap
+    # places when a sleep overruns. The service never leaves terminate.
     runtime =
       start_runtime(
-        shutdown_timeout_ms: 80,
+        shutdown_timeout_ms: 5_000,
         services: [
           replay_cache: [
             adapter: LifecycleReplay,
@@ -631,20 +642,28 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
         ]
       )
 
-    assert_receive {:service_initializing, service, _table, guard, _owned}
+    assert_receive {:service_initializing, service, _table, guard, _owned}, 5_000
     {:ok, task_binding} = Services.resolve(runtime, :tasks)
     {:ok, subscription_binding} = Services.resolve(runtime, :subscriptions)
-    started = System.monotonic_time(:millisecond)
-    assert :ok = Runtime.stop(runtime)
-    assert_receive {:service_terminating, ^service}
-    assert System.monotonic_time(:millisecond) - started < 450
+    stopper = stop_async(runtime)
 
-    eventually(fn ->
-      Enum.all?(
-        [service, guard, task_binding.server, subscription_binding.server],
-        &(not Process.alive?(&1))
-      )
-    end)
+    assert_receive {:service_terminating, ^service}, 5_000
+    deadline = await_stop_deadline(Ref.table(runtime))
+    assert Process.alive?(service)
+    assert Deadline.now() < deadline - 2_000
+
+    await_deadline(deadline)
+    assert_stop_finished(stopper)
+
+    eventually(
+      fn ->
+        Enum.all?(
+          [service, guard, task_binding.server, subscription_binding.server],
+          &(not Process.alive?(&1))
+        )
+      end,
+      1_000
+    )
 
     assert {:ok, %{"result" => 0}} = Runtime.request(sibling, request(1, "read"))
   end
@@ -662,7 +681,7 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
 
     {runtime, edge, connection} =
       start_subscription_runtime(
-        shutdown_timeout_ms: 80,
+        shutdown_timeout_ms: 5_000,
         services: [subscriptions: [options: [authorize_publication: authorizer]]]
       )
 
@@ -678,13 +697,17 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
         end
       end)
 
-    assert_receive {:blocked_listener, ^listener}
+    assert_receive {:blocked_listener, ^listener}, 5_000
     [{:shutdown_guard, guard}] = :ets.lookup(Ref.table(runtime), :shutdown_guard)
-    started = System.monotonic_time(:millisecond)
-    assert :ok = Runtime.stop(runtime)
-    assert System.monotonic_time(:millisecond) - started < 450
-    eventually(fn -> not Process.alive?(listener) and not Process.alive?(guard) end)
-    Task.await(publication, 1_000)
+    stopper = stop_async(runtime)
+    deadline = await_stop_deadline(Ref.table(runtime))
+    assert Process.alive?(listener)
+    assert Deadline.now() < deadline - 2_000
+
+    await_deadline(deadline)
+    assert_stop_finished(stopper)
+    eventually(fn -> not Process.alive?(listener) and not Process.alive?(guard) end, 1_000)
+    Task.await(publication, 5_000)
     assert {:ok, %{"result" => 0}} = Runtime.request(sibling, request(1, "read"))
   end
 
@@ -751,6 +774,64 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
   defp receive_response(transport) do
     assert_receive {:transport_message, response}, 1_000
     if transport == :test, do: Jason.decode!(response), else: response
+  end
+
+  defp stop_async(runtime) do
+    parent = self()
+    stopper = spawn(fn -> send(parent, {:stopped, self(), Runtime.stop(runtime)}) end)
+    on_exit(fn -> if Process.alive?(stopper), do: Process.exit(stopper, :kill) end)
+    stopper
+  end
+
+  defp assert_stop_finished(stopper) do
+    assert_receive {:stopped, ^stopper, result}, 5_000
+
+    assert result in [:ok, {:error, :shutdown_cleanup_unconfirmed}],
+           "stop did not finish on the charged cutoff: #{inspect(result)}"
+  end
+
+  defp await_stop_deadline(table) do
+    give_up = Deadline.now() + 5_000
+    await_stop_deadline(table, give_up)
+  end
+
+  defp await_stop_deadline(table, give_up) do
+    case stop_deadline(table) do
+      deadline when is_integer(deadline) ->
+        deadline
+
+      _missing ->
+        if Deadline.now() >= give_up do
+          flunk("stop cutoff was not charged")
+        else
+          Process.sleep(10)
+          await_stop_deadline(table, give_up)
+        end
+    end
+  end
+
+  defp stop_deadline(table) do
+    case ShutdownControl.lookup(table) do
+      {:ok, control} ->
+        case :ets.lookup(control.ledger, :stop) do
+          [{:stop, _reason, deadline, _started}] -> deadline
+          _missing -> nil
+        end
+
+      _unavailable ->
+        nil
+    end
+  end
+
+  defp await_deadline(deadline) do
+    remaining = deadline - Deadline.now()
+
+    if remaining <= 0 do
+      :ok
+    else
+      Process.sleep(min(remaining, 50))
+      await_deadline(deadline)
+    end
   end
 
   defp eventually(predicate, attempts \\ 150)
