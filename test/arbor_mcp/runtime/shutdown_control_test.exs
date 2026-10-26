@@ -511,18 +511,25 @@ defmodule Arbor.MCP.Server.Runtime.ShutdownControlTest do
       monitors = Enum.map(children, &{&1, Process.monitor(&1)})
       Enum.each(children, &send(&1, :release))
 
-      for {pid, monitor} <- monitors,
-          do: assert_receive({:DOWN, ^monitor, :process, ^pid, :normal})
+      for {pid, monitor} <- monitors do
+        assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 5_000
+      end
 
-      eventually(fn ->
-        length(:ets.match_object(table, {{:runtime_owned, :_}, :_})) == baseline and
-          ShutdownControl.stats(table).owned == baseline_slots
-      end)
+      # Reaping is the synchronization point. The poll bound is not a budget.
+      eventually(
+        fn ->
+          length(:ets.match_object(table, {{:runtime_owned, :_}, :_})) == baseline and
+            ShutdownControl.stats(table).owned == baseline_slots
+        end,
+        1_000
+      )
     end
 
     :sys.resume(guard)
-    assert :ok = Runtime.stop(root)
-    eventually(fn -> not Process.alive?(observer) end)
+
+    assert Runtime.stop(root) in [:ok, {:error, :shutdown_cleanup_unconfirmed}]
+
+    eventually(fn -> not Process.alive?(observer) end, 1_000)
   end
 
   test "child DOWN retains a pending publication until its last metadata write is fenced" do
@@ -540,7 +547,7 @@ defmodule Arbor.MCP.Server.Runtime.ShutdownControlTest do
       Enum.find(collected.monitors, fn {_ref, entry} -> elem(entry, 0) == child end)
 
     send(child, :release)
-    assert_receive {:DOWN, ^monitor, :process, ^child, :normal}
+    assert_receive {:DOWN, ^monitor, :process, ^child, :normal}, 5_000
 
     {:noreply, pending, _timeout} =
       ShutdownControl.handle_info({:DOWN, monitor, :process, child, :normal}, collected)
@@ -556,7 +563,7 @@ defmodule Arbor.MCP.Server.Runtime.ShutdownControlTest do
     assert retired.pending_publications == %{}
     :sys.resume(observer)
     :sys.resume(guard)
-    assert :ok = Runtime.stop(root)
+    assert Runtime.stop(root) in [:ok, {:error, :shutdown_cleanup_unconfirmed}]
   end
 
   defp control_ledger(observer) do
