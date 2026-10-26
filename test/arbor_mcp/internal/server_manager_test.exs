@@ -54,6 +54,8 @@ defmodule Arbor.MCP.Internal.ServerManagerTest do
   test "test_server does not execute a discovered command", %{marker: marker, script: script} do
     refute Discovery.test_server(%{command: [script]})
     refute Discovery.test_server(%{command: script})
+    # As discovery returns them, with no URL.
+    refute Discovery.test_server(%{command: [script], url: nil})
     refute File.exists?(marker)
   end
 end

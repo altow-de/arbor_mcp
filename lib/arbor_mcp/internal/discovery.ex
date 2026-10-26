@@ -165,7 +165,8 @@ defmodule Arbor.MCP.Internal.Discovery do
   @spec test_server(map()) :: boolean()
   def test_server(server_config) do
     case server_config do
-      %{url: url} ->
+      # Discovery gives command configs `url: nil`.
+      %{url: url} when is_binary(url) ->
         test_sse_server(url)
 
       _ ->
