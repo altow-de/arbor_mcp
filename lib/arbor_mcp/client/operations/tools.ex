@@ -334,7 +334,8 @@ defmodule Arbor.MCP.Client.Operations.Tools do
              list_tools(client,
                timeout: remaining,
                format: :map,
-               retry_policy: false
+               retry_policy: false,
+               cache_mode: :refresh
              ),
            {:ok, remaining} <- remaining_timeout(deadline) do
         # What's left becomes the retry's limit: its total limit if

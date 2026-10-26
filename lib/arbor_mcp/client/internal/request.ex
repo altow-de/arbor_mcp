@@ -66,15 +66,9 @@ defmodule Arbor.MCP.Client.Internal.Request do
   end
 
   defp validate_options!(opts) do
-    case Keyword.get(opts, :format, :struct) do
-      format when format in [:map, :struct] -> :ok
-      _invalid -> raise ArgumentError, "format must be :map or :struct"
-    end
-
-    case Keyword.get(opts, :reset_timeout_on_progress, false) do
-      reset when is_boolean(reset) -> :ok
-      _invalid -> raise ArgumentError, "reset_timeout_on_progress must be a boolean"
-    end
+    validate_option!(opts, :format, [:map, :struct], ":map or :struct")
+    validate_option!(opts, :cache_mode, [:use, :refresh, :bypass], ":use, :refresh or :bypass")
+    validate_option!(opts, :reset_timeout_on_progress, [true, false], "a boolean")
 
     for key <- [:timeout, :max_total_timeout], Keyword.has_key?(opts, key) do
       case Keyword.fetch!(opts, key) do
@@ -84,6 +78,16 @@ defmodule Arbor.MCP.Client.Internal.Request do
     end
 
     :ok
+  end
+
+  defp validate_option!(opts, key, allowed, description) do
+    case Keyword.fetch(opts, key) do
+      :error ->
+        :ok
+
+      {:ok, value} ->
+        if value in allowed, do: :ok, else: raise(ArgumentError, "#{key} must be #{description}")
+    end
   end
 
   defp do_make_request(
@@ -112,7 +116,8 @@ defmodule Arbor.MCP.Client.Internal.Request do
           deadline: deadline,
           scope_ref: scope_ref,
           stream_retry_mode: stream_retry_mode,
-          progress_timeout: progress_timeout
+          progress_timeout: progress_timeout,
+          cache_mode: Keyword.get(opts, :cache_mode, :use)
         }
 
         do_mrtr_request(
@@ -126,13 +131,14 @@ defmodule Arbor.MCP.Client.Internal.Request do
           control
         )
       else
-        first_operation = fn -> request_once(client, method, params, nil) end
+        cache_mode = Keyword.get(opts, :cache_mode, :use)
+        first_operation = fn -> request_once(client, method, params, nil, cache_mode) end
 
         retry_operation = fn ->
           deadline = started_at + fetch_default_timeout(client, default_timeout)
 
           with {:ok, remaining} <- remaining_timeout(deadline) do
-            request_once(client, method, params, remaining)
+            request_once(client, method, params, remaining, cache_mode)
           end
         end
 
@@ -153,7 +159,8 @@ defmodule Arbor.MCP.Client.Internal.Request do
               control = %{
                 deadline: deadline,
                 scope_ref: scope_ref,
-                stream_retry_mode: stream_retry_mode
+                stream_retry_mode: stream_retry_mode,
+                cache_mode: cache_mode
               }
 
               continue_mrtr(
@@ -314,21 +321,22 @@ defmodule Arbor.MCP.Client.Internal.Request do
 
   # The absolute deadline travels with the request so the client does not
   # send it after the caller has given up (see RequestHandler.handle_request/5).
-  defp request_once(client, method, params, timeout) when is_integer(timeout) do
+  defp request_once(client, method, params, timeout, cache_mode) when is_integer(timeout) do
     deadline = System.monotonic_time(:millisecond) + timeout
-    meta = %{timeout: timeout, deadline: deadline}
+    meta = %{timeout: timeout, deadline: deadline, cache_mode: cache_mode}
     GenServer.call(client, {:request, method, params, meta}, timeout)
   catch
     :exit, {:timeout, _} -> {:error, :timeout}
   end
 
-  defp request_once(client, method, params, nil) do
-    GenServer.call(client, {:request, method, params, %{timeout: nil}}, :infinity)
+  defp request_once(client, method, params, nil, cache_mode) do
+    meta = %{timeout: nil, cache_mode: cache_mode}
+    GenServer.call(client, {:request, method, params, meta}, :infinity)
   end
 
   defp request_before(client, method, params, timeout, control) do
     meta =
-      %{timeout: timeout, deadline: control.deadline}
+      %{timeout: timeout, deadline: control.deadline, cache_mode: control.cache_mode}
       |> then(fn meta ->
         if control[:progress_timeout],
           do: Map.put(meta, :progress_timeout, control.progress_timeout),
