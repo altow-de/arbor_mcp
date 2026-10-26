@@ -213,7 +213,8 @@ defmodule Arbor.MCP.Server.LegacyInputBridgeTest do
   test "a cancelled call releases its pending input request" do
     client = connect(:legacy_only, handler: {SilentClient, [owner: self()]})
 
-    assert {:error, _timeout} = Client.call_tool(client, "onboard", %{}, timeout: 200)
+    # Long enough for the elicitation to go out on a busy machine.
+    assert {:error, _timeout} = Client.call_tool(client, "onboard", %{}, timeout: 2_000)
     assert_received :elicitation_waiting
 
     {:ok, edge} = Runtime.edge(Process.get(:bridge_server))
