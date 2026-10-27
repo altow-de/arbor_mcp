@@ -57,6 +57,20 @@ defmodule Arbor.MCP.Client.StdioLegacyRespawnTest do
     end
   end
 
+  describe "a legacy server that prints a line and exits on the probe" do
+    # Non-JSON stdout lines (banners, logs) are ignored, so a server that
+    # prints one and exits has not answered: it is replaced like any other.
+    test "is respawned and initialized", %{tmp_dir: tmp_dir} do
+      %{prefer_modern: %{result: result, methods: methods, starts: starts}} =
+        connect_concurrently(tmp_dir, :banner, [:prefer_modern], [])
+
+      assert {:ok, client} = result, inspect(result)
+      assert {:ok, "2025-11-25"} = Client.negotiated_version(client)
+      assert methods == ["server/discover" | @legacy_handshake]
+      assert starts == 2
+    end
+  end
+
   describe "a legacy server that never answers the probe" do
     test "is respawned and initialized once the probe times out", %{tmp_dir: tmp_dir} do
       results = connect_concurrently(tmp_dir, :silent, @modes, handshake_timeout: 1_500)
@@ -145,40 +159,76 @@ defmodule Arbor.MCP.Client.StdioLegacyRespawnTest do
     end
   end
 
-  describe "a probed server that cannot be confirmed stopped" do
-    test "is not replaced by a second one", %{tmp_dir: tmp_dir} do
-      log = Path.join(tmp_dir, "unconfirmed.log")
-      owner = self()
+  describe "a server that cannot be confirmed stopped" do
+    # A policy that would retry anything, the strongest test of the guard.
+    @retry_anything [
+      max_attempts: 3,
+      initial_delay: 10,
+      jitter: false,
+      should_retry?: &__MODULE__.always/1
+    ]
 
-      starter =
-        spawn_link(fn ->
-          Process.flag(:trap_exit, true)
+    test "is not replaced by a second one, even under a retry policy", %{tmp_dir: tmp_dir} do
+      for {label, policy} <- [none: [], default: [max_attempts: 2], anything: @retry_anything] do
+        log = Path.join(tmp_dir, "unconfirmed-#{label}.log")
+        result = start_with_stuck_close(log, :prefer_modern, retry_policy: policy)
 
-          result =
-            start_client(:mute, :prefer_modern, log,
-              handshake_timeout: 1_000,
-              establish_timeout: 15_000,
-              cleanup_timeout: 600
-            )
+        assert {:error, {:transport_connect_failed, reason}} = result
+        assert reason =~ "{:probed_server_stop_unconfirmed, ", "#{label}: #{reason}"
+        assert starts(log) == 1, "#{label} started #{starts(log)} servers"
+      end
+    end
 
-          send(owner, {:started, result})
+    # The failure path without a respawn: modern_only gives up on the probe,
+    # and closing the child is not confirmed either.
+    test "after a failed attempt stops a retry from starting another", %{tmp_dir: tmp_dir} do
+      log = Path.join(tmp_dir, "failed-attempt.log")
+      result = start_with_stuck_close(log, :modern_only, retry_policy: @retry_anything)
 
-          receive do
-            {:EXIT, ^owner, _reason} -> :ok
-          end
-        end)
+      assert {:error,
+              {:transport_connect_failed,
+               {:cleanup_failed, {:era_probe_failed, {:transport_error, :handshake_timeout}},
+                {:error, _cleanup}}}} = result
 
-      # Once the probe has reached the server, stop the probed child's stdio
-      # actor from answering: closing it then cannot confirm the child is
-      # gone.
-      TestHelpers.wait_until(fn -> "server/discover" in methods(log) end, timeout: 5_000)
-      actor = stdio_actor(starter)
-      true = :erlang.suspend_process(actor)
-
-      assert_receive {:started, result}, 15_000
-      assert {:error, {:transport_connect_failed, reason}} = result
-      assert reason =~ "{:probed_server_stop_unconfirmed, "
       assert starts(log) == 1
+    end
+  end
+
+  @doc false
+  def always(_reason), do: true
+
+  # Starts a client against a mute server and, once the probe has reached the
+  # server, stops the probed child's stdio actor from answering, so closing
+  # the child cannot confirm it is gone. Returns what the start returned.
+  defp start_with_stuck_close(log, mode, opts) do
+    owner = self()
+
+    starter =
+      spawn_link(fn ->
+        Process.flag(:trap_exit, true)
+
+        result =
+          start_client(
+            :mute,
+            mode,
+            log,
+            [handshake_timeout: 1_000, establish_timeout: 30_000, cleanup_timeout: 600] ++ opts
+          )
+
+        send(owner, {:started, self(), result})
+
+        receive do
+          {:EXIT, ^owner, _reason} -> :ok
+        end
+      end)
+
+    TestHelpers.wait_until(fn -> "server/discover" in methods(log) end, timeout: 5_000)
+    true = :erlang.suspend_process(stdio_actor(starter))
+
+    receive do
+      {:started, ^starter, result} -> result
+    after
+      30_000 -> flunk("the client did not finish starting")
     end
   end
 

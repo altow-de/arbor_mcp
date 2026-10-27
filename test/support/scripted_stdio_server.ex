@@ -13,6 +13,8 @@ defmodule Arbor.MCP.Test.ScriptedStdioServer do
   #           -32601, answers initialize
   #   exits   a legacy server that exits on server/discover, as Python's
   #           `mcp` 1.8 and earlier do, and answers initialize
+  #   banner  like exits, but prints a non-JSON line first, which the
+  #           transport ignores as it does any banner or log line
   #   silent  a legacy server that never answers server/discover
   #   broken  exits on any request
   #   mute    reads everything and answers nothing
@@ -43,10 +45,13 @@ defmodule Arbor.MCP.Test.ScriptedStdioServer do
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2026-07-28"],"requested":"2025-11-25"}}}\n' "$id" ;;
       legacy:server/discover)
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
-      legacy:initialize|exits:initialize|silent:initialize)
+      legacy:initialize|exits:initialize|banner:initialize|silent:initialize)
         sleep "$5"
         printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"scripted-legacy","version":"1"}}}\n' "$id" ;;
       exits:server/discover)
+        exit 3 ;;
+      banner:server/discover)
+        printf 'legacy server: unknown request, exiting\n'
         exit 3 ;;
       broken:*)
         exit 4 ;;

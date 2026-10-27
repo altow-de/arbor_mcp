@@ -78,9 +78,25 @@ defmodule Arbor.MCP.Client.ConnectionManager do
       do_establish_connection(state, opts)
     end
 
-    retry_opts = Retry.mcp_defaults(retry_policy)
+    retry_opts = retry_policy |> Retry.mcp_defaults() |> never_retry_unconfirmed_cleanup()
     Retry.with_retry(connection_operation, retry_opts)
   end
+
+  # Each attempt starts a new transport, for stdio a new server process. That
+  # never happens while one an earlier attempt opened may still be running,
+  # whatever the policy's own :should_retry? says: it could hold the port or
+  # lock the new one needs.
+  defp never_retry_unconfirmed_cleanup(retry_opts) do
+    should_retry? = Keyword.fetch!(retry_opts, :should_retry?)
+
+    Keyword.put(retry_opts, :should_retry?, fn reason ->
+      not cleanup_unconfirmed?(reason) and should_retry?.(reason)
+    end)
+  end
+
+  defp cleanup_unconfirmed?({:probed_server_stop_unconfirmed, _details}), do: true
+  defp cleanup_unconfirmed?({:cleanup_failed, _reason, {:error, _cleanup}}), do: true
+  defp cleanup_unconfirmed?(_reason), do: false
 
   defp do_establish_connection(state, opts) do
     opts = maybe_default_legacy_sse_opts(opts)
@@ -150,11 +166,25 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   # A failure with no open transport left to close.
   defp close_on_failure({:error, _reason} = failure, _transport_mod), do: failure
 
+  # A spawned server that cannot be confirmed stopped is reported with the
+  # failure, as {:cleanup_failed, reason, cleanup}, so no retry starts
+  # another beside it.
   defp close_on_failure({:error, reason, latest_state}, transport_mod) do
     ConnectionScope.transport(transport_mod, latest_state)
-    close_quietly(transport_mod, with_cleanup_deadline(transport_mod, latest_state))
-    {:error, reason}
+
+    case close_quietly(transport_mod, with_cleanup_deadline(transport_mod, latest_state)) do
+      :ok ->
+        {:error, reason}
+
+      cleanup ->
+        if spawned_server?(transport_mod, latest_state),
+          do: {:error, {:cleanup_failed, reason, cleanup_error(cleanup)}},
+          else: {:error, reason}
+    end
   end
+
+  defp cleanup_error({:error, _reason} = error), do: error
+  defp cleanup_error(other), do: {:error, other}
 
   # Cleanup gets its own budget, whatever is left of the establishment
   # deadline: it must still happen when the deadline is what failed.
