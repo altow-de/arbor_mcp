@@ -67,6 +67,9 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
         wire == ":\r\n\r\n" and state.fail_keepalive ->
           {:error, :closed}
 
+        String.starts_with?(wire, "data: ") and state.fail_terminal ->
+          {:error, :closed}
+
         wire == ":\r\n\r\n" and state.hold_keepalive ->
           send(state.observer, {:keepalive_entered, self()})
           receive do: (:return_io -> :ok)
@@ -166,6 +169,26 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
   end
 
   for adapter <- [:cowboy, :bandit] do
+    @tag :physical_http
+    test "#{adapter} ends a stream with a JSON-RPC error when its runtime stops after a keepalive" do
+      {runtime, port} = start_server(unquote(adapter))
+      conn = connect(port)
+      id = System.unique_integer([:positive])
+      {:ok, conn, ref} = request(conn, "hold", true, id)
+      assert_receive {:tool_started, _worker}, 1_000
+      {conn, events} = receive_until(conn, ref, &heartbeat?/1)
+
+      assert :ok = Runtime.stop(runtime)
+      {conn, tail} = receive_until(conn, ref, &Enum.member?(&1, {:done, ref}))
+      body = response_body(events ++ tail, ref)
+
+      # The 200 and its comments are followed by one terminal error for the
+      # request, and the stream then ends cleanly.
+      assert [_body, frame] = Regex.run(~r/\A(?::\r\n\r\n)+data: ([^\r\n]+)\r\n\r\n\z/, body)
+      assert %{"id" => ^id, "error" => %{"code" => -32_603}} = Jason.decode!(frame)
+      Mint.HTTP.close(conn)
+    end
+
     @tag :physical_http
     test "owned #{adapter} servers apply :request_keepalive_interval_ms" do
       root =
@@ -360,25 +383,38 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
     refute_received {:stream_wire, ^socket, _wire}
   end
 
-  test "a stream that loses its invocation after a keepalive is aborted without an error response" do
+  test "a stream that loses its invocation after a keepalive ends with a JSON-RPC error" do
     runtime = start_runtime([])
-    socket = stream_request(runtime, "hold", [])
+    id = System.unique_integer([:positive])
+    socket = stream_request(runtime, "hold", [], [], id)
     assert_receive {:tool_started, _worker}, 1_000
     assert_receive {:stream_wire, ^socket, ":\r\n\r\n"}, 1_000
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
         assert :ok = Runtime.stop(runtime)
-
-        assert_receive {:stream_result, ^socket,
-                        {:raised, :error, %Arbor.MCP.HttpPlug.RuntimeWriter.AdmissionError{}}},
-                       2_000
+        assert_receive {:stream_wire, ^socket, "data: " <> frame}, 2_000
+        assert %{"id" => ^id, "error" => %{"code" => -32_603}} = Jason.decode!(frame)
+        assert_receive {:stream_result, ^socket, {:returned, conn}}, 2_000
+        assert conn.state == :chunked
       end)
 
     # The keepalive already sent the headers, so the plug must not attempt a
     # 500 or a JSON-RPC rejection with the conn it had before the stream began.
     refute log =~ "MCP request processing failed"
     refute_received {:stream_resp, ^socket, _status}
+    refute_received {:stream_wire, ^socket, _wire}
+  end
+
+  test "a terminal error that cannot be written ends the stream without raising" do
+    runtime = start_runtime([])
+    socket = stream_request(runtime, "hold", fail_terminal: true)
+    assert_receive {:tool_started, _worker}, 1_000
+    assert_receive {:stream_wire, ^socket, ":\r\n\r\n"}, 1_000
+    assert :ok = Runtime.stop(runtime)
+    assert_receive {:stream_wire, ^socket, "data: " <> _frame}, 2_000
+    assert_receive {:stream_result, ^socket, {:returned, conn}}, 2_000
+    assert conn.state == :chunked
   end
 
   test "a handler timeout during an in-flight keepalive still writes the timeout error" do
@@ -482,9 +518,9 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
     runtime
   end
 
-  defp stream_request(runtime, name, adapter_opts, plug_opts \\ []) do
+  defp stream_request(runtime, name, adapter_opts, plug_opts \\ [], id \\ nil) do
     headers = [{"mcp-method", "tools/call"}, {"mcp-name", name}]
-    stream_post(runtime, tool_body(name, true), headers, adapter_opts, plug_opts)
+    stream_post(runtime, tool_body(name, true, id), headers, adapter_opts, plug_opts)
   end
 
   # A subscriptions/listen request that, with its progress token, also selects
@@ -542,7 +578,8 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
                   hold_keepalive: false,
                   fail_keepalive: false,
                   raise_headers: false,
-                  report_stack: false
+                  report_stack: false,
+                  fail_terminal: false
                 ],
                 Keyword.delete(adapter_opts, :gate)
               )
@@ -688,7 +725,7 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
     conn
   end
 
-  defp request(conn, name, stream? \\ true) do
+  defp request(conn, name, stream? \\ true, id \\ nil) do
     Mint.HTTP.request(
       conn,
       "POST",
@@ -700,12 +737,12 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
         {"mcp-method", "tools/call"},
         {"mcp-name", name}
       ],
-      tool_body(name, stream?)
+      tool_body(name, stream?, id)
     )
   end
 
   # A progress token makes the request own an SSE response stream.
-  defp tool_body(name, stream?) do
+  defp tool_body(name, stream?, id \\ nil) do
     meta = %{
       "io.modelcontextprotocol/protocolVersion" => "2026-07-28",
       "io.modelcontextprotocol/clientCapabilities" => %{}
@@ -715,7 +752,7 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
 
     Jason.encode!(%{
       jsonrpc: "2.0",
-      id: System.unique_integer([:positive]),
+      id: id || System.unique_integer([:positive]),
       method: "tools/call",
       params: %{name: name, arguments: %{}, _meta: meta}
     })

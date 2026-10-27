@@ -16,8 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the next one fails, so on Bandit a closed stream is usually noticed within
   two intervals. Cowboy cancels the request as soon as it sees the connection
   close, by terminating the request process. `subscriptions/listen` keeps
-  using only `:subscription_keepalive_interval_ms`. JSON responses and legacy
-  streams are unchanged.
+  using only `:subscription_keepalive_interval_ms`. A request whose invocation
+  closes after its SSE response started (for example on Runtime stop) now ends
+  with a JSON-RPC error for its id instead of a truncated stream. JSON
+  responses and legacy streams are unchanged.
 
 ## [2.0.0-rc.6] — 2026-10-26
 
