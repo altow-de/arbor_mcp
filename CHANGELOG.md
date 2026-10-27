@@ -22,13 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- An HTTP mount that rejects a protocol version (`-32022`) lists `supported`
-  as the revisions its `protocol_mode` accepts, in that mode's preference
-  order. A `:legacy_only` mount no longer advertises `2026-07-28`, and a
-  `:modern_only` mount no longer advertises the legacy revisions. The message
-  is `Unsupported protocol version`, matching the other transports. The same
-  list is returned for an `initialize` version the mount does not accept, and
-  `Arbor.MCP.Plugs.ProtocolVersion` uses it when a mode is configured.
+- An unsupported-version error (`-32022`) lists `supported` as exactly the
+  revisions the mount or server accepts, from the same source its request
+  validation uses (`Arbor.MCP.Server.RequestContext.accepted_versions/1`), in
+  its preference order. An HTTP mount listed every revision the library
+  knows, so a `:legacy_only` mount advertised `2026-07-28` and a
+  `:modern_only` mount the legacy revisions. A mount without `protocol_mode`
+  accepts both eras, and now lists both, ordered by the application's
+  preferred era, where the HTTP error listed only the application mode's
+  revisions and `Arbor.MCP.Plugs.ProtocolVersion` only the legacy ones. The
+  HTTP message is `Unsupported protocol version`, as on the other
+  transports. A legacy `initialize` naming a revision the server lacks is
+  still negotiated, as the legacy revisions specify, over HTTP as over
+  stdio; only a mount that serves no legacy revision rejects it.
 - Authorization code flow rejects malformed `:scopes` instead of silently
   turning a non-list value into an empty scope parameter. An improper list
   returns `{:error, :invalid_scopes}` instead of raising inside the check. `nil`

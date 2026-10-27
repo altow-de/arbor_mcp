@@ -24,6 +24,7 @@ defmodule Arbor.MCP.Plugs.ProtocolVersion do
   require Logger
 
   alias Arbor.MCP.Internal.VersionRegistry
+  alias Arbor.MCP.Server.RequestContext
 
   @behaviour Plug
 
@@ -76,26 +77,13 @@ defmodule Arbor.MCP.Plugs.ProtocolVersion do
   defp validate_modern_only_header(conn, _duplicates),
     do: reject_version(conn, "duplicate", advertised_versions(:modern_only))
 
-  # No configured mode preserves the historical header contract: legacy
-  # revisions plus the modern revision are accepted, and a rejection lists
-  # the initialize-compatible revisions.
-  defp explicit_version_accepted?(version, nil) do
-    version == "2026-07-28" or VersionRegistry.supported?(version)
-  end
+  # The versions a mount accepts and the ones a rejection lists come from
+  # the same place as the rest of the server's validation. No configured
+  # mode restricts nothing: every version of both eras.
+  defp explicit_version_accepted?(version, mode),
+    do: version in RequestContext.accepted_versions(mode)
 
-  defp explicit_version_accepted?(version, mode) do
-    VersionRegistry.supported?(version, accepted_mode(mode))
-  end
-
-  defp advertised_versions(nil), do: VersionRegistry.supported_versions()
-
-  defp advertised_versions(mode), do: VersionRegistry.supported_versions(accepted_mode(mode))
-
-  defp accepted_mode(mode)
-       when mode in [:legacy_only, :modern_only, :prefer_legacy, :prefer_modern],
-       do: mode
-
-  defp accepted_mode(_mode), do: VersionRegistry.protocol_mode()
+  defp advertised_versions(mode), do: RequestContext.accepted_versions(mode)
 
   defp reject_version(conn, _invalid_version, supported) do
     Logger.warning("Invalid MCP-Protocol-Version header")

@@ -144,12 +144,20 @@ defmodule Arbor.MCP.Plugs.ProtocolVersionTest do
       assert body["error"]["message"] == "Invalid Request"
       assert body["error"]["data"]["reason"] =~ "Unsupported protocol version"
 
-      assert body["error"]["data"]["supported_versions"] == [
-               "2025-11-25",
-               "2025-06-18",
-               "2025-03-26",
-               "2024-11-05"
-             ]
+      # Without a configured mode the Plug accepts every version of both
+      # eras, 2026-07-28 included, and lists exactly what it accepts.
+      supported = body["error"]["data"]["supported_versions"]
+      assert supported == Arbor.MCP.Server.RequestContext.accepted_versions(nil)
+      assert "2026-07-28" in supported
+
+      for version <- supported do
+        accepted =
+          conn(:post, "/mcp")
+          |> put_req_header("mcp-protocol-version", version)
+          |> ProtocolVersion.call([])
+
+        refute accepted.halted, "#{version} is listed but rejected"
+      end
     end
 
     test "rejects empty version string" do

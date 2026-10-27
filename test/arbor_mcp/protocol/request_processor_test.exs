@@ -350,6 +350,24 @@ defmodule Arbor.MCP.Protocol.RequestProcessorTest do
 
       refute "2026-07-28" in response["error"]["data"]["supported"]
     end
+
+    # initialize opens a legacy session, so a mode that also accepts the
+    # modern era still cannot agree 2026-07-28 through it.
+    test "initialize never agrees a modern revision", %{minimal_state: state} do
+      request = %{
+        "method" => "initialize",
+        "id" => 127,
+        "params" => %{"protocolVersion" => "2026-07-28"}
+      }
+
+      for mode <- [:prefer_modern, :prefer_legacy] do
+        state = Map.put(state, :protocol_mode, mode)
+        {:response, response, ^state} = RequestProcessor.process(request, state)
+
+        refute response["result"], "#{mode} answered #{inspect(response)}"
+        assert response["error"]["code"] == -32600
+      end
+    end
   end
 
   describe "tools/list" do

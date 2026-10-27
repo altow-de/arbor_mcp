@@ -142,9 +142,11 @@ defmodule Arbor.MCP.Protocol.RequestProcessor do
 
   defp process_default_initialize(id, params, state) do
     client_version = Map.get(params, "protocolVersion", VersionRegistry.preferred_version())
-    supported_versions = negotiation_versions(state)
+    supported_versions = RequestContext.accepted_versions(Map.get(state, :protocol_mode))
 
-    if client_version in supported_versions do
+    # initialize opens a legacy session, so only a legacy revision the mode
+    # accepts can be agreed this way, never a modern one.
+    if client_version in supported_versions and VersionRegistry.era_for(client_version) == :legacy do
       result =
         Initialize.build_initialize_result(params, %{
           "protocolVersion" => client_version,
@@ -166,16 +168,6 @@ defmodule Arbor.MCP.Protocol.RequestProcessor do
       error_response = ResponseBuilder.build_error_response(error, id)
 
       {:response, error_response, state}
-    end
-  end
-
-  defp negotiation_versions(state) do
-    case Map.get(state, :protocol_mode) do
-      mode when mode in [:legacy_only, :modern_only, :prefer_legacy, :prefer_modern] ->
-        VersionRegistry.supported_versions(mode)
-
-      _mode ->
-        VersionRegistry.supported_versions()
     end
   end
 

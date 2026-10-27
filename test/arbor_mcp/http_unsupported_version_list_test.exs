@@ -1,6 +1,9 @@
 defmodule Arbor.MCP.HTTPUnsupportedVersionListTest do
   @moduledoc """
-  A mount's unsupported-version error lists only the revisions that mount accepts.
+  A mount's unsupported-version error (`-32022`) lists exactly the revisions
+  that mount accepts: each listed version is served, and no other is. A
+  legacy `initialize` naming a version the server lacks is negotiated, as the
+  legacy revisions specify, the same way over HTTP as over stdio.
   """
 
   use ExUnit.Case, async: false
@@ -10,8 +13,9 @@ defmodule Arbor.MCP.HTTPUnsupportedVersionListTest do
 
   alias Arbor.MCP.HttpPlug
   alias Arbor.MCP.Internal.VersionRegistry
-  alias Arbor.MCP.Server.{Runtime, Transport}
+  alias Arbor.MCP.Server.{RequestContext, Runtime, Transport}
   alias Arbor.MCP.Test.RuntimeHTTPFixture
+  alias Arbor.MCP.Transport.Stdio
 
   defmodule Handler do
     use Arbor.MCP.Server.Handler
@@ -20,79 +24,118 @@ defmodule Arbor.MCP.HTTPUnsupportedVersionListTest do
 
   @moduletag :capture_log
 
+  @fixture Path.expand("../../priv/test/protocol_mode_stdio_server.exs", __DIR__)
+  @project_root Path.expand("../..", __DIR__)
+
   @modes [:legacy_only, :prefer_legacy, :prefer_modern, :modern_only]
   @adapters [:plug, :cowboy, :bandit]
 
-  for adapter <- @adapters, mode <- @modes do
-    test "#{adapter} #{mode} lists only the versions that mount accepts" do
-      server = start_server(unquote(adapter), unquote(mode))
-      mode = unquote(mode)
+  # The TypeScript SDK v2 client's legacy handshake for
+  # `supportedProtocolVersions: ["2024-10-07", "2025-11-25"]`: it offers the
+  # first, a revision this server does not implement, with no
+  # MCP-Protocol-Version header.
+  @ts_initialize Jason.encode!(%{
+                   "jsonrpc" => "2.0",
+                   "id" => 0,
+                   "method" => "initialize",
+                   "params" => %{
+                     "protocolVersion" => "2024-10-07",
+                     "capabilities" => %{},
+                     "clientInfo" => %{"name" => "ts-sdk-client", "version" => "2.4.0"}
+                   }
+                 })
 
-      assert_unknown_modern(server, mode)
-      assert_unknown_initialize(server, mode)
-      assert_wrong_era(server, mode)
+  for adapter <- @adapters, mode <- @modes do
+    test "#{adapter} #{mode} lists exactly the versions it accepts" do
+      server = start_server(unquote(adapter), unquote(mode))
+      {status, body} = modern_request(server, "tools/list", "2099-01-01")
+
+      assert_unsupported(status, body, "2099-01-01")
+      listed = body["error"]["data"]["supported"]
+      assert listed == RequestContext.accepted_versions(unquote(mode))
+      assert_lists_what_it_accepts(server, listed)
     end
   end
 
-  defp assert_unknown_modern(server, mode) do
-    {status, body} = modern_request(server, "tools/list", "2099-01-01")
-    assert_supported(status, body, mode, "2099-01-01")
-    prove_retries(server, body["error"]["data"]["supported"])
+  test "a mount without protocol_mode lists what it accepts under every application mode" do
+    previous = Application.fetch_env(:arbor_mcp, :protocol_mode)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, mode} -> Application.put_env(:arbor_mcp, :protocol_mode, mode)
+        :error -> Application.delete_env(:arbor_mcp, :protocol_mode)
+      end
+    end)
+
+    for app_mode <- @modes, adapter <- @adapters do
+      Application.put_env(:arbor_mcp, :protocol_mode, app_mode)
+      server = start_server(adapter, nil)
+      {status, body} = modern_request(server, "tools/list", "2099-01-01")
+
+      assert_unsupported(status, body, "2099-01-01")
+
+      assert_lists_what_it_accepts(
+        server,
+        body["error"]["data"]["supported"],
+        {adapter, app_mode}
+      )
+    end
   end
 
-  defp assert_unknown_initialize(server, mode) do
-    {status, body} = initialize(server, "1999-01-01")
-    assert_supported(status, body, mode, "1999-01-01")
-    prove_retries(server, body["error"]["data"]["supported"])
+  test "HTTP answers the TypeScript SDK's initialize exactly as stdio does" do
+    for mode <- @modes do
+      stdio = stdio_initialize(mode)
+      assert_ts_initialize_outcome(mode, stdio)
+
+      for adapter <- @adapters do
+        {_status, body} = request(start_server(adapter, mode), @ts_initialize, [])
+
+        assert outcome(body) == outcome(stdio),
+               "#{adapter} #{mode} answered #{inspect(body)}, stdio #{inspect(stdio)}"
+      end
+    end
   end
 
-  defp assert_wrong_era(server, :legacy_only) do
-    {status, body} = initialize(server, "2026-07-28")
-    assert_supported(status, body, :legacy_only, "2026-07-28")
-    prove_retries(server, body["error"]["data"]["supported"])
+  # What an initialize answer agreed or refused, whatever the server's name.
+  defp outcome(%{"result" => result}), do: {:negotiated, result["protocolVersion"]}
+  defp outcome(%{"error" => error}), do: {:rejected, error["code"], error["data"]}
+
+  # A legacy server answers an initialize for a revision it lacks with one it
+  # supports; only a mount that serves no legacy revision rejects it.
+  defp assert_ts_initialize_outcome(:modern_only, response) do
+    assert %{"code" => -32022, "data" => %{"supported" => ["2026-07-28"]}} = response["error"]
   end
 
-  defp assert_wrong_era(server, :modern_only) do
-    {status, body} = initialize(server, "2025-11-25")
-    assert_supported(status, body, :modern_only, "2025-11-25")
-    prove_retries(server, body["error"]["data"]["supported"])
+  defp assert_ts_initialize_outcome(_mode, response) do
+    assert response["result"]["protocolVersion"] == "2025-11-25", inspect(response)
   end
 
-  defp assert_wrong_era(server, :prefer_legacy) do
-    {status, body} = discover(server, "2026-07-28")
-    assert status == 200, inspect(body)
-
-    assert body["result"]["supportedVersions"] ==
-             VersionRegistry.supported_versions(:prefer_legacy)
-  end
-
-  defp assert_wrong_era(server, :prefer_modern) do
-    {status, body} = initialize(server, "2025-11-25")
-    assert status == 200, inspect(body)
-    assert body["result"]["protocolVersion"] == "2025-11-25"
-  end
-
-  defp assert_supported(status, body, mode, requested) do
+  defp assert_unsupported(status, body, requested) do
     assert status == 400, inspect(body)
     assert body["error"]["code"] == -32022
     assert body["error"]["message"] == "Unsupported protocol version"
     assert body["error"]["data"]["requested"] == requested
-
-    assert body["error"]["data"]["supported"] == VersionRegistry.supported_versions(mode)
   end
 
-  defp prove_retries(server, versions) do
-    Enum.each(versions, fn version ->
-      if VersionRegistry.modern?(version) do
-        {status, body} = discover(server, version)
-        assert status == 200, inspect(body)
-        assert body["result"]["supportedVersions"] == versions
-      else
-        {status, body} = initialize(server, version)
-        assert status == 200, inspect(body)
-        assert body["result"]["protocolVersion"] == version
-      end
-    end)
+  # Every revision the library knows is served by the mount exactly when the
+  # error listed it.
+  defp assert_lists_what_it_accepts(server, listed, label \\ nil) do
+    for version <- VersionRegistry.known_versions() do
+      accepted = accepts?(server, version)
+
+      assert accepted == version in listed,
+             "#{inspect(label)}: #{version} accepted: #{accepted}, listed: #{inspect(listed)}"
+    end
+  end
+
+  defp accepts?(server, version) do
+    if VersionRegistry.modern?(version) do
+      {status, body} = modern_request(server, "server/discover", version)
+      status == 200 and is_map(body["result"])
+    else
+      {status, body} = initialize(server, version)
+      status == 200 and body["result"]["protocolVersion"] == version
+    end
   end
 
   defp modern_request(server, method, version) do
@@ -114,8 +157,6 @@ defmodule Arbor.MCP.HTTPUnsupportedVersionListTest do
       {"mcp-method", method}
     ])
   end
-
-  defp discover(server, version), do: modern_request(server, "server/discover", version)
 
   defp initialize(server, version) do
     body =
@@ -196,6 +237,43 @@ defmodule Arbor.MCP.HTTPUnsupportedVersionListTest do
     assert {:ok, %{listener: listener}} = Transport.http_listener(root)
     assert {:ok, {_address, port}} = ThousandIsland.listener_info(listener)
     port
+  end
+
+  # The same initialize, sent to a stdio server running `mode`.
+  defp stdio_initialize(mode) do
+    mix = System.find_executable("mix") || flunk("mix executable is required")
+
+    {:ok, stdio} =
+      Stdio.connect(
+        command: [mix, "run", "--no-compile", "--no-start", @fixture, to_string(mode)],
+        cd: @project_root,
+        env: mix_child_env()
+      )
+
+    try do
+      {:ok, stdio} = Stdio.send_message(@ts_initialize, stdio)
+      assert {:ok, response, _stdio} = Stdio.receive_message(stdio, 30_000)
+      Jason.decode!(response)
+    after
+      Stdio.close(stdio)
+    end
+  end
+
+  # As in Arbor.MCP.Client.ModernStdioTest: the stdio transport isolates the
+  # child's environment, so pass on the Mix paths the child BEAM needs.
+  defp mix_child_env do
+    [{"MIX_ENV", "test"}] ++
+      for name <- [
+            "MIX_HOME",
+            "MIX_ARCHIVES",
+            "MIX_DEPS_PATH",
+            "ARBOR_RPC_PATH",
+            "ARBOR_V2_DEPS",
+            "ARBOR_V2_BUILD",
+            "ARBOR_V2_LOCK"
+          ],
+          value = System.get_env(name),
+          do: {name, value}
   end
 
   defp next_id do
