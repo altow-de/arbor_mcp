@@ -21,14 +21,77 @@ defmodule Arbor.MCP.Server.Runtime.HTTPFailureDeliveryTest do
   defmodule Handler do
     def init(opts), do: {:ok, %{test: opts[:test]}}
 
-    def dispatch(request, _module, state, _opts) do
-      send(state.test, {:entered, request["id"], CallbackContext.current().deadline})
+    def dispatch(%{"id" => id}, _module, state, _opts) do
+      send(state.test, {:entered, id, CallbackContext.current().deadline})
       receive do: (:finish -> :ok)
-      {:response, %{"jsonrpc" => "2.0", "id" => request["id"], "result" => true}, state}
+      {:response, %{"jsonrpc" => "2.0", "id" => id, "result" => true}, state}
     end
+
+    def dispatch(_notification, _module, state, _opts), do: {:notification, state}
   end
 
   test "a timeout error reaches the client although the output controller answers late" do
+    %{runtime: _runtime, controller: controller, binding: binding, domain: domain} =
+      failure_waiting_on_controller()
+
+    # Longer than the 50 ms the gateway used to wait for that answer.
+    Process.sleep(200)
+    :ok = :sys.resume(controller)
+
+    assert_receive {:mcp_http_output_wake, ^domain, nonce}, 5_000
+    assert :ok = HTTPWriterRegistry.acknowledge_wake(domain, nonce)
+    assert {:ok, effect, wire} = HTTPWriterRegistry.checkout(binding)
+
+    assert %{"id" => 7, "error" => %{"code" => -32603, "message" => "Request timeout"}} =
+             Jason.decode!(wire)
+
+    assert :ok = HTTPWriterRegistry.complete(effect, :ok)
+  end
+
+  test "a request waiting on the output controller does not hold up another request's 202" do
+    %{runtime: runtime, controller: controller} = failure_waiting_on_controller()
+    parent = self()
+
+    # A notification needs no Controller to be accepted: only the gateway
+    # must publish its 202, which it cannot do while it waits for request 7.
+    socket =
+      spawn(fn ->
+        {:ok, notice} = HTTPWriterProxy.capture(runtime, timeout: 1_000)
+        {:ok, %{deadline: deadline}} = HTTPWriterBinding.validate(notice, runtime)
+        {:ok, {domain, _}} = HTTPWriterBinding.address(notice)
+
+        {:ok, _token} =
+          HTTPGateway.submit(runtime, notice, %{"jsonrpc" => "2.0", "method" => "note"})
+
+        accepted =
+          receive do
+            {:mcp_http_output_wake, ^domain, nonce} ->
+              :ok = HTTPWriterRegistry.acknowledge_wake(domain, nonce)
+
+              with {:ok, effect, ""} <- HTTPWriterRegistry.checkout(notice),
+                   :ok <- HTTPWriterRegistry.complete(effect, :ok),
+                   do: Deadline.now() < deadline
+          after
+            Deadline.remaining(deadline) -> :expired
+          end
+
+        send(parent, {:accepted, self(), accepted})
+      end)
+
+    on_exit(fn -> Process.exit(socket, :kill) end)
+    assert_receive {:accepted, ^socket, accepted}, 5_000
+
+    assert accepted == true,
+           "the notification's 202 was not published in time: #{inspect(accepted)}"
+
+    :ok = :sys.resume(controller)
+  end
+
+  # Request 7 times out at its cutoff while the Controller is suspended. The
+  # test answers the scheduler's {:failed, ...} call as the Controller would,
+  # so the gateway goes on to ask the still-suspended Controller for the
+  # failure frame. Returns once that request is in the Controller's mailbox.
+  defp failure_waiting_on_controller do
     root =
       start_supervised!(
         {Runtime,
@@ -54,9 +117,6 @@ defmodule Arbor.MCP.Server.Runtime.HTTPFailureDeliveryTest do
     :ok = :sys.suspend(controller)
     on_exit(fn -> if Process.alive?(controller), do: :sys.resume(controller) end)
 
-    # At the cutoff the scheduler tells the controller the work failed. Answer
-    # that call as the controller would, so the gateway goes on to ask the
-    # still-suspended controller for the failure frame.
     assert_receive {:trace, ^controller, :receive,
                     {:"$gen_call", scheduler, {:failed, ^token, :handler_timeout}}},
                    5_000
@@ -68,18 +128,7 @@ defmodule Arbor.MCP.Server.Runtime.HTTPFailureDeliveryTest do
                    5_000
 
     assert Deadline.now() >= cutoff
-    # Longer than the 50 ms the gateway used to wait for that answer.
-    Process.sleep(200)
-    :ok = :sys.resume(controller)
-
-    assert_receive {:mcp_http_output_wake, ^domain, nonce}, 5_000
-    assert :ok = HTTPWriterRegistry.acknowledge_wake(domain, nonce)
-    assert {:ok, effect, wire} = HTTPWriterRegistry.checkout(binding)
-
-    assert %{"id" => 7, "error" => %{"code" => -32603, "message" => "Request timeout"}} =
-             Jason.decode!(wire)
-
-    assert :ok = HTTPWriterRegistry.complete(effect, :ok)
+    %{runtime: runtime, controller: controller, binding: binding, domain: domain}
   end
 
   # Receive traces report each message as it is queued, even while the
