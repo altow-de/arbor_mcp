@@ -156,8 +156,13 @@ a probe in exactly these cases:
 
 Nothing else triggers `initialize`: a recognized modern error, an
 authentication error, a cached-modern probe failure, any other transport
-failure, and over stdio output that is malformed, cut off or larger than
-`:max_frame_bytes` all fail the connection. Similarly, `:prefer_legacy`
+failure, and over stdio malformed output all fail the connection.
+Malformed output means a line that looks like JSON (it starts with `{` or
+`[`) but is not a valid JSON-RPC answer to the probe, a frame cut off when
+the server exits, or one larger than `:max_frame_bytes`. Other stdout lines,
+banners and logs, are ignored throughout the stdio transport, so they are
+no answer: a server that prints one and then exits counts as exiting
+without answering. Similarly, `:prefer_legacy`
 probes modern only after a protocol-level legacy failure while the transport
 remains usable. Strict modes never fall back or respawn.
 

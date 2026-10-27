@@ -18,9 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:establish_timeout`. The probed pipe carries nothing more, so a late
   answer to the probe cannot reach the handshake. A process that cannot be
   confirmed stopped is not replaced: the attempt fails with
-  `{:probed_server_stop_unconfirmed, %{probe: ..., cleanup: ...}}`. Output
-  that is malformed, cut off or over `:max_frame_bytes` never leads to a
-  respawn. A modern-only server
+  `{:probed_server_stop_unconfirmed, %{probe: ..., cleanup: ...}}`, and no
+  `:retry_policy` retries it. Malformed output never leads to a respawn: a
+  JSON-looking line (one starting with `{` or `[`) that is not a valid
+  JSON-RPC answer, or a frame cut off or over `:max_frame_bytes`. Non-JSON
+  stdout lines (banners, logs), which the stdio transport ignores
+  everywhere, are no answer, so a server that prints one and exits is
+  replaced like any other. A modern-only server
   then fails on `initialize` with the versions it supports, reported as
   `{:era_probe_and_initialize_failed, %{..., respawned: true}}`. The legacy
   observation is recorded and the `[:arbor_mcp, :client, :era, :fallback]`
@@ -32,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A failed connection attempt whose stdio server cannot be confirmed
+  stopped now fails with `{:cleanup_failed, reason, {:error, cleanup}}`,
+  the shape `Arbor.MCP.Client` already uses for unconfirmed cleanup, and a
+  `:retry_policy` never retries it or the stdio respawn refusal, whatever
+  its `:should_retry?`, so no new server process starts beside one that may
+  still run.
 - Over stdio, the modern `server/discover` probe gave a newly spawned server
   only `:era_probe_timeout` (2 s by default) to start and answer. Under the
   default `:prefer_modern`, and under `:modern_only`, a server that took

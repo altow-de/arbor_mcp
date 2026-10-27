@@ -271,8 +271,10 @@ stopped is not replaced; the attempt fails with
 `{:probed_server_stop_unconfirmed, ...}`. A modern-only server fails on the
 new `initialize` with the versions it supports. Those are the only two
 triggers: a live server's error answer, such as `-32601`, leads to
-`initialize` on the same pipe, and malformed, cut-off or oversized output
-fails the connection. `:modern_only` fails with the probe error and never
+`initialize` on the same pipe, and malformed output (a JSON-looking line
+that is not a valid answer, or a frame cut off or over `:max_frame_bytes`)
+fails the connection. Non-JSON lines such as banners and logs are ignored,
+as everywhere on stdio, and are no answer. `:modern_only` fails with the probe error and never
 respawns.
 
 Successful modern observations are pinned by endpoint and relevant transport
