@@ -174,11 +174,18 @@ defmodule Arbor.MCP.HttpPlug.RuntimeSessionStream do
   end
 
   # `:ended` when the stream is no longer current, so there is nothing to
-  # frame for.
+  # frame for. Its deadline can pass after the proof, while the event is
+  # encoded under it (`:output_expired`); a frame that fails while the stream
+  # has meanwhile ended is put down to that too. A malformed event on a
+  # current stream is `{:error, :invalid_sse_event}`.
   defp frame(conn, type, data, cursor) do
-    case stream_proof(conn) do
-      {:ok, proof} -> frame_current(proof, type, data, cursor)
-      _ended -> :ended
+    with {:ok, proof} <- stream_proof(conn),
+         {:ok, wire} <- frame_current(proof, type, data, cursor) do
+      {:ok, wire}
+    else
+      {:error, :output_expired} -> :ended
+      {:error, :invalid_sse_event} = invalid -> if ended?(conn), do: :ended, else: invalid
+      _not_current -> :ended
     end
   end
 
@@ -195,6 +202,7 @@ defmodule Arbor.MCP.HttpPlug.RuntimeSessionStream do
       prefix = if cursor, do: "id: " <> cursor <> "\n", else: ""
       {:ok, prefix <> "event: " <> type <> "\ndata: " <> json <> "\n\n"}
     else
+      {:error, :output_expired} = expired -> expired
       _invalid -> {:error, :invalid_sse_event}
     end
   end

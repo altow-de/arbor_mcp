@@ -5,10 +5,12 @@ defmodule Arbor.MCP.Server.Runtime.HTTPSessionStreamEndTest do
   # raising, so the server closes the response cleanly and logs nothing.
   use ExUnit.Case, async: false
 
+  import Arbor.MCP.TestHelpers, only: [wait_until: 2]
   import ExUnit.CaptureLog
 
   alias Arbor.MCP.{HttpPlug, SessionManager}
   alias Arbor.MCP.Server.Runtime
+  alias Arbor.MCP.Server.Runtime.{Deadline, OutputCodec}
 
   @version "2025-11-25"
 
@@ -91,8 +93,84 @@ defmodule Arbor.MCP.Server.Runtime.HTTPSessionStreamEndTest do
     end
   end
 
-  defp runtime do
-    root = start_supervised!({Runtime, handler: Handler, services: [sessions: []]})
+  # The stream's deadline (the Runtime's request timeout) passes after its
+  # proof was checked, while the next event is encoded under it. The stream
+  # is suspended inside `OutputCodec.prepare/2` on that event, which is large
+  # enough to still be walking its term, until the deadline it is encoding
+  # under has passed.
+  for mode <- [:stream, :oneshot] do
+    test "a #{mode} GET stream whose deadline passes while it encodes an event ends cleanly" do
+      runtime = runtime(request_timeout_ms: 1_000)
+
+      opts =
+        HttpPlug.init(runtime: runtime, protocol_mode: :legacy_only, sse_mode: unquote(mode))
+
+      session = initialize(opts)
+      {:ok, service} = Runtime.service(runtime, :sessions)
+      {:ok, lease} = SessionManager.ensure_session(service, session, %{}, [])
+      {:ok, cursor} = append(service, lease, "replay-zero")
+      # As many JSON values as one replay append may carry, so encoding it
+      # takes a while.
+      assert {:ok, _event} = append(service, lease, %{"bulk" => List.duplicate(0, 30_000)})
+
+      # The stream runs at low priority and the test at high priority while
+      # it waits, so the stream is still encoding when the test suspends it.
+      stream =
+        Task.async(fn ->
+          Process.flag(:priority, :low)
+
+          receive do
+            :go -> HttpPlug.call(request(:get, session, cursor.id), opts)
+          end
+        end)
+
+      log =
+        capture_log(fn ->
+          :erlang.trace_pattern({OutputCodec, :prepare, 2}, true, [:global])
+          :erlang.trace(stream.pid, true, [:call])
+
+          try do
+            previous = Process.flag(:priority, :high)
+            send(stream.pid, :go)
+            deadline = suspend_encoding_bulk(stream.pid)
+            Process.flag(:priority, previous)
+            wait_until(fn -> Deadline.now() > deadline end, timeout: 2_000, interval: 10)
+            :erlang.trace(stream.pid, false, [:call])
+            true = :erlang.resume_process(stream.pid)
+
+            conn = Task.await(stream, 5_000)
+            assert conn.status == 200
+            assert conn.resp_body =~ "event: connected"
+            refute conn.resp_body =~ "bulk"
+          after
+            :erlang.trace_pattern({OutputCodec, :prepare, 2}, false, [:global])
+          end
+        end)
+
+      refute log =~ "[error]"
+    end
+  end
+
+  # Suspends the stream as it starts encoding the bulk event, and returns the
+  # deadline it encodes under.
+  defp suspend_encoding_bulk(pid) do
+    receive do
+      {:trace, ^pid, :call,
+       {OutputCodec, :prepare, [%{"params" => %{"data" => %{"bulk" => _}}}, options]}} ->
+        true = :erlang.suspend_process(pid)
+        Keyword.fetch!(options, :deadline)
+
+      {:trace, ^pid, :call, _other} ->
+        suspend_encoding_bulk(pid)
+    after
+      2_000 -> flunk("the stream never encoded the bulk event")
+    end
+  end
+
+  defp runtime(opts \\ []) do
+    root =
+      start_supervised!({Runtime, [handler: Handler, services: [sessions: []]] ++ opts})
+
     {:ok, runtime} = Runtime.ref(root)
     runtime
   end
