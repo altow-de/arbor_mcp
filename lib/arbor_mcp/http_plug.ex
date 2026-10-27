@@ -1551,7 +1551,9 @@ defmodule Arbor.MCP.HttpPlug do
   defp request_keepalive_interval(%{"method" => "subscriptions/listen"}, _opts), do: :infinity
   defp request_keepalive_interval(_request, opts), do: opts.request_keepalive_interval_ms
 
-  defp wait_request_id(%{"id" => id}), do: id
+  # A terminal error may echo only an id the Runtime accepts; any other id is
+  # an invalid request, and its error uses a null id.
+  defp wait_request_id(%{"id" => id}) when is_binary(id) or is_integer(id), do: id
   defp wait_request_id(_request), do: nil
 
   # Every recursive call is a tail call: a request can wait through one

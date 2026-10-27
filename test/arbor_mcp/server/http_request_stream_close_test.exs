@@ -406,6 +406,26 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
     refute_received {:stream_wire, ^socket, _wire}
   end
 
+  test "a terminal error for a request id that is not a string or integer uses a null id" do
+    runtime = start_runtime([])
+
+    # The suspended gateway has not yet rejected the invalid id when the
+    # Runtime stops, so the request is still waiting through keepalives.
+    {:ok, gateway} = Arbor.MCP.Server.Runtime.HTTPGateway.address(runtime)
+    :sys.suspend(gateway)
+    on_exit(fn -> if Process.alive?(gateway), do: :sys.resume(gateway) end)
+
+    socket = stream_request(runtime, "hold", [], [], %{})
+    assert_receive {:stream_wire, ^socket, ":\r\n\r\n"}, 1_000
+    stop = Task.async(fn -> Runtime.stop(runtime) end)
+    assert_receive {:stream_wire, ^socket, "data: " <> frame}, 10_000
+    assert %{"id" => nil, "error" => %{"code" => -32_603}} = Jason.decode!(frame)
+    assert_receive {:stream_result, ^socket, {:returned, conn}}, 1_000
+    assert conn.state == :chunked
+    # The suspended gateway can make the stop report unconfirmed cleanup.
+    _stopped = Task.await(stop, 15_000)
+  end
+
   test "a terminal error that cannot be written ends the stream without raising" do
     runtime = start_runtime([])
     socket = stream_request(runtime, "hold", fail_terminal: true)
@@ -742,7 +762,7 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
   end
 
   # A progress token makes the request own an SSE response stream.
-  defp tool_body(name, stream?, id \\ nil) do
+  defp tool_body(name, stream?, id) do
     meta = %{
       "io.modelcontextprotocol/protocolVersion" => "2026-07-28",
       "io.modelcontextprotocol/clientCapabilities" => %{}
