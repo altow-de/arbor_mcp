@@ -78,6 +78,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `notifications/cancelled`). It now runs to its end, under its original
   deadline, and its response, which nothing can carry any more, is released.
   A modern request is still cancelled with its connection.
+- A legacy session's GET stream raised `RuntimeWriter.AdmissionError` ("MCP
+  HTTP response capacity unavailable"), logged as an error, and dropped its
+  connection without ending the response, when the session was deleted, or
+  its lease or deadline ran out, while the stream was writing a page of its
+  replay. It now ends the response normally; a later stream resumes the rest
+  of the page with `Last-Event-ID`. Other refusals and failed writes still
+  raise.
 
 ## [2.0.0-rc.6] — 2026-10-26
 

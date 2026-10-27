@@ -79,13 +79,27 @@ defmodule Arbor.MCP.HttpPlug.RuntimeSessionStream do
   end
 
   defp drain(conn, %{page: %{events: events} = page} = context) do
-    conn = Enum.reduce(events, conn, &write_event/2)
-    context = %{context | cursor: page.next_cursor || context.cursor}
+    case write_events(events, conn) do
+      {:ok, conn} ->
+        context = %{context | cursor: page.next_cursor || context.cursor}
 
-    cond do
-      page.more? -> next_page(conn, context)
-      context.mode == :oneshot -> conn
-      true -> poll(conn, context)
+        cond do
+          page.more? -> next_page(conn, context)
+          context.mode == :oneshot -> conn
+          true -> poll(conn, context)
+        end
+
+      {:ended, conn} ->
+        conn
+    end
+  end
+
+  defp write_events([], conn), do: {:ok, conn}
+
+  defp write_events([event | events], conn) do
+    case write_event(event, conn) do
+      {:ok, conn} -> write_events(events, conn)
+      :ended -> {:ended, conn}
     end
   end
 
@@ -121,12 +135,36 @@ defmodule Arbor.MCP.HttpPlug.RuntimeSessionStream do
   defp stream_proof(conn),
     do: HTTPWriterBinding.validate(RuntimeWriter.binding(conn), RuntimeWriter.runtime(conn))
 
+  # A stream can end while it writes a page it has already read: its session
+  # is deleted, its lease or deadline runs out, or another stream replaces
+  # it. The frame is then refused before any IO, and the stream ends
+  # normally, without the rest of the page, which a new stream resumes with
+  # Last-Event-ID. Any other refusal, and a failed or uncertain write, still
+  # raises, as RuntimeWriter.chunk/2 does.
   defp write_event(event, conn) do
     with {:ok, wire} <- frame(conn, event.type, event.data, event.id),
-         {:ok, conn} <- RuntimeWriter.chunk(conn, wire),
-         do: conn,
-         else: (_closed -> raise(RuntimeWriter.AdmissionError))
+         {:ok, conn} <- chunk(conn, wire) do
+      {:ok, conn}
+    else
+      :ended -> :ended
+      _invalid -> raise(RuntimeWriter.AdmissionError)
+    end
   end
+
+  defp chunk(conn, wire) do
+    binding = RuntimeWriter.binding(conn)
+
+    with {:ok, effect} <- HTTPWriterRegistry.prepare(binding, wire),
+         :ok <- HTTPWriterRegistry.publish(effect),
+         {:ok, effect, wire} <- HTTPWriterRegistry.peek(binding),
+         {:ok, conn} <- RuntimeWriter.perform_if_ready(conn, effect, wire, &Plug.Conn.chunk/2) do
+      {:ok, conn}
+    else
+      _refused -> if ended?(conn), do: :ended, else: raise(RuntimeWriter.AdmissionError)
+    end
+  end
+
+  defp ended?(conn), do: not match?({:ok, _proof}, stream_proof(conn))
 
   defp frame(_conn, type, {:raw, value}, nil)
        when type == "endpoint" and is_binary(value) do
@@ -135,10 +173,17 @@ defmodule Arbor.MCP.HttpPlug.RuntimeSessionStream do
       else: {:ok, "event: endpoint\ndata: " <> value <> "\n\n"}
   end
 
+  # `:ended` when the stream is no longer current, so there is nothing to
+  # frame for.
   defp frame(conn, type, data, cursor) do
-    with {:ok, proof} <-
-           stream_proof(conn),
-         {:ok, %{wire: json}} <-
+    case stream_proof(conn) do
+      {:ok, proof} -> frame_current(proof, type, data, cursor)
+      _ended -> :ended
+    end
+  end
+
+  defp frame_current(proof, type, data, cursor) do
+    with {:ok, %{wire: json}} <-
            OutputCodec.prepare(data, codec: :protocol, deadline: proof.deadline),
          true <-
            is_binary(type) and byte_size(type) in 1..128 and
