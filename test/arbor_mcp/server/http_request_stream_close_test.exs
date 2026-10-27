@@ -300,13 +300,21 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
       receive do: (:authorize -> {:ok, filter})
     end
 
-    socket = stream_listen(runtime, [], authorize_subscription_filter: authorize)
+    socket = stream_listen(runtime, [gate: true], authorize_subscription_filter: authorize)
+    await = {Arbor.MCP.HttpPlug.RuntimeWriter, :await, 2}
+    :erlang.trace_pattern(await, true, [])
+    on_exit(fn -> :erlang.trace_pattern(await, false, []) end)
+    :erlang.trace(socket, true, [:call, {:tracer, self()}])
+    send(socket, :go)
+
+    # The wait itself is observed, so a slow request process cannot make this
+    # pass: the listen request waits with no request keepalive at all.
+    assert_receive {:trace, ^socket, :call, {_writer, :await, [_conn, :infinity]}}, 1_000
     assert_receive {:authorizing_listen, authorizer}, 1_000
 
-    # Ten 20 ms request keepalive intervals pass while the listener is set up.
     # A comment here would send the headers that the subscription stream sends
     # itself, and its send_chunked would then raise Plug.Conn.AlreadySentError.
-    refute_receive {:stream_headers, ^socket, _status}, 200
+    refute_received {:stream_headers, ^socket, _status}
     refute_received {:stream_wire, ^socket, _wire}
 
     send(authorizer, :authorize)
@@ -536,10 +544,13 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
                   raise_headers: false,
                   report_stack: false
                 ],
-                adapter_opts
+                Keyword.delete(adapter_opts, :gate)
               )
             )
           )
+
+        # A gated request waits so the test can trace it from its first call.
+        if adapter_opts[:gate], do: receive(do: (:go -> :ok))
 
         opts =
           Arbor.MCP.HttpPlug.init(
