@@ -440,6 +440,28 @@ defmodule Arbor.MCP.Server.Runtime.HTTPWriterRegistry do
     end
   end
 
+  # True only for the borrowed socket whose exact Listener has authorized its
+  # fixed completion and not yet claimed it. Ordinary frames are refused in
+  # that tail with the same reason as a closed invocation, so a stream asks
+  # here before treating such a refusal as the end of its listener.
+  @spec listener_tail?(HTTPListenerBinding.t(), Ref.t()) :: boolean()
+  def listener_tail?(listener, runtime) do
+    with {:ok, binding, nonce} <- HTTPListenerBinding.address(listener),
+         {:ok, {domain, token}} <- HTTPWriterBinding.address(binding),
+         true <- domain.runtime == runtime,
+         {:ok, gate} <- read(domain),
+         %{
+           mode: :listener_tail,
+           writer: writer,
+           authority: %{listener: %{registration: ^nonce, terminal: %{state: 2} = terminal}}
+         } = info <- gate.bindings[token],
+         true <- writer == self() and not gate.sealed do
+      terminal.deadline > Deadline.now() and listener_domain_current?(domain, info)
+    else
+      _closed -> false
+    end
+  end
+
   def prepare_listener_completion(completion) do
     with {:ok, listener, receipt} <- HTTPListenerCompletion.address(completion),
          {:ok, binding, nonce} <- HTTPListenerBinding.address(listener),
