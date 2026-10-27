@@ -110,6 +110,25 @@ defmodule Arbor.MCP.HttpPlug do
   and any requested replay page, then returns. The deprecated GET handshake
   announces its POST alias; the Streamable HTTP GET uses a `connected` event.
   Neither mode starts a standalone global SSEHandler or session manager.
+  Without the option, the `:arbor_mcp, :sse_mode` application environment
+  decides, and the legacy `:arbor_mcp, :test_mode` flag makes it `:oneshot`;
+  pass `sse_mode: :stream` to a test listener whose clients read the GET
+  stream. A `:stream` GET lasts until the Runtime's `:request_timeout_ms`, and
+  an ArborMCP client then opens it again with `Last-Event-ID`; if that GET is
+  refused with 405, the client carries on POST-only.
+
+  In the legacy Streamable HTTP revisions, a request that carries
+  `_meta.progressToken`, from a client that accepts `text/event-stream`, owns
+  its POST response stream, as with the TypeScript SDK's servers. Its progress
+  and its callback's other notifications are written there ahead of the
+  response. `initialize`, batches and requests without a progress token are
+  answered with JSON; their callback's progress, log messages and list changes
+  go to the session's own GET stream. Requests a callback sends to the client,
+  such as `roots/list`, always use that GET stream. Without an open GET stream
+  these return `{:error, :stream_closed}`. Those revisions say a disconnect
+  SHOULD NOT be taken for a cancellation, so a legacy request whose connection
+  goes away runs to its end, under its original deadline, and what it would
+  have written is released; a client cancels with `notifications/cancelled`.
 
   MCP 2026-07-28 does not use that GET stream. A modern
   `subscriptions/listen` POST owns its SSE response directly. The response
@@ -118,16 +137,19 @@ defmodule Arbor.MCP.HttpPlug do
   (default: `15_000`; set `:infinity` to disable).
 
   An ordinary modern request that opts into progress or request logs also owns
-  its POST response stream. `notifications/progress` and
+  its POST response stream. In either era a client accepts an event stream
+  when its `Accept` header names `text/event-stream` with a quality above
+  zero; `text/event-stream;q=0` refuses one, and a wildcard such as `*/*`
+  gets JSON. `notifications/progress` and
   `notifications/message` are written only there, followed by one final
   JSON-RPC response that closes the stream. SSE comment keepalives are sent
   every `:request_keepalive_interval_ms` milliseconds (default: `15_000`;
-  set `:infinity` to disable). A failed write cancels that request's worker
-  without affecting other requests or subscriptions. The first write after a
-  TCP peer closes usually succeeds, so a write-detected close is usually
-  noticed within two intervals; Cowboy also cancels by terminating the request
-  process when it sees the connection close. JSON responses do not send
-  keepalives.
+  set `:infinity` to disable). A failed write cancels that modern request's
+  worker without affecting other requests or subscriptions. The first write
+  after a TCP peer closes usually succeeds, so a write-detected close is
+  usually noticed within two intervals; Cowboy also cancels by terminating the
+  request process when it sees the connection close. JSON responses do not
+  send keepalives.
 
   Mount subscription authorizers are composed with the Runtime service policy;
   both must authorize. Mount queue, message-byte, aggregate-byte and lifetime
@@ -180,6 +202,7 @@ defmodule Arbor.MCP.HttpPlug do
 
   alias Arbor.MCP.Transport.HTTP.RequestHeaders
   alias Arbor.RPC.{JSONRPC, LogSummary}
+  alias Plug.Conn.Utils, as: ConnUtils
 
   @session_id_max_bytes 128
 
@@ -722,12 +745,8 @@ defmodule Arbor.MCP.HttpPlug do
   # Per MCP spec, SSE GET uses the same endpoint as POST.
   # Handle GET requests with Accept: text/event-stream on any path.
   defp do_dispatch("GET", _path, conn, opts) do
-    accepts_sse =
-      conn
-      |> get_req_header("accept")
-      |> Enum.any?(&String.contains?(&1, "text/event-stream"))
-
-    if legacy_http_sse_enabled?(opts) and accepts_sse and mcp_endpoint_path?(conn, opts) do
+    if legacy_http_sse_enabled?(opts) and accepts_event_stream?(conn) and
+         mcp_endpoint_path?(conn, opts) do
       handle_runtime_session_endpoint(conn, opts)
     else
       conn
@@ -1727,8 +1746,33 @@ defmodule Arbor.MCP.HttpPlug do
   defp runtime_output_format(%{private: %{arbor_mcp_legacy_session: _id}}, _request),
     do: :legacy_sse
 
-  defp runtime_output_format(conn, request),
-    do: if(request_stream?(conn, request), do: :sse, else: :json)
+  defp runtime_output_format(conn, request) do
+    if request_stream?(conn, request) or legacy_progress_stream?(conn, request),
+      do: :sse,
+      else: :json
+  end
+
+  # In the legacy Streamable HTTP revisions a server may answer a request's
+  # POST with an event stream that carries the request's own notifications
+  # ahead of its response, as the TypeScript SDK's servers do. A legacy
+  # request that asks for progress, from a client that accepts an event
+  # stream, gets one, so its progress doesn't depend on the session's GET
+  # stream. `initialize` stays JSON, and a client that accepts only JSON keeps
+  # the JSON answer with progress on its session GET stream. Modern requests
+  # are decided by `request_stream?/2` alone.
+  defp legacy_progress_stream?(
+         conn,
+         %{
+           "id" => _id,
+           "method" => method,
+           "params" => %{"_meta" => %{"progressToken" => token}}
+         } = request
+       )
+       when method != "initialize" and not is_nil(token) do
+    not modern_http_request?(conn, request) and accepts_event_stream?(conn)
+  end
+
+  defp legacy_progress_stream?(_conn, _request), do: false
 
   defp runtime_route_policy(%{private: %{arbor_mcp_legacy_session: _id}} = conn, request) do
     members = if is_list(request), do: request, else: [request]
@@ -2160,7 +2204,7 @@ defmodule Arbor.MCP.HttpPlug do
   end
 
   defp json_request?(conn) do
-    case Plug.Conn.Utils.content_type(List.first(get_req_header(conn, "content-type"), "")) do
+    case ConnUtils.content_type(List.first(get_req_header(conn, "content-type"), "")) do
       {:ok, "application", subtype, _params} ->
         subtype == "json" or String.ends_with?(subtype, "+json")
 
@@ -3206,11 +3250,74 @@ defmodule Arbor.MCP.HttpPlug do
 
   defp request_stream?(_conn, _request), do: false
 
+  # Whether the client accepts an event stream in either era: its Accept
+  # header names `text/event-stream` with a quality above zero (RFC 9110
+  # section 12.5.1), so `text/event-stream;q=0` refuses one. A wildcard such
+  # as `*/*` or `text/*` doesn't opt in: the MCP spec asks clients to list
+  # `text/event-stream` itself, and JSON is always a valid answer to a POST.
+  # Commas and semicolons inside a quoted parameter value don't separate
+  # anything, so a range's own `q` can't be cut off from it; a header with an
+  # unterminated quoted string doesn't opt in.
   defp accepts_event_stream?(conn) do
     conn
     |> get_req_header("accept")
-    |> Enum.any?(&String.contains?(&1, "text/event-stream"))
+    |> Enum.any?(fn header ->
+      case split_unquoted(header, ?,) do
+        {:ok, ranges} -> Enum.any?(ranges, &event_stream_range?/1)
+        :error -> false
+      end
+    end)
   end
+
+  defp event_stream_range?(range) do
+    with {:ok, [media | params]} <- split_unquoted(range, ?;),
+         "text/event-stream" <- media |> String.trim() |> String.downcase() do
+      positive_quality?(quality(params))
+    else
+      _other -> false
+    end
+  end
+
+  # The weight is the `q` parameter, whose value is a bare qvalue (RFC 9110
+  # section 12.4.2). A range without one has quality 1.
+  defp quality(params) do
+    Enum.find_value(params, "1", fn param ->
+      case String.split(param, "=", parts: 2) do
+        [name, value] -> if String.downcase(String.trim(name)) == "q", do: String.trim(value)
+        _other -> nil
+      end
+    end)
+  end
+
+  # A malformed qvalue, a quoted one included, makes its range unusable, so it
+  # doesn't opt in either.
+  defp positive_quality?(q) do
+    Regex.match?(~r/\A(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)\z/, q) and
+      not Regex.match?(~r/\A0(?:\.0{0,3})?\z/, q)
+  end
+
+  # Splits a header value at `separator` outside quoted strings (RFC 9110
+  # section 5.6.4). Inside one, a backslash escapes the next byte, so an
+  # escaped quote doesn't end it.
+  defp split_unquoted(value, separator), do: split_unquoted(value, separator, false, "", [])
+
+  defp split_unquoted(<<>>, _separator, true, _part, _parts), do: :error
+
+  defp split_unquoted(<<>>, _separator, false, part, parts),
+    do: {:ok, Enum.reverse([part | parts])}
+
+  defp split_unquoted(<<?\\, byte, rest::binary>>, separator, true, part, parts),
+    do: split_unquoted(rest, separator, true, <<part::binary, ?\\, byte>>, parts)
+
+  defp split_unquoted(<<?", rest::binary>>, separator, quoted?, part, parts),
+    do: split_unquoted(rest, separator, not quoted?, <<part::binary, ?">>, parts)
+
+  defp split_unquoted(<<byte, rest::binary>>, separator, false, part, parts)
+       when byte == separator,
+       do: split_unquoted(rest, separator, false, "", [part | parts])
+
+  defp split_unquoted(<<byte, rest::binary>>, separator, quoted?, part, parts),
+    do: split_unquoted(rest, separator, quoted?, <<part::binary, byte>>, parts)
 
   defp process_mcp_request(%{"method" => "subscriptions/listen"} = request, opts) do
     open_http_subscription(request, opts)

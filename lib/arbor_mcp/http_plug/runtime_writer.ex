@@ -61,6 +61,26 @@ defmodule Arbor.MCP.HttpPlug.RuntimeWriter do
 
   defp admitted(conn, wire, write), do: write.(conn, wire)
 
+  # chunk/2 for a listener stream. A frame refused before IO because the exact
+  # listener has entered its completion tail, where only that completion can
+  # still be written, is returned as a value. Every other refusal, and any
+  # failed or uncertain write, raises exactly as chunk/2 does.
+  def listener_chunk(conn, listener, body) do
+    binding = binding(conn)
+
+    with {:ok, effect} <- HTTPWriterRegistry.prepare(binding, IO.iodata_to_binary(body)),
+         :ok <- HTTPWriterRegistry.publish(effect),
+         {:ok, effect, wire} <- HTTPWriterRegistry.peek(binding),
+         {:ok, conn} <- perform_if_ready(conn, effect, wire, &Plug.Conn.chunk/2) do
+      {:ok, conn}
+    else
+      _refused ->
+        if HTTPWriterRegistry.listener_tail?(listener, runtime(conn)),
+          do: {:error, :http_listener_tail},
+          else: raise(AdmissionError)
+    end
+  end
+
   def await(conn, idle_timeout \\ :infinity) do
     binding = binding(conn)
 
