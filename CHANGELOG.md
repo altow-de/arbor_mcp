@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `jose` `>= 1.11.13` is required and locked. 1.11.13 fixes five advisories:
+  EEF-CVE-2026-65625 (attacker-chosen AES-GCM tag length), EEF-CVE-2026-65626
+  (RSAES-PKCS1-v1_5 padding oracle), EEF-CVE-2026-65627 (unbounded JWE zip
+  decompression), EEF-CVE-2026-65628 (infinite recursion in
+  `JOSE.JWK.shared_secret/2` on mismatched key types) and EEF-CVE-2026-65629
+  (weak PBKDF2 parameters for password-encrypted private-key export). This
+  library reaches none of them: it only signs and verifies JWS, never decrypts
+  JWE, derives shared secrets or exports password-encrypted keys, and MRTR
+  request state is sealed with `:crypto` directly and checks the tag length.
+  The floor keeps applications' dependency graphs off the affected releases.
+
 ### Fixed
 
 - POST event streams now stop at the response deadline even when the socket
@@ -433,7 +446,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Send the OAuth `resource` parameter exactly as published in protected
   resource metadata, including pathless identifiers that must not gain a
   trailing slash from URL normalization.
-
 
 ## [2.0.0-rc.2] — 2026-10-08
 
