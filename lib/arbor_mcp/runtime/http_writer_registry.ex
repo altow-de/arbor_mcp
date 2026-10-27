@@ -1346,7 +1346,8 @@ defmodule Arbor.MCP.Server.Runtime.HTTPWriterRegistry do
          :ok <- wire_valid(wire, domain.limits),
          :ok <- before_deadline(deadline),
          metadata = %{request_keepalive: true},
-         entry = candidate(make_ref(), binding_token, self(), self(), deadline, wire, metadata, 0),
+         entry =
+           candidate(make_ref(), binding_token, self(), self(), deadline, wire, metadata, 0),
          {:ok, ticket} <- update(domain, deadline, &enter_keepalive(&1, entry, wire, domain)) do
       {:ok, ticket, wire}
     else
