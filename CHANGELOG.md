@@ -29,6 +29,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is `Unsupported protocol version`, matching the other transports. The same
   list is returned for an `initialize` version the mount does not accept, and
   `Arbor.MCP.Plugs.ProtocolVersion` uses it when a mode is configured.
+- Authorization code flow rejects malformed `:scopes` instead of silently
+  turning a non-list value into an empty scope parameter. An improper list
+  returns `{:error, :invalid_scopes}` instead of raising inside the check. `nil`
+  still omits the `scope` parameter, so the server's default scopes apply.
+- `Arbor.MCP.Security.Validation.validate_config/1` rejects an improper or
+  non-string `:allowed_origins` list when origin validation is enabled.
+  The empty-list check had accepted it, and a later request from another
+  origin then raised `ArgumentError`.
+- A modern `subscriptions/listen` stream over Streamable HTTP now ends with
+  its completion response when the listener closes (maximum lifetime, slow
+  consumer, revoked authorization or server close) while a keepalive or a
+  notification is being written. A keepalive that raced the close aborted the
+  response with "MCP HTTP response capacity unavailable", and a notification
+  still in flight ended the stream without the completion. Once the listener
+  has started closing, the stream stops sending keepalives, drops that
+  notification and waits for the completion.
+- `Arbor.MCP.Server.Handler.handle_get_prompt/3` accepts a GetPromptResult
+  (`%{messages: [...]}`, optional `description`). The callback used to
+  require a single prompt message, so a correct `prompts/get` result failed
+  Dialyzer with `callback_type_mismatch`. A prompt message may carry a
+  `resource_link` content block. `handle_read_resource/2` also accepts a
+  list of contents or the whole read result, including the `ttlMs` and
+  `cacheScope` cache hints. `handle_complete/3` and `handle_complete/4`
+  require a CompleteResult (`%{completion: %{values: [...]}}`). All three
+  callbacks accept string keys as well as atom keys, as the server does.
+  `Handler.Echo` returns that empty completion result.
+- A `resources/read` handler's whole result (`%{contents: [...]}`) is sent
+  as the result even when it has other keys. A map with a `uri` beside its
+  `contents` list used to be sent as one content item with neither `text`
+  nor `blob`. Over HTTP with a handler module, every whole result used to
+  be nested inside its own `contents` list. One content item or a list of
+  them is still wrapped as `contents`, and a map with `text` or `blob` is
+  always an item, even beside a `contents` key.
+- A modern `tools/call` served by a handler process looks for the tool's
+  `x-mcp-header` annotations across the `tools/list` pages within one
+  `handler_call_timeout` in all, instead of one per page. A handler returning
+  up to 100 cursored pages, each just under the default 10 s, could hold the
+  request for about 1,000 s and run its `list_tools` callback 100 times. Past
+  the deadline the request fails closed with `tool_schema_unavailable`, as
+  past the page bound, and so does a page ready only after the deadline or
+  a timeout that `GenServer.call/3` wouldn't take; the walk still ends at
+  the first page that has the tool.
+- POST event streams now stop at the response deadline even when the socket
+  or stream consumer keeps returning data. This ports the 1.x maintenance
+  fix from `87b495e`.
 
 ## [2.0.0-rc.6] — 2026-10-26
 
@@ -450,7 +495,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Send the OAuth `resource` parameter exactly as published in protected
   resource metadata, including pathless identifiers that must not gain a
   trailing slash from URL normalization.
-
 
 ## [2.0.0-rc.2] — 2026-10-08
 
