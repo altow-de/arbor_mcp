@@ -184,11 +184,13 @@ validates the era on each request instead.
 This separation prevents a failed modern probe from becoming an unsafe silent
 downgrade. Fallback requires both a recognized compatibility signal and a
 still-usable transport. The one exception is stdio under `:prefer_modern`: a
-server that exits on the probe (Python `mcp` 1.8 and earlier) or does not
-answer it within its bound is closed, and a fresh process from the same
-options is initialized, once per attempt. The probed pipe, which a late
-answer could still reach, is never reused, and a modern-only server then
-fails on `initialize` with the versions it supports. A cached modern peer failing its next probe is surfaced
+server that exits without answering the probe (Python `mcp` 1.8 and earlier)
+or does not answer it within its bound is closed, and once that close is
+confirmed a fresh process from the same options is initialized, once per
+attempt. That probed pipe, which a late answer could still reach, carries
+nothing more, and a modern-only server then fails on `initialize` with the
+versions it supports. Malformed or oversized output is not such a case and
+fails the connection. A cached modern peer failing its next probe is surfaced
 as an error until the operator clears that observation or changes policy.
 
 ## Internal Functional Cores

@@ -260,14 +260,20 @@ the client waits for the server to start as well as to answer. Unless
 slow to start connects in every mode. The establishment bound covers both:
 `:handshake_timeout` plus the probe's bound, 20 s by default.
 
-A stdio server that exits on the probe (Python `mcp` 1.8 and earlier do) or
-answers nothing within its bound gives no evidence on that pipe, and a late
-answer could still reach anything sent after the probe. Under
-`:prefer_modern` the client closes that process (EOF, then TERM and KILL),
-starts a fresh one with the same options, and initializes it: once per
-connection attempt, reconnects included, within `:establish_timeout`. A
-modern-only server then fails on `initialize` with the versions it supports.
-`:modern_only` fails with the probe error and never respawns.
+A stdio server that exits without answering the probe (Python `mcp` 1.8
+and earlier do) or answers nothing within its bound gives no evidence on
+that pipe, and a late answer could still reach anything sent after the
+probe. Under `:prefer_modern` the client closes that process (EOF, then TERM
+and KILL) and, once the close is confirmed, starts a fresh one with the same
+options and initializes it: once per connection attempt, reconnects
+included, within `:establish_timeout`. A process that cannot be confirmed
+stopped is not replaced; the attempt fails with
+`{:probed_server_stop_unconfirmed, ...}`. A modern-only server fails on the
+new `initialize` with the versions it supports. Those are the only two
+triggers: a live server's error answer, such as `-32601`, leads to
+`initialize` on the same pipe, and malformed, cut-off or oversized output
+fails the connection. `:modern_only` fails with the probe error and never
+respawns.
 
 Successful modern observations are pinned by endpoint and relevant transport
 configuration. Legacy observations expire (five minutes by default) so an

@@ -133,24 +133,33 @@ Client mode options:
   cannot be identified from its connected state. Never include raw secrets;
   ArborMCP hashes the configured identity.
 
-Fallback is deliberately narrow. `:prefer_modern` initializes after the probe
-only on evidence of a legacy server, as MCP 2026-07-28 defines it: a JSON-RPC
-error that is not a recognized modern one, an HTTP `400`, `404` or `405`
-rejection of the probe, or an HTTP probe that gets no answer within
-`:era_probe_timeout`. Each HTTP POST stands alone, so a late answer to the
-probe cannot reach the `initialize` that follows. A recognized modern error,
-authentication error, transport failure, or cached-modern probe failure does
-not trigger `initialize`.
+Fallback is deliberately narrow. `:prefer_modern` sends `initialize` after
+a probe in exactly these cases:
 
-Over stdio the probed pipe is never reused for `initialize`. A stdio server
-that exits on the probe, as Python `mcp` 1.8 and earlier do, or that does not
-answer it within its bound is closed (EOF, then TERM and KILL) and started
-again from the same options, and `:prefer_modern` initializes the new
-process. That happens once per connection attempt, within
-`:establish_timeout`; a modern-only server then fails on `initialize` with
-the versions it supports. Similarly, `:prefer_legacy` probes modern only
-after a protocol-level legacy failure while the transport remains usable.
-Strict modes never fall back or respawn.
+- **On the same connection**, when the probe's answer is evidence of a
+  legacy server, as MCP 2026-07-28 defines it: a JSON-RPC error that is not
+  a recognized modern one (over stdio, typically a live server's `-32601`),
+  an HTTP `400`, `404` or `405` rejection of the probe, or an HTTP probe that
+  gets no answer within `:era_probe_timeout`. Each HTTP POST stands alone,
+  so a late answer to the probe cannot reach the `initialize` that follows.
+- **On a fresh stdio process**, when the stdio server exits without
+  answering the probe at all, as Python `mcp` 1.8 and earlier do, or the
+  probe gets no answer within its bound. A late answer could still arrive
+  on that pipe, so the client closes the process (EOF, then TERM and KILL)
+  and, once that close is confirmed, starts a fresh one from the same
+  options and initializes it. That happens once per connection attempt,
+  within `:establish_timeout`. When the first process cannot be confirmed
+  stopped, no second one is started and the attempt fails with
+  `{:probed_server_stop_unconfirmed, %{probe: ..., cleanup: ...}}`. A
+  modern-only server fails on that `initialize` with the versions it
+  supports.
+
+Nothing else triggers `initialize`: a recognized modern error, an
+authentication error, a cached-modern probe failure, any other transport
+failure, and over stdio output that is malformed, cut off or larger than
+`:max_frame_bytes` all fail the connection. Similarly, `:prefer_legacy`
+probes modern only after a protocol-level legacy failure while the transport
+remains usable. Strict modes never fall back or respawn.
 
 `protocol_version` is a legacy revision preference, not an era switch or a
 statement of the latest upstream MCP revision. The

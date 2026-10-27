@@ -9,13 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Under `:prefer_modern`, a stdio server that exits on the `server/discover`
-  probe, as Python `mcp` 1.6 and 1.8 stdio servers do, or that does not
-  answer it within its bound is now reached with a legacy `initialize`. The
-  client closes that process (EOF, then TERM and KILL), starts a fresh one
-  from the same options and initializes it, once per connection attempt and
-  reconnect, within `:establish_timeout`. The probed pipe is never reused, so
-  a late answer to the probe cannot reach the handshake. A modern-only server
+- Under `:prefer_modern`, a stdio server that exits without answering the
+  `server/discover` probe, as Python `mcp` 1.6 and 1.8 stdio servers do, or
+  that does not answer it within its bound is now reached with a legacy
+  `initialize`. The client closes that process (EOF, then TERM and KILL)
+  and, once the close is confirmed, starts a fresh one from the same options
+  and initializes it, once per connection attempt and reconnect, within
+  `:establish_timeout`. The probed pipe carries nothing more, so a late
+  answer to the probe cannot reach the handshake. A process that cannot be
+  confirmed stopped is not replaced: the attempt fails with
+  `{:probed_server_stop_unconfirmed, %{probe: ..., cleanup: ...}}`. Output
+  that is malformed, cut off or over `:max_frame_bytes` never leads to a
+  respawn. A modern-only server
   then fails on `initialize` with the versions it supports, reported as
   `{:era_probe_and_initialize_failed, %{..., respawned: true}}`. The legacy
   observation is recorded and the `[:arbor_mcp, :client, :era, :fallback]`
@@ -42,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default. **Behavior change:** under `:modern_only` a stdio server that
   never answers now fails after `:handshake_timeout` rather than 2 s, with
   the same error.
+- A stdio server that wrote part of a frame and then exited was reported
+  like one that exited cleanly, `{:connection_error, {:process_exited,
+  status}}`. Cut-off output is now
+  `{:connection_error, {:unfinished_frame, {:process_exited, status}}}`.
 - Inside the reliability wrapper with a circuit breaker, a receive with its
   own timeout (the era probe's, `initialize`'s) was cut short at the
   breaker's 5 s per-call `:timeout`, so a wrapped stdio server slower than

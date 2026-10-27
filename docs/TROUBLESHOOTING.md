@@ -131,8 +131,9 @@ an HTTP `400`, `404` or `405` rejection, or, over HTTP, no answer to the probe
 within `:era_probe_timeout`. An authentication failure, transport break,
 cached-modern failure, recognized modern error, or unsupported modern
 revision is surfaced instead of being silently downgraded. Over stdio a
-server that exits on the probe or never answers it is started again and
-initialized, once.
+server that exits without answering the probe, or never answers it, is
+closed, started again and initialized, once; one that cannot be confirmed
+stopped fails with `{:probed_server_stop_unconfirmed, ...}` instead.
 Use `:prefer_legacy` for a deliberate rollback, or `reset_era_cache: true` once
 after an operator-controlled endpoint upgrade. Strict `:modern_only` and
 `:legacy_only` modes never fall back.
