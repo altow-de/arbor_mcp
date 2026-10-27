@@ -56,6 +56,9 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
 
   require Logger
 
+  # How much longer than a receive's own timeout the circuit breaker waits.
+  @receive_slack_ms 500
+
   defstruct [
     :wrapped_module,
     :wrapped_state,
@@ -185,15 +188,26 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
     end
   end
 
+  # The receive's own timeout bounds it, not the breaker's per-call
+  # :timeout: the era probe and the initialize exchange wait as long as they
+  # mean to through the wrapper too. The breaker allows a little longer, so
+  # the wrapped transport reports its own timeout first.
   def receive_message(%__MODULE__{} = state, timeout) do
     if state.config.circuit_breaker_enabled do
-      CircuitBreaker.call(state.circuit_breaker_pid, fn ->
-        execute_wrapped_operation(:receive_message, [state.wrapped_state, timeout], state)
-      end)
+      CircuitBreaker.call_with_deadline(
+        state.circuit_breaker_pid,
+        fn ->
+          execute_wrapped_operation(:receive_message, [state.wrapped_state, timeout], state)
+        end,
+        with_receive_slack(timeout)
+      )
     else
       execute_wrapped_operation(:receive_message, [state.wrapped_state, timeout], state)
     end
   end
+
+  defp with_receive_slack(:infinity), do: :infinity
+  defp with_receive_slack(timeout), do: timeout + @receive_slack_ms
 
   @impl true
   def close(%__MODULE__{} = state) do
