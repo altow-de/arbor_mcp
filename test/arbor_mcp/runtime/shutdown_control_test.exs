@@ -17,6 +17,8 @@ defmodule Arbor.MCP.Server.Runtime.ShutdownControlTest do
     ShutdownGuard
   }
 
+  alias Arbor.MCP.Test.ShutdownProbe
+
   defmodule Handler do
     def init(parent), do: {:ok, parent}
 
@@ -565,30 +567,16 @@ defmodule Arbor.MCP.Server.Runtime.ShutdownControlTest do
   end
 
   # The owned fixture holds terminate until released, so this stop can only
-  # end it by force. Stop charges its budget once, when called. It returns
-  # :ok only with the observer's confirmation recorded, or unconfirmed only
-  # at or after the charged cutoff, and either way no later than
-  # @stop_return_margin_ms past that cutoff. The held owner must die :killed,
-  # and the observer must still confirm every owned DOWN (phase 3).
+  # end it by force. ShutdownProbe checks the shutdown contract against
+  # traced instants: the cutoff is charged when stop is entered, :ok only
+  # after the observer's confirmation, an unconfirmed result only at or after
+  # the cutoff, and either result within @stop_return_margin_ms of it. The
+  # held owner must die :killed.
   defp stop_forced(root, table, owner, budget) do
     {:ok, control} = ShutdownControl.lookup(table)
     owner_monitor = Process.monitor(owner)
-    observer_monitor = Process.monitor(ShutdownControl.observer(control))
-    called = Deadline.now()
-    result = Runtime.stop(root)
-    returned = Deadline.now()
-    cutoff = :atomics.get(control.cells, 1)
-    assert (cutoff - budget) in called..returned
-    assert returned <= cutoff + @stop_return_margin_ms
-
-    case result do
-      :ok -> assert :atomics.get(control.cells, 2) == 3
-      {:error, :shutdown_cleanup_unconfirmed} -> assert returned >= cutoff
-    end
-
+    result = ShutdownProbe.stop_forced(root, control, budget, @stop_return_margin_ms)
     assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :killed}, 1_000
-    assert_receive {:DOWN, ^observer_monitor, :process, _observer, :normal}, 2_000
-    assert :atomics.get(control.cells, 2) == 3
     result
   end
 

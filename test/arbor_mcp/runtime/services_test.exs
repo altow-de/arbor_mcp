@@ -10,7 +10,6 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
 
   alias Arbor.MCP.Server.Runtime.{
     Admission,
-    Deadline,
     Ref,
     ServiceAdapter,
     Services,
@@ -19,6 +18,7 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
 
   alias Arbor.MCP.Tasks
   alias Arbor.MCP.Tasks.{Extension, Store}
+  alias Arbor.MCP.Test.ShutdownProbe
 
   defmodule Handler do
     def init(parent), do: {:ok, %{parent: parent, counter: 0}}
@@ -766,29 +766,14 @@ defmodule Arbor.MCP.Server.RuntimeServicesTest do
 
   defp monitor(pid), do: {pid, Process.monitor(pid)}
 
-  # Stop charges its whole budget once, when it is called. It returns :ok only
-  # after the observer has confirmed every owned DOWN, and an unconfirmed
-  # cleanup only once that charged cutoff has passed, either way no later than
-  # @stop_return_margin_ms past it. The observer still confirms the cleanup
-  # (phase 3) and then exits.
+  # The blocked process can only be ended by force. ShutdownProbe checks the
+  # shutdown contract against traced instants: the 80 ms cutoff is charged
+  # when stop is entered, :ok only after the observer's confirmation, an
+  # unconfirmed result only at or after the cutoff, and either result within
+  # @stop_return_margin_ms of it.
   defp stop_within_budget(runtime, budget) do
     {:ok, control} = ShutdownControl.lookup(Ref.table(runtime))
-    observer = Process.monitor(ShutdownControl.observer(control))
-    called = Deadline.now()
-    result = Runtime.stop(runtime)
-    returned = Deadline.now()
-    cutoff = :atomics.get(control.cells, 1)
-    assert (cutoff - budget) in called..returned
-    assert returned <= cutoff + @stop_return_margin_ms
-
-    case result do
-      :ok -> assert :atomics.get(control.cells, 2) == 3
-      {:error, :shutdown_cleanup_unconfirmed} -> assert returned >= cutoff
-    end
-
-    assert_receive {:DOWN, ^observer, :process, _pid, :normal}, 2_000
-    assert :atomics.get(control.cells, 2) == 3
-    result
+    ShutdownProbe.stop_forced(runtime, control, budget, @stop_return_margin_ms)
   end
 
   defp eventually(predicate, attempts \\ 150)
