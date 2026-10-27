@@ -1382,6 +1382,22 @@ Set `:subscription_keepalive_interval_ms` to a positive integer or
 `:infinity`. Disabling keepalives delays detection of a quiet peer disconnect
 until the next notification or server-initiated closure.
 
+Other modern requests that use an SSE response stream also write comment
+keepalives; `subscriptions/listen` uses only the subscription interval above,
+and a legacy request's event stream gets none, since a legacy disconnect is
+not a cancellation.
+Set `:request_keepalive_interval_ms` to a positive integer (default `15_000`)
+or `:infinity`, either on an `Arbor.MCP.HttpPlug` mount or in an owned
+server's `http:` options. A failed write cancels the request handler and
+releases its scheduler and writer capacity. Over TCP the first write after
+the peer closes usually succeeds and only the next one fails, so on Bandit a
+closed stream is usually noticed within two intervals. Cowboy terminates the
+request process as soon as it sees the connection close, which cancels the
+request without waiting for a write, for SSE and JSON responses alike. This
+setting does not change JSON responses or the original request deadline. On
+Bandit, a quiet disconnect on a JSON response is detected only when the server
+writes or the request deadline expires.
+
 ## Legacy notifications (MCP 2024-11-05 through 2025-11-25)
 
 Legacy peers deliver `notifications/tools/list_changed`,
@@ -1540,7 +1556,8 @@ intermediary to apply a smaller header-size limit and reject early.
 For response streams, use an HTTP/1.1-or-newer upstream connection, disable
 request and response buffering, disable transformation/caching, preserve
 `Content-Type: text/event-stream` and `X-Accel-Buffering: no`, and set the
-proxy idle timeout above `:subscription_keepalive_interval_ms`. The automated
+proxy idle timeout above `:subscription_keepalive_interval_ms` and
+`:request_keepalive_interval_ms`. The automated
 proxy-boundary matrix sends literal HTTP bytes through two Cowboy connections
 and a normalizing, buffering forwarding hop. Deployment CI should run the same
 valid/duplicate/oversized/stream cases against the exact Nginx, HAProxy,
