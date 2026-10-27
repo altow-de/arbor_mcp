@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Authorization code flow rejects malformed `:scopes` instead of silently
   turning a non-list value into an empty scope parameter. An improper list
-  returns `{:error, :invalid_scopes}` instead of raising inside the check.
+  returns `{:error, :invalid_scopes}` instead of raising inside the check. `nil`
+  still omits the `scope` parameter, so the server's default scopes apply.
 - `Arbor.MCP.Security.Validation.validate_config/1` rejects an improper or
   non-string `:allowed_origins` list when origin validation is enabled.
   The empty-list check had accepted it, and a later request from another
