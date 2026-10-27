@@ -17,14 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and initializes it, once per connection attempt and reconnect, within
   `:establish_timeout`. The probed pipe carries nothing more, so a late
   answer to the probe cannot reach the handshake. A process that cannot be
-  confirmed stopped is not replaced: the attempt fails with
-  `{:probed_server_stop_unconfirmed, %{probe: ..., cleanup: ...}}`, and no
-  `:retry_policy` retries it. Malformed output never leads to a respawn: a
-  JSON-looking line (one starting with `{` or `[`) that is not a valid
-  JSON-RPC answer, or a frame cut off or over `:max_frame_bytes`. Non-JSON
-  stdout lines (banners, logs), which the stdio transport ignores
-  everywhere, are no answer, so a server that prints one and exits is
-  replaced like any other. A modern-only server
+  confirmed stopped is not replaced: `start_link/1` returns
+  `{:error, {:transport_connect_failed, {:probed_server_stop_unconfirmed, %{probe: ..., cleanup: ...}}}}`,
+  and no `:retry_policy` or reconnect starts another. Malformed output never
+  leads to a respawn: a JSON-looking line (one starting with `{` or `[`)
+  that is not valid JSON-RPC, a message other than a notification that is
+  not the answer to the probe, or a frame cut off or over
+  `:max_frame_bytes`. Valid JSON-RPC notifications, which the probe skips,
+  and non-JSON stdout lines (banners, logs), which the stdio transport
+  ignores everywhere, are no answer, so a server that sends only those and
+  exits is replaced like any other. A modern-only server
   then fails on `initialize` with the versions it supports, reported as
   `{:era_probe_and_initialize_failed, %{..., respawned: true}}`. The legacy
   observation is recorded and the `[:arbor_mcp, :client, :era, :fallback]`
@@ -38,10 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A failed connection attempt whose stdio server cannot be confirmed
   stopped now fails with `{:cleanup_failed, reason, {:error, cleanup}}`,
-  the shape `Arbor.MCP.Client` already uses for unconfirmed cleanup, and a
-  `:retry_policy` never retries it or the stdio respawn refusal, whatever
-  its `:should_retry?`, so no new server process starts beside one that may
-  still run.
+  the shape `Arbor.MCP.Client` already uses for unconfirmed cleanup:
+  `start_link/1` returns
+  `{:error, {:transport_connect_failed, {:cleanup_failed, reason, {:error, cleanup}}}}`.
+  A `:retry_policy` never retries it or the stdio respawn refusal, whatever
+  its `:should_retry?`, and an establishment deadline that runs out at the
+  same time no longer hides either behind `:establish_timeout`, so no new
+  server process starts beside one that may still run.
+- Reconnection could start a stdio server beside one that was never
+  stopped. A health check that gave up on a hung server dropped the
+  connection without closing it, so the old server kept running next to
+  the reconnected one; it is now closed first. And a reconnect went on after
+  an attempt or teardown whose stdio server could not be confirmed stopped.
+  Now the client stops reconnecting, settles in `:disconnected`, emits the
+  new `[:arbor_mcp, :client, :reconnect, :cleanup_unconfirmed]` event with
+  the reason, and `stop/2` returns the cleanup error.
 - Over stdio, the modern `server/discover` probe gave a newly spawned server
   only `:era_probe_timeout` (2 s by default) to start and answer. Under the
   default `:prefer_modern`, and under `:modern_only`, a server that took

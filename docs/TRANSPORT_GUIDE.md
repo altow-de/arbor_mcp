@@ -267,14 +267,17 @@ probe. Under `:prefer_modern` the client closes that process (EOF, then TERM
 and KILL) and, once the close is confirmed, starts a fresh one with the same
 options and initializes it: once per connection attempt, reconnects
 included, within `:establish_timeout`. A process that cannot be confirmed
-stopped is not replaced; the attempt fails with
-`{:probed_server_stop_unconfirmed, ...}`. A modern-only server fails on the
-new `initialize` with the versions it supports. Those are the only two
-triggers: a live server's error answer, such as `-32601`, leads to
-`initialize` on the same pipe, and malformed output (a JSON-looking line
-that is not a valid answer, or a frame cut off or over `:max_frame_bytes`)
-fails the connection. Non-JSON lines such as banners and logs are ignored,
-as everywhere on stdio, and are no answer. `:modern_only` fails with the probe error and never
+stopped is not replaced, by a retry or a reconnect either; `start_link/1`
+returns
+`{:error, {:transport_connect_failed, {:probed_server_stop_unconfirmed, ...}}}`.
+A modern-only server fails on the new `initialize` with the versions it
+supports. Those are the only two triggers: a live server's error answer,
+such as `-32601`, leads to `initialize` on the same pipe, and malformed
+output (a JSON-looking line that is not valid JSON-RPC, a message other
+than a notification that is not the answer, or a frame cut off or over
+`:max_frame_bytes`) fails the connection. Valid notifications, which the
+probe skips, and non-JSON lines such as banners and logs, which stdio
+ignores everywhere, are no answer. `:modern_only` fails with the probe error and never
 respawns.
 
 Successful modern observations are pinned by endpoint and relevant transport

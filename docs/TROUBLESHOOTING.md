@@ -132,8 +132,12 @@ within `:era_probe_timeout`. An authentication failure, transport break,
 cached-modern failure, recognized modern error, or unsupported modern
 revision is surfaced instead of being silently downgraded. Over stdio a
 server that exits without answering the probe, or never answers it, is
-closed, started again and initialized, once; one that cannot be confirmed
-stopped fails with `{:probed_server_stop_unconfirmed, ...}` instead.
+closed, started again and initialized, once. One that cannot be confirmed
+stopped is never replaced, by a retry or a reconnect either: `start_link/1`
+returns
+`{:error, {:transport_connect_failed, {:probed_server_stop_unconfirmed, ...}}}`,
+and a client that was reconnecting stops, settles in `:disconnected` and
+emits `[:arbor_mcp, :client, :reconnect, :cleanup_unconfirmed]`.
 Use `:prefer_legacy` for a deliberate rollback, or `reset_era_cache: true` once
 after an operator-controlled endpoint upgrade. Strict `:modern_only` and
 `:legacy_only` modes never fall back.

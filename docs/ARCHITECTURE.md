@@ -189,9 +189,12 @@ or does not answer it within its bound is closed, and once that close is
 confirmed a fresh process from the same options is initialized, once per
 attempt. That probed pipe, which a late answer could still reach, carries
 nothing more, and a modern-only server then fails on `initialize` with the
-versions it supports. Malformed output (a JSON-looking line that is not a
-valid answer, or a cut-off or oversized frame) is not such a case and fails
-the connection; non-JSON banner and log lines are ignored and are no answer. A cached modern peer failing its next probe is surfaced
+versions it supports. Malformed output (a JSON-looking line that is not
+valid JSON-RPC, a message other than a notification that is not the
+answer, or a cut-off or oversized frame) is not such a case and fails the
+connection; valid notifications and non-JSON banner and log lines are no
+answer. A reconnect never starts a stdio server while an earlier one is not
+confirmed stopped. A cached modern peer failing its next probe is surfaced
 as an error until the operator clears that observation or changes policy.
 
 ## Internal Functional Cores

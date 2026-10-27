@@ -149,20 +149,23 @@ a probe in exactly these cases:
   and, once that close is confirmed, starts a fresh one from the same
   options and initializes it. That happens once per connection attempt,
   within `:establish_timeout`. When the first process cannot be confirmed
-  stopped, no second one is started and the attempt fails with
-  `{:probed_server_stop_unconfirmed, %{probe: ..., cleanup: ...}}`. A
-  modern-only server fails on that `initialize` with the versions it
+  stopped, no second one is started, no `:retry_policy` or reconnect starts
+  one either, and `start_link/1` returns
+  `{:error, {:transport_connect_failed, {:probed_server_stop_unconfirmed, %{probe: ..., cleanup: ...}}}}`.
+  A modern-only server fails on that `initialize` with the versions it
   supports.
 
 Nothing else triggers `initialize`: a recognized modern error, an
 authentication error, a cached-modern probe failure, any other transport
 failure, and over stdio malformed output all fail the connection.
-Malformed output means a line that looks like JSON (it starts with `{` or
-`[`) but is not a valid JSON-RPC answer to the probe, a frame cut off when
-the server exits, or one larger than `:max_frame_bytes`. Other stdout lines,
-banners and logs, are ignored throughout the stdio transport, so they are
-no answer: a server that prints one and then exits counts as exiting
-without answering. Similarly, `:prefer_legacy`
+Malformed output is a JSON-looking line (one starting with `{` or `[`) that
+is not valid JSON-RPC, a JSON-RPC message other than a notification that is
+not the answer to the probe (a response to another id, say), a frame cut
+off when the server exits, or one larger than `:max_frame_bytes`. Two kinds
+of output are no answer at all: valid JSON-RPC notifications, which the
+probe skips while it waits (a log message, say), and non-JSON lines such as
+banners and logs, which the stdio transport ignores everywhere. A server
+that sends only those and then exits counts as exiting without answering. Similarly, `:prefer_legacy`
 probes modern only after a protocol-level legacy failure while the transport
 remains usable. Strict modes never fall back or respawn.
 
