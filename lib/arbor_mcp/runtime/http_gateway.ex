@@ -498,11 +498,17 @@ defmodule Arbor.MCP.Server.Runtime.HTTPGateway do
 
   def handle_info(_message, state), do: {:noreply, state}
 
+  # The request's connection went away. A modern request is cancelled with
+  # it. The legacy Streamable HTTP revisions say a disconnect SHOULD NOT be
+  # taken for a cancellation (a client cancels with notifications/cancelled),
+  # so a request on a legacy session runs to its end, under its original
+  # deadline; with its writer retired, what it would have written is
+  # released.
   defp socket_down({:DOWN, monitor, :process, _socket, _reason}, state) do
     state =
       Enum.reduce(state.jobs, state, fn {token, job}, state ->
         if job.socket_monitor == monitor and not job.notification_only? do
-          Runtime.cancel_scope(state.runtime, job.scope)
+          if is_nil(job.lease), do: Runtime.cancel_scope(state.runtime, job.scope)
           HTTPWriterRegistry.retire(job.binding, :writer_down)
           state = put_in(state.jobs[token].socket_down?, true)
           finish(token, state)
