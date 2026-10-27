@@ -144,20 +144,25 @@ defmodule Arbor.MCP.Client.StdioLegacyRespawnTest do
   describe "an answer that is not silence" do
     # Only a child that exits without a word, or a probe that times out, is
     # replaced: output that is oversized, malformed or cut off is an answer
-    # of a sort, and fails the connection on the pipe it came from.
+    # of a sort, and fails the connection on the pipe it came from. An
+    # oversized frame is reported as finished or unfinished depending on how
+    # the pipe delivers it (Linux and macOS buffer differently).
     for {era, expected} <- [
-          oversized:
+          oversized: [
             "{:era_probe_failed, {:transport_error, {:connection_error, :frame_too_large}}}",
-          malformed: "{:era_probe_failed, {:unexpected_response, ",
-          partial:
+            "{:era_probe_failed, {:transport_error, {:connection_error, {:unfinished_frame, :frame_too_large}}}}"
+          ],
+          malformed: ["{:era_probe_failed, {:unexpected_response, "],
+          partial: [
             "{:era_probe_failed, {:transport_error, {:connection_error, {:unfinished_frame, {:process_exited, 5}}}}}"
+          ]
         ] do
       test "#{era} output is not respawned", %{tmp_dir: tmp_dir} do
         %{prefer_modern: %{result: result, methods: methods, starts: starts}} =
           connect_concurrently(tmp_dir, unquote(era), [:prefer_modern], max_frame_bytes: 4_096)
 
         assert {:error, {:transport_connect_failed, reason}} = result
-        assert String.starts_with?(reason, unquote(expected)), reason
+        assert Enum.any?(unquote(expected), &String.starts_with?(reason, &1)), reason
         assert {methods, starts} == {["server/discover"], 1}
       end
     end
