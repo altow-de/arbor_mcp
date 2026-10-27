@@ -15,9 +15,14 @@ defmodule Arbor.MCP.Test.ScriptedStdioServer do
   #           `mcp` 1.8 and earlier do, and answers initialize
   #   banner  like exits, but prints a non-JSON line first, which the
   #           transport ignores as it does any banner or log line
+  #   notifies like exits, but sends a valid notification first, which the
+  #           probe skips while it waits for an answer
   #   silent  a legacy server that never answers server/discover
   #   broken  exits on any request
   #   mute    reads everything and answers nothing
+  #   once    a modern server that answers only its first server/discover,
+  #           so its health-check pings go unanswered
+  #   flaky   modern for the copy started with `:first_start`, mute after
   #   garbage answers server/discover with a response for another request id
   #   oversized answers server/discover with a 20 kB line
   #   malformed answers server/discover with a line that is not JSON
@@ -25,9 +30,14 @@ defmodule Arbor.MCP.Test.ScriptedStdioServer do
 
   @script ~S"""
   printf 'start\n' >> "$3"
-  if [ -n "$4" ] && [ ! -e "$4" ]; then : > "$4"; else sleep "$1"; fi
+  if [ -n "$4" ] && [ ! -e "$4" ]; then : > "$4"; first=1; else sleep "$1"; first=0; fi
   era=$2
   log=$3
+  # flaky: the first copy is modern, later ones never answer.
+  if [ "$era" = flaky ]; then
+    if [ "$first" = 1 ]; then era=modern; else era=mute; fi
+  fi
+  answered=0
   while IFS= read -r line; do
     id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
     case "$line" in
@@ -39,19 +49,26 @@ defmodule Arbor.MCP.Test.ScriptedStdioServer do
     printf '%s\n' "$method" >> "$log"
     [ -z "$id" ] && continue
     case "$era:$method" in
+      once:server/discover)
+        [ "$answered" = 1 ] && continue
+        answered=1
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}\n' "$id" ;;
       modern:server/discover)
         printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"scripted-modern","version":"1"}}}}\n' "$id" ;;
       modern:initialize)
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2026-07-28"],"requested":"2025-11-25"}}}\n' "$id" ;;
       legacy:server/discover)
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
-      legacy:initialize|exits:initialize|banner:initialize|silent:initialize)
+      legacy:initialize|exits:initialize|banner:initialize|notifies:initialize|silent:initialize)
         sleep "$5"
         printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"scripted-legacy","version":"1"}}}\n' "$id" ;;
       exits:server/discover)
         exit 3 ;;
       banner:server/discover)
         printf 'legacy server: unknown request, exiting\n'
+        exit 3 ;;
+      notifies:server/discover)
+        printf '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"error","data":"unknown request"}}\n'
         exit 3 ;;
       broken:*)
         exit 4 ;;
@@ -65,7 +82,7 @@ defmodule Arbor.MCP.Test.ScriptedStdioServer do
       partial:server/discover)
         printf '{"jsonrpc":"2.0","id":%s,"res' "$id"
         exit 5 ;;
-      mute:*|garbage:*|oversized:*|malformed:*|partial:*|silent:server/discover) ;;
+      mute:*|once:*|garbage:*|oversized:*|malformed:*|partial:*|silent:server/discover) ;;
       *)
         printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
     esac

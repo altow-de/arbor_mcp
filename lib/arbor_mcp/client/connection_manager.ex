@@ -94,9 +94,12 @@ defmodule Arbor.MCP.Client.ConnectionManager do
     end)
   end
 
-  defp cleanup_unconfirmed?({:probed_server_stop_unconfirmed, _details}), do: true
-  defp cleanup_unconfirmed?({:cleanup_failed, _reason, {:error, _cleanup}}), do: true
-  defp cleanup_unconfirmed?(_reason), do: false
+  @doc false
+  # Whether a failed establishment left something it opened, a server
+  # process above all, not confirmed stopped.
+  def cleanup_unconfirmed?({:probed_server_stop_unconfirmed, _details}), do: true
+  def cleanup_unconfirmed?({:cleanup_failed, _reason, {:error, _cleanup}}), do: true
+  def cleanup_unconfirmed?(_reason), do: false
 
   defp do_establish_connection(state, opts) do
     opts = maybe_default_legacy_sse_opts(opts)
@@ -142,8 +145,12 @@ defmodule Arbor.MCP.Client.ConnectionManager do
       ConnectionScope.established()
       {:ok, new_state}
     else
+      # Unconfirmed cleanup outranks the deadline: callers (a retry, a
+      # reconnect) must see it to keep from starting another server.
       {:error, reason} ->
-        if Deadline.expired?(deadline), do: {:error, :establish_timeout}, else: {:error, reason}
+        if Deadline.expired?(deadline) and not cleanup_unconfirmed?(reason),
+          do: {:error, :establish_timeout},
+          else: {:error, reason}
 
       error ->
         {:error, "Unexpected error during connection: #{inspect(error)}"}
@@ -501,14 +508,17 @@ defmodule Arbor.MCP.Client.ConnectionManager do
     end
   end
 
-  defp spawned_server?(Stdio, _transport_state), do: true
+  @doc false
+  # Whether this transport runs its own server process (stdio, directly or
+  # inside the reliability wrapper).
+  def spawned_server?(Stdio, _transport_state), do: true
 
-  defp spawned_server?(ReliabilityWrapper, %ReliabilityWrapper{} = transport_state) do
+  def spawned_server?(ReliabilityWrapper, %ReliabilityWrapper{} = transport_state) do
     {wrapped_module, _wrapped_state} = ReliabilityWrapper.unwrap(transport_state)
     wrapped_module == Stdio
   end
 
-  defp spawned_server?(_transport_mod, _transport_state), do: false
+  def spawned_server?(_transport_mod, _transport_state), do: false
 
   defp handshake_timeout(opts),
     do: Keyword.get(opts, :handshake_timeout, @default_handshake_timeout)

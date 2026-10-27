@@ -57,17 +57,21 @@ defmodule Arbor.MCP.Client.StdioLegacyRespawnTest do
     end
   end
 
-  describe "a legacy server that prints a line and exits on the probe" do
-    # Non-JSON stdout lines (banners, logs) are ignored, so a server that
-    # prints one and exits has not answered: it is replaced like any other.
-    test "is respawned and initialized", %{tmp_dir: tmp_dir} do
-      %{prefer_modern: %{result: result, methods: methods, starts: starts}} =
-        connect_concurrently(tmp_dir, :banner, [:prefer_modern], [])
+  describe "a legacy server that writes something other than an answer and exits" do
+    # Non-JSON stdout lines (banners, logs) are ignored and valid JSON-RPC
+    # notifications are skipped while the probe waits, so a server that
+    # sends either and then exits has not answered: it is replaced like any
+    # other.
+    for era <- [:banner, :notifies] do
+      test "is respawned and initialized after #{era} output", %{tmp_dir: tmp_dir} do
+        %{prefer_modern: %{result: result, methods: methods, starts: starts}} =
+          connect_concurrently(tmp_dir, unquote(era), [:prefer_modern], [])
 
-      assert {:ok, client} = result, inspect(result)
-      assert {:ok, "2025-11-25"} = Client.negotiated_version(client)
-      assert methods == ["server/discover" | @legacy_handshake]
-      assert starts == 2
+        assert {:ok, client} = result, inspect(result)
+        assert {:ok, "2025-11-25"} = Client.negotiated_version(client)
+        assert methods == ["server/discover" | @legacy_handshake]
+        assert starts == 2
+      end
     end
   end
 
@@ -173,8 +177,13 @@ defmodule Arbor.MCP.Client.StdioLegacyRespawnTest do
         log = Path.join(tmp_dir, "unconfirmed-#{label}.log")
         result = start_with_stuck_close(log, :prefer_modern, retry_policy: policy)
 
-        assert {:error, {:transport_connect_failed, reason}} = result
-        assert reason =~ "{:probed_server_stop_unconfirmed, ", "#{label}: #{reason}"
+        assert {:error,
+                {:transport_connect_failed,
+                 {:probed_server_stop_unconfirmed,
+                  %{probe: {:transport_error, :handshake_timeout}, cleanup: {:error, _}}}}} =
+                 result,
+               "#{label}: #{inspect(result)}"
+
         assert starts(log) == 1, "#{label} started #{starts(log)} servers"
       end
     end
