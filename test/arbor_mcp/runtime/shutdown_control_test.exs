@@ -1,6 +1,11 @@
 defmodule Arbor.MCP.Server.Runtime.ShutdownControlTest do
   use ExUnit.Case, async: false
 
+  # How long past its charged cutoff a forced stop may take to return. On a
+  # loaded machine forced stops returned up to 615 ms late; a stop that waits
+  # on the held owner instead of its budget never returns at all.
+  @stop_return_margin_ms 1_000
+
   alias Arbor.MCP.Server.Runtime
 
   alias Arbor.MCP.Server.Runtime.{
@@ -11,6 +16,8 @@ defmodule Arbor.MCP.Server.Runtime.ShutdownControlTest do
     ShutdownControl,
     ShutdownGuard
   }
+
+  alias Arbor.MCP.Test.ShutdownProbe
 
   defmodule Handler do
     def init(parent), do: {:ok, parent}
@@ -521,7 +528,7 @@ defmodule Arbor.MCP.Server.Runtime.ShutdownControlTest do
     end
 
     :sys.resume(guard)
-    assert :ok = Runtime.stop(root)
+    stop_forced(root, table, producer, 500)
     eventually(fn -> not Process.alive?(observer) end)
   end
 
@@ -556,7 +563,21 @@ defmodule Arbor.MCP.Server.Runtime.ShutdownControlTest do
     assert retired.pending_publications == %{}
     :sys.resume(observer)
     :sys.resume(guard)
-    assert :ok = Runtime.stop(root)
+    stop_forced(root, table, producer, 500)
+  end
+
+  # The owned fixture holds terminate until released, so this stop can only
+  # end it by force. ShutdownProbe checks the shutdown contract against
+  # traced instants: the cutoff is charged when stop is entered, :ok only
+  # after the observer's confirmation, an unconfirmed result only at or after
+  # the cutoff, and either result within @stop_return_margin_ms of it. The
+  # held owner must die :killed.
+  defp stop_forced(root, table, owner, budget) do
+    {:ok, control} = ShutdownControl.lookup(table)
+    owner_monitor = Process.monitor(owner)
+    result = ShutdownProbe.stop_forced(root, control, budget, @stop_return_margin_ms)
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :killed}, 1_000
+    result
   end
 
   defp control_ledger(observer) do

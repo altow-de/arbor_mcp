@@ -96,6 +96,37 @@ sending `Last-Event-ID` after a connection settles modern. Modern request and
 subscription streams use SSE on the owning POST response automatically and do
 not require `use_sse: true`.
 
+In the legacy era an ArborMCP server answers a request that carries
+`_meta.progressToken` with request-owned SSE when the client's `Accept` header
+names `text/event-stream` with a quality above zero (not `q=0`, and not just
+`*/*`), as the TypeScript SDK's servers do: the request's
+progress, and its callback's other notifications, arrive ahead of the result.
+Other legacy requests get JSON. Their callback's progress, log messages and
+list changes, and every request a callback sends to the client (roots,
+sampling, elicitation), go to that session's GET stream and never to another
+session's; with no GET stream open they return `{:error, :stream_closed}`.
+As those revisions ask, a legacy request whose connection goes away isn't
+taken for cancelled: it runs to its end, under its original deadline, and its
+response, which nothing can carry any more, is released. A modern request is
+cancelled with its connection. The server closes a GET stream at the Runtime's `:request_timeout_ms`; the
+client keeps its session and opens the stream again with `Last-Event-ID`. A
+server that answers that GET with 405 no longer offers the stream, and the
+client carries on POST-only.
+
+A list change sent outside a callback, such as
+`Arbor.MCP.Server.notify_tools_changed(runtime)` or the `add_tool/3` family,
+isn't addressed to a session. It goes to every modern `subscriptions/listen`
+stream whose filter matches and to every legacy session whose GET stream is
+open at that moment. It carries no data, only a prompt to fetch the list
+again, and each session's fetch is authorized on its own. A legacy session
+with no open GET stream, including one whose client is about to reopen it,
+misses the change rather than having it queued; its client can list again
+after reopening. Each session takes the change into its own bounded replay,
+which its stream writes out, so a slow or dead stream holds up neither the
+others nor the caller. The call returns `:ok` when every matching
+subscription and every open session took the change, and
+`{:error, :partially_delivered}` when some didn't.
+
 ```elixir
 {:ok, client} =
   Arbor.MCP.Client.start_link(
@@ -234,6 +265,18 @@ response stays open as SSE, begins with the subscription acknowledgement, and
 then carries only the notification categories selected by that request.
 Closing a modern request/subscription response stream is the cancellation
 signal; there is no session DELETE and no resumable `Last-Event-ID` cursor.
+For a modern SSE request response other than `subscriptions/listen`, which
+has its own keepalive, the server writes comment keepalives every
+`:request_keepalive_interval_ms` (15 seconds by default). A failed write
+cancels the running handler and releases its Runtime capacity. Over TCP the
+first write after the client closes usually succeeds and the next one fails,
+so on Bandit the close is usually noticed within two intervals. Cowboy instead
+terminates the request process when it sees the connection close, which
+cancels the request without waiting for a write. JSON responses do not use
+keepalives, so on Bandit a quiet disconnect there is detected at the next
+write or the request deadline. A legacy request's event stream gets no
+request keepalives, since a legacy disconnect is not a cancellation. Set the
+interval to `:infinity` to disable request stream keepalives.
 
 A `:modern_only` HTTP mount returns `405 Method Not Allowed` for GET or DELETE
 on the MCP endpoint, ignores legacy session headers, and never exposes the
