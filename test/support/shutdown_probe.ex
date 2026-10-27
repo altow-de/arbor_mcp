@@ -6,8 +6,8 @@ defmodule Arbor.MCP.Test.ShutdownProbe do
   #
   #   * the cutoff is charged when stop is called: `cutoff - budget` is within
   #     @charge_epsilon_ms of the instant `Runtime.stop/1` was entered;
-  #   * `:ok` only after the observer recorded its confirmation (phase 3 in
-  #     the control cells) and before stop returned;
+  #   * `:ok` only once the observer's write of its confirmation (phase 3 in
+  #     the control cells) had completed before stop returned;
   #   * an unconfirmed result only at or after the charged cutoff;
   #   * either result no later than `margin` past the cutoff;
   #   * the observer exits normally with the cleanup confirmed.
@@ -34,8 +34,11 @@ defmodule Arbor.MCP.Test.ShutdownProbe do
       if Process.alive?(tracer), do: Process.exit(tracer, :kill)
     end)
 
-    # The observer writes phase 3 last, once every owned DOWN is in.
-    assert 1 == :erlang.trace_pattern(@confirm, [{[:_, 2, 3], [], []}], [:global])
+    # The observer writes phase 3 last, once every owned DOWN is in. The
+    # return trace marks the instant that write has completed.
+    assert 1 ==
+             :erlang.trace_pattern(@confirm, [{[:_, 2, 3], [], [{:return_trace}]}], [:global])
+
     assert 1 == :erlang.trace_pattern(@stop, [{:_, [], [{:return_trace}]}], [:global])
     flags = [:call, :monotonic_timestamp, {:tracer, tracer}]
     assert 1 == :erlang.trace(observer, true, flags)
@@ -43,7 +46,6 @@ defmodule Arbor.MCP.Test.ShutdownProbe do
 
     result = Runtime.stop(server)
     :erlang.trace(test, false, [:call])
-    returned = now()
     cutoff = :atomics.get(control.cells, 1)
     assert_receive {:DOWN, ^observer_monitor, :process, ^observer, :normal}, 2_000
     assert :atomics.get(control.cells, 2) == 3
@@ -52,8 +54,9 @@ defmodule Arbor.MCP.Test.ShutdownProbe do
       traces(tracer, test, observer)
 
     entered_ms = System.convert_time_unit(entered, :native, :millisecond)
+    returned_ms = System.convert_time_unit(returned_at, :native, :millisecond)
     assert (cutoff - budget - entered_ms) in 0..@charge_epsilon_ms
-    assert returned <= cutoff + margin
+    assert returned_ms <= cutoff + margin
 
     case result do
       :ok ->
@@ -61,7 +64,7 @@ defmodule Arbor.MCP.Test.ShutdownProbe do
                "stop returned :ok before the observer confirmed cleanup"
 
       {:error, :shutdown_cleanup_unconfirmed} ->
-        assert System.convert_time_unit(returned_at, :native, :millisecond) >= cutoff
+        assert returned_ms >= cutoff
     end
 
     result
@@ -87,7 +90,7 @@ defmodule Arbor.MCP.Test.ShutdownProbe do
 
     confirmed_at =
       Enum.find_value(traces, fn
-        {:trace_ts, ^observer, :call, {:atomics, :put, [_cells, 2, 3]}, ts} -> ts
+        {:trace_ts, ^observer, :return_from, {:atomics, :put, 3}, :ok, ts} -> ts
         _other -> nil
       end)
 
@@ -101,6 +104,4 @@ defmodule Arbor.MCP.Test.ShutdownProbe do
       trace -> collect([trace | traces])
     end
   end
-
-  defp now, do: System.monotonic_time(:millisecond)
 end
