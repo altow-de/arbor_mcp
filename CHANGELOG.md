@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   up to 100 cursored pages, each just under the default 10 s, could hold the
   request for about 1,000 s and run its `list_tools` callback 100 times. Past
   the deadline the request fails closed with `tool_schema_unavailable`, as
-  past the page bound; the walk still ends at the first page that has the
-  tool.
+  past the page bound, and so does a page ready only after the deadline or
+  a timeout that `GenServer.call/3` wouldn't take; the walk still ends at
+  the first page that has the tool.
 
 ## [2.0.0-rc.6] — 2026-10-26
 
