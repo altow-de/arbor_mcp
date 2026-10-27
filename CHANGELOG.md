@@ -32,7 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transport failure. `:prefer_legacy` therefore never moved forward to the
   modern era over HTTP, unless an earlier connection had recorded it. The
   error is now read as the rejection it is, the way the other transports
-  deliver it: `:prefer_legacy` probes and connects, and **`:legacy_only`
+  deliver it, when that error carries this `initialize` request's id (any
+  other id, `null` included, is not an answer to it and stays a transport
+  error): `:prefer_legacy` probes and connects, and **`:legacy_only`
   now fails with `{:initialize_error, error}`** as it does on the other
   transports, instead of `{:transport_connect_failed, "{:http_error, 400,
   ...}"}`.

@@ -826,12 +826,10 @@ defmodule Arbor.MCP.Client.ConnectionManager do
          capabilities,
          deadline
        ) do
-    case send_initialize_request(
-           transport_mod,
-           transport_state,
-           protocol_version,
-           capabilities
-         ) do
+    request =
+      Protocol.encode_initialize(VersionInfo.client_info(), capabilities, protocol_version)
+
+    case send_initialize_request(transport_mod, transport_state, request) do
       {:ok, state_after_send, response_data} ->
         # Non-SSE HTTP mode - response came back immediately
         response_data
@@ -856,10 +854,16 @@ defmodule Arbor.MCP.Client.ConnectionManager do
 
       # An HTTP server rejects initialize with a 400 carrying the JSON-RPC
       # error (a modern-only one does), which the other transports deliver
-      # as the response itself: read it the same way.
+      # as the response itself: read it the same way. Only an error for this
+      # initialize counts. A null id means the server could not read the
+      # request's id, which a well-formed initialize never causes, and any
+      # other id is someone else's answer (a stale proxy's, say): both stay
+      # the transport error they were.
       {:error, {:http_error, 400, body}} = error ->
+        initialize_id = request["id"]
+
         case Protocol.parse_message(body) do
-          {:error, details, _id} when is_map(details) ->
+          {:error, details, ^initialize_id} when is_map(details) ->
             body
             |> parse_handshake_response(transport_state)
             |> with_state(transport_state)
@@ -888,16 +892,7 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   defp restore_deadline({:error, reason, transport_state}, transport_mod, deadline),
     do: {:error, reason, Deadline.put_on_transport(transport_mod, transport_state, deadline)}
 
-  defp send_initialize_request(
-         transport_mod,
-         transport_state,
-         protocol_version,
-         capabilities
-       ) do
-    client_info = VersionInfo.client_info()
-
-    request = Protocol.encode_initialize(client_info, capabilities, protocol_version)
-
+  defp send_initialize_request(transport_mod, transport_state, request) do
     with {:ok, outbound_request} <- encode_for_transport(transport_mod, request) do
       case transport_mod.send_message(outbound_request, transport_state) do
         {:ok, new_state, response_data} ->

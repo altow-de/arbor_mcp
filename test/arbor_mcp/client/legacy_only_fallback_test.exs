@@ -150,6 +150,68 @@ defmodule Arbor.MCP.Client.LegacyOnlyFallbackTest do
     def close(_state), do: :ok
   end
 
+  # Synchronous like non-SSE HTTP: rejects initialize with a 400 carrying a
+  # -32022 for the request id `:rejection_id` says (`:same`, `:other` or
+  # `:null`), and answers server/discover with a DiscoverResult. Reports
+  # every request as `{:http400, method}`.
+  defmodule HTTP400Transport do
+    @behaviour Arbor.MCP.Transport
+
+    @impl true
+    def connect(opts),
+      do:
+        {:ok,
+         %{test_pid: Keyword.fetch!(opts, :test_pid), id: Keyword.fetch!(opts, :rejection_id)}}
+
+    @impl true
+    def send_message(message, state) do
+      request = Jason.decode!(message)
+      send(state.test_pid, {:http400, request["method"]})
+      respond(request, state)
+    end
+
+    defp respond(%{"method" => "initialize", "id" => id}, state) do
+      error = %{
+        "code" => -32022,
+        "message" => "Unsupported protocol version",
+        "data" => %{"supported" => ["2026-07-28"], "requested" => "legacy"}
+      }
+
+      rejection_id =
+        case state.id do
+          :same -> id
+          :other -> id + 1
+          :null -> nil
+        end
+
+      body = Jason.encode!(%{"jsonrpc" => "2.0", "id" => rejection_id, "error" => error})
+      {:error, {:http_error, 400, body}}
+    end
+
+    defp respond(%{"method" => "server/discover", "id" => id}, state) do
+      result = %{
+        "resultType" => "complete",
+        "supportedVersions" => ["2026-07-28"],
+        "capabilities" => %{},
+        "ttlMs" => 0,
+        "cacheScope" => "private"
+      }
+
+      {:ok, state, Jason.encode!(%{"jsonrpc" => "2.0", "id" => id, "result" => result})}
+    end
+
+    defp respond(_notification, state), do: {:ok, state}
+
+    @impl true
+    def receive_message(_state), do: receive(do: (:never -> :ok))
+
+    @impl true
+    def connected?(_state), do: true
+
+    @impl true
+    def close(_state), do: :ok
+  end
+
   defmodule LegacyHandler do
     use Arbor.MCP.Server.Handler
     use Arbor.MCP.Server.DSL, name: "legacy-only-server", version: "1.0.0"
@@ -405,6 +467,44 @@ defmodule Arbor.MCP.Client.LegacyOnlyFallbackTest do
         )
       end
     end
+  end
+
+  describe "an HTTP 400 to initialize" do
+    test "is the rejection when its JSON-RPC error answers this initialize" do
+      assert {:error, {:initialize_error, %{"code" => -32022}}} =
+               start_client(:legacy_only, http400(:same))
+
+      assert {:ok, client} = start_client(:prefer_legacy, http400(:same))
+      assert {:ok, "2026-07-28"} = Client.negotiated_version(client)
+      assert_receive {:http400, "initialize"}
+      assert_receive {:http400, "server/discover"}
+      Client.stop(client)
+    end
+
+    # A JSON-RPC error for another request (a stale proxy's answer, say), or
+    # with the null id a server uses when it could not read the request's,
+    # rejects nothing this client sent: it stays a transport error.
+    for {id, label} <- [other: "another request's id", null: "a null id"] do
+      test "with #{label} stays a transport error" do
+        for mode <- [:legacy_only, :prefer_legacy] do
+          assert {:error, {:transport_connect_failed, reason}} =
+                   start_client(mode, http400(unquote(id)))
+
+          assert reason =~ "{:http_error, 400, "
+          assert_receive {:http400, "initialize"}
+          refute_received {:http400, "server/discover"}
+        end
+      end
+    end
+  end
+
+  defp http400(rejection_id) do
+    [
+      transport: HTTP400Transport,
+      test_pid: self(),
+      rejection_id: rejection_id,
+      era_cache_key: make_ref()
+    ]
   end
 
   defp assert_modern_target(mode, opts) do
