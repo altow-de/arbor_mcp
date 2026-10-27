@@ -36,8 +36,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operation that has its own deadline through a breaker without the
   breaker's per-call `:timeout` cutting it short.
 
+### Changed
+
+- `jose` `>= 1.11.13` is required and locked. 1.11.13 fixes five advisories:
+  EEF-CVE-2026-65625 (attacker-chosen AES-GCM tag length), EEF-CVE-2026-65626
+  (RSAES-PKCS1-v1_5 padding oracle), EEF-CVE-2026-65627 (unbounded JWE zip
+  decompression), EEF-CVE-2026-65628 (infinite recursion in
+  `JOSE.JWK.shared_secret/2` on mismatched key types) and EEF-CVE-2026-65629
+  (weak PBKDF2 parameters for password-encrypted private-key export). This
+  library reaches none of them: it only signs and verifies JWS, never decrypts
+  JWE, derives shared secrets or exports password-encrypted keys, and MRTR
+  request state is sealed with `:crypto` directly and checks the tag length.
+  The floor keeps applications' dependency graphs off the affected releases.
+
 ### Fixed
 
+- A client in the default `:prefer_modern` mode could not connect to an
+  Arbor server running `protocol_mode: :legacy_only`, the documented
+  rollback, over any transport. The server answers the `server/discover`
+  probe with an UnsupportedProtocolVersionError (-32022) whose `supported`
+  list names only legacy revisions, and the client failed with
+  `{:era_probe_failed, {:no_mutually_supported_modern_version, ...}}` instead
+  of using one of them. MCP says to continue with a listed version, and for
+  a legacy one that is `initialize`: `:prefer_modern` now falls back to it,
+  offering its preferred revision among those listed (its legacy
+  `:protocol_version` when listed), and records the legacy observation.
+  `:prefer_legacy`, whose `initialize` comes first, retries it once with
+  such a revision when the server rejected the one it offered and the probe
+  then names others. A list that also names a modern or an unknown revision
+  is not legacy evidence, `:modern_only` never falls back, and a cached
+  modern observation still never downgrades. A cached legacy observation
+  now also keeps the revision the server negotiated, and the next
+  connection offers that one again, so a server that accepts only an older
+  revision stays reachable until the observation expires.
+- Over HTTP, an `initialize` rejected with a 400 carrying a JSON-RPC error,
+  as an Arbor `protocol_mode: :modern_only` server sends it, was taken for a
+  transport failure. `:prefer_legacy` therefore never moved forward to the
+  modern era over HTTP, unless an earlier connection had recorded it. The
+  error is now read as the rejection it is, the way the other transports
+  deliver it, when that error carries this `initialize` request's id (any
+  other id, `null` included, is not an answer to it and stays a transport
+  error): `:prefer_legacy` probes and connects, and **`:legacy_only`
+  now fails with `{:initialize_error, error}`** as it does on the other
+  transports, instead of `{:transport_connect_failed, "{:http_error, 400,
+  ...}"}`.
 - A failed connection attempt whose stdio server cannot be confirmed
   stopped now fails with `{:cleanup_failed, reason, {:error, cleanup}}`,
   the shape `Arbor.MCP.Client` already uses for unconfirmed cleanup:
@@ -505,7 +547,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Send the OAuth `resource` parameter exactly as published in protected
   resource metadata, including pathless identifiers that must not gain a
   trailing slash from URL normalization.
-
 
 ## [2.0.0-rc.2] — 2026-10-08
 

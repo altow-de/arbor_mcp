@@ -139,8 +139,11 @@ a probe in exactly these cases:
 - **On the same connection**, when the probe's answer is evidence of a
   legacy server, as MCP 2026-07-28 defines it: a JSON-RPC error that is not
   a recognized modern one (over stdio, typically a live server's `-32601`),
-  an HTTP `400`, `404` or `405` rejection of the probe, or an HTTP probe that
-  gets no answer within `:era_probe_timeout`. Each HTTP POST stands alone,
+  an UnsupportedProtocolVersionError (`-32022`) whose `supported` list names
+  only legacy revisions, as a `protocol_mode: :legacy_only` server sends
+  (`initialize` then offers the client's preferred listed revision), an HTTP
+  `400`, `404` or `405` rejection of the probe, or an HTTP probe that gets
+  no answer within `:era_probe_timeout`. Each HTTP POST stands alone,
   so a late answer to the probe cannot reach the `initialize` that follows.
 - **On a fresh stdio process**, when the stdio server exits without
   answering the probe at all, as Python `mcp` 1.8 and earlier do, or the
@@ -155,7 +158,7 @@ a probe in exactly these cases:
   A modern-only server fails on that `initialize` with the versions it
   supports.
 
-Nothing else triggers `initialize`: a recognized modern error, an
+Nothing else triggers `initialize`: any other recognized modern error, an
 authentication error, a cached-modern probe failure, any other transport
 failure, and over stdio malformed output all fail the connection.
 Malformed output is a JSON-looking line (one starting with `{` or `[`) that
