@@ -51,7 +51,30 @@ defmodule Arbor.MCP.Server.Runtime.OutputController do
 
   # Asynchronous: the HTTP gateway is shared by every request of a runtime,
   # so it never blocks on these. It sends the request and handles the reply,
-  # or the returned deadline, in its own loop (see HTTPGateway).
+  # or the returned deadline, in its own loop (see HTTPGateway). One gateway
+  # sending to one Controller is FIFO, so these keep the order of the
+  # synchronous calls they replace.
+  def deliver_request(table, token, ticket),
+    do: send_control(table, {:deliver, token, ticket}, now() + @call_timeout_ms)
+
+  def finish_request(table, token),
+    do: send_control(table, {:finish, token}, now() + @call_timeout_ms)
+
+  # edge_result/4 in two requests: the edge prepares the result itself between
+  # them, because a session event's producer has to be the edge.
+  def register_request(table, token, output) do
+    case controller(table) do
+      pid when is_pid(pid) ->
+        send_control(table, {:register, token, output, pid}, now() + @call_timeout_ms)
+
+      _missing ->
+        {:error, :output_unavailable}
+    end
+  end
+
+  def edge_prepared_request(table, token, ticket),
+    do: send_control(table, {:edge_prepared, token, ticket}, now() + @call_timeout_ms)
+
   #
   # The failure frame's deadline is the one mark_failure/3 charged, not a
   # fixed interval. A slow Controller may already have queued that frame when

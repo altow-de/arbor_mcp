@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   until the error's own delivery deadline, after which it could not have been
   sent anyway. It waits asynchronously, so other requests are not held up
   while one waits.
+- A busy output controller no longer holds up a runtime's other HTTP
+  requests. The HTTP gateway serves every request of a runtime and used to
+  wait synchronously, for up to 5 s each, for the controller to deliver a
+  result, finish a batch, or publish an error the gateway authors itself.
+  During that wait no other request could even get its 202. These are now
+  asynchronous requests that the gateway settles in its own loop. Each
+  request's later steps still wait for its own answers, so results, batch
+  arrays and errors keep their order.
 
 ## [2.0.0-rc.6] — 2026-10-26
 
