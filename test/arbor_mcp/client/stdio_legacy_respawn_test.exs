@@ -18,6 +18,7 @@ defmodule Arbor.MCP.Client.StdioLegacyRespawnTest do
 
   alias Arbor.MCP.Client
   alias Arbor.MCP.Client.EraCache
+  alias Arbor.MCP.TestHelpers
   alias Arbor.MCP.Transport.Stdio
 
   @moduletag :tmp_dir
@@ -122,6 +123,65 @@ defmodule Arbor.MCP.Client.StdioLegacyRespawnTest do
     end
   end
 
+  describe "an answer that is not silence" do
+    # Only a child that exits without a word, or a probe that times out, is
+    # replaced: output that is oversized, malformed or cut off is an answer
+    # of a sort, and fails the connection on the pipe it came from.
+    for {era, expected} <- [
+          oversized:
+            "{:era_probe_failed, {:transport_error, {:connection_error, :frame_too_large}}}",
+          malformed: "{:era_probe_failed, {:unexpected_response, ",
+          partial:
+            "{:era_probe_failed, {:transport_error, {:connection_error, {:unfinished_frame, {:process_exited, 5}}}}}"
+        ] do
+      test "#{era} output is not respawned", %{tmp_dir: tmp_dir} do
+        %{prefer_modern: %{result: result, methods: methods, starts: starts}} =
+          connect_concurrently(tmp_dir, unquote(era), [:prefer_modern], max_frame_bytes: 4_096)
+
+        assert {:error, {:transport_connect_failed, reason}} = result
+        assert String.starts_with?(reason, unquote(expected)), reason
+        assert {methods, starts} == {["server/discover"], 1}
+      end
+    end
+  end
+
+  describe "a probed server that cannot be confirmed stopped" do
+    test "is not replaced by a second one", %{tmp_dir: tmp_dir} do
+      log = Path.join(tmp_dir, "unconfirmed.log")
+      owner = self()
+
+      starter =
+        spawn_link(fn ->
+          Process.flag(:trap_exit, true)
+
+          result =
+            start_client(:mute, :prefer_modern, log,
+              handshake_timeout: 1_000,
+              establish_timeout: 15_000,
+              cleanup_timeout: 600
+            )
+
+          send(owner, {:started, result})
+
+          receive do
+            {:EXIT, ^owner, _reason} -> :ok
+          end
+        end)
+
+      # Once the probe has reached the server, stop the probed child's stdio
+      # actor from answering: closing it then cannot confirm the child is
+      # gone.
+      TestHelpers.wait_until(fn -> "server/discover" in methods(log) end, timeout: 5_000)
+      actor = stdio_actor(starter)
+      true = :erlang.suspend_process(actor)
+
+      assert_receive {:started, result}, 15_000
+      assert {:error, {:transport_connect_failed, reason}} = result
+      assert reason =~ "{:probed_server_stop_unconfirmed, "
+      assert starts(log) == 1
+    end
+  end
+
   describe "a reconnect" do
     test "respawns again for a server that exits on the probe", %{tmp_dir: tmp_dir} do
       log = Path.join(tmp_dir, "reconnect.log")
@@ -136,6 +196,8 @@ defmodule Arbor.MCP.Client.StdioLegacyRespawnTest do
       on_exit(fn -> stop_client(client) end)
       assert {:ok, "2025-11-25"} = Client.negotiated_version(client)
       assert starts(log) == 2
+      # Answered after notifications/initialized, so that was read too.
+      assert {:ok, _result} = Client.ping(client)
 
       %{transport_state: %{os_pid: os_pid}} = :sys.get_state(client)
       assert {_output, 0} = System.cmd("kill", ["-KILL", "#{os_pid}"])
@@ -146,10 +208,35 @@ defmodule Arbor.MCP.Client.StdioLegacyRespawnTest do
       assert {:ok, _result} = Client.ping(client)
       assert starts(log) == 4
 
+      # Each ping reads as "other"; the last is left out.
       assert Enum.drop(methods(log), -1) ==
-               ["server/discover" | @legacy_handshake] ++ ["server/discover" | @legacy_handshake]
+               ["server/discover" | @legacy_handshake] ++
+                 ["other", "server/discover" | @legacy_handshake]
     end
   end
+
+  # The stdio actor that the client `starter` is starting owns.
+  defp stdio_actor(starter) do
+    {:links, links} = Process.info(starter, :links)
+    [client] = Enum.filter(links, &(dictionary_value(&1, {Arbor.MCP.Client, :client}) == true))
+
+    [actor] =
+      Enum.filter(
+        Process.list(),
+        &(dictionary_value(&1, {Arbor.RPC.Subprocess.Actor, :owner}) == client)
+      )
+
+    actor
+  end
+
+  defp dictionary_value(pid, key) when is_pid(pid) do
+    case Process.info(pid, :dictionary) do
+      {:dictionary, dictionary} -> :proplists.get_value(key, dictionary, nil)
+      nil -> nil
+    end
+  end
+
+  defp dictionary_value(_port, _key), do: nil
 
   defp assert_legacy_observed(client) do
     %{transport_mod: Stdio, transport_state: transport_state} = :sys.get_state(client)

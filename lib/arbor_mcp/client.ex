@@ -191,8 +191,9 @@ defmodule Arbor.MCP.Client do
     On expiry `start_link/1` fails with `{:error, :handshake_timeout}`.
   - `:protocol_mode` - Era policy: `:modern_only`, `:legacy_only`,
     `:prefer_modern`, or `:prefer_legacy`. Under `:prefer_modern`, a stdio
-    server that exits on the `server/discover` probe or never answers it is
-    closed and started again for a legacy `initialize`, once.
+    server that exits without answering the `server/discover` probe, or never
+    answers it, is closed and, once confirmed stopped, started again for a
+    legacy `initialize`, once.
   - `:era_probe_timeout` - Dedicated timeout for the side-effect-free modern
     discovery probe exchange, send included (default: 2_000 milliseconds).
     Over stdio the probe is the first message a newly started server reads,

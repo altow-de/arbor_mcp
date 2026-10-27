@@ -17,6 +17,9 @@ defmodule Arbor.MCP.Test.ScriptedStdioServer do
   #   broken  exits on any request
   #   mute    reads everything and answers nothing
   #   garbage answers server/discover with a response for another request id
+  #   oversized answers server/discover with a 20 kB line
+  #   malformed answers server/discover with a line that is not JSON
+  #   partial writes part of an answer to server/discover, then exits
 
   @script ~S"""
   printf 'start\n' >> "$3"
@@ -49,7 +52,15 @@ defmodule Arbor.MCP.Test.ScriptedStdioServer do
         exit 4 ;;
       garbage:server/discover)
         printf '{"jsonrpc":"2.0","id":0,"result":{}}\n' ;;
-      mute:*|garbage:*|silent:server/discover) ;;
+      oversized:server/discover)
+        pad=$(head -c 20000 /dev/zero | tr '\0' x)
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"pad":"%s"}}\n' "$id" "$pad" ;;
+      malformed:server/discover)
+        printf '{this is not JSON\n' ;;
+      partial:server/discover)
+        printf '{"jsonrpc":"2.0","id":%s,"res' "$id"
+        exit 5 ;;
+      mute:*|garbage:*|oversized:*|malformed:*|partial:*|silent:server/discover) ;;
       *)
         printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
     esac

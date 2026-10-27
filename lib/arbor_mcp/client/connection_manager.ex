@@ -190,17 +190,14 @@ defmodule Arbor.MCP.Client.ConnectionManager do
     result
   rescue
     exception ->
-      ConnectionScope.closed(
-        transport_mod,
-        transport_state,
-        {:error, {:cleanup_exception, exception.__struct__}}
-      )
-
-      :ok
+      result = {:error, {:cleanup_exception, exception.__struct__}}
+      ConnectionScope.closed(transport_mod, transport_state, result)
+      result
   catch
     :exit, reason ->
-      ConnectionScope.closed(transport_mod, transport_state, {:error, {:cleanup_exit, reason}})
-      :ok
+      result = {:error, {:cleanup_exit, reason}}
+      ConnectionScope.closed(transport_mod, transport_state, result)
+      result
   end
 
   defp establish_protocol(transport_mod, transport_state, opts, era_identity) do
@@ -330,15 +327,23 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   end
 
   defp respawn_for_legacy?(transport_mod, transport_state, {:transport_error, reason}) do
-    spawned_server?(transport_mod, transport_state) and
-      (reason == :handshake_timeout or not transport_alive?(transport_mod, transport_state))
+    spawned_server?(transport_mod, transport_state) and probe_unanswered?(reason)
   end
 
   defp respawn_for_legacy?(_transport_mod, _transport_state, _probe_error), do: false
 
+  # The only two triggers: the probe timed out, or the child exited with no
+  # answer at all. Malformed, partial or oversized output and any other
+  # framing error are answers of a sort, and fail the connection.
+  defp probe_unanswered?(:handshake_timeout), do: true
+  defp probe_unanswered?({:connection_error, {:process_exited, _status}}), do: true
+  defp probe_unanswered?(_reason), do: false
+
   # Under :prefer_modern only, once per attempt: the probed child is closed
   # (EOF, then TERM and KILL) before a fresh one is started from the same
   # options for the legacy handshake, all within the establishment deadline.
+  # A child that cannot be confirmed stopped may still hold what the fresh
+  # one needs (a port, a lock), so then no second one is started.
   defp respawn_for_legacy(
          {:respawn_for_legacy, probe_error, probed_state},
          transport_mod,
@@ -346,15 +351,20 @@ defmodule Arbor.MCP.Client.ConnectionManager do
          opts
        ) do
     ConnectionScope.transport(transport_mod, probed_state)
-    close_quietly(transport_mod, with_cleanup_deadline(transport_mod, probed_state))
     deadline = Keyword.get(opts, :establish_deadline)
 
-    with :ok <- check_deadline(deadline),
+    with {:closed, :ok} <-
+           {:closed,
+            close_quietly(transport_mod, with_cleanup_deadline(transport_mod, probed_state))},
+         :ok <- check_deadline(deadline),
          :ok <- Lifetime.opening(),
          :ok <- ConnectionScope.opening(),
          {:ok, {_transport_mod, respawned}} <- connect_transport(transport_manager_opts) do
       initialize_respawned(transport_mod, respawned, probe_error, opts, deadline)
     else
+      {:closed, cleanup} ->
+        {:error, {:probed_server_stop_unconfirmed, %{probe: probe_error, cleanup: cleanup}}}
+
       {:error, reason} ->
         {:error, {:era_probe_and_respawn_failed, %{probe: probe_error, respawn: reason}}}
     end
