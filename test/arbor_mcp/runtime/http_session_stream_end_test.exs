@@ -115,30 +115,45 @@ defmodule Arbor.MCP.Server.Runtime.HTTPSessionStreamEndTest do
 
       # The stream runs at low priority and the test at high priority while
       # it waits, so the stream is still encoding when the test suspends it.
-      stream =
-        Task.async(fn ->
+      # It is unlinked and monitored, so a crash fails the test through
+      # await_stream/2 rather than killing it.
+      test = self()
+
+      {stream, monitor} =
+        spawn_monitor(fn ->
           Process.flag(:priority, :low)
 
           receive do
-            :go -> HttpPlug.call(request(:get, session, cursor.id), opts)
+            :go ->
+              send(
+                test,
+                {:stream_done, self(), HttpPlug.call(request(:get, session, cursor.id), opts)}
+              )
           end
         end)
+
+      # Runs however the test ends. The test process's own exit releases the
+      # suspension it holds, so a stream still alive here is only stopped.
+      on_exit(fn ->
+        :erlang.trace_pattern({OutputCodec, :prepare, 2}, false, [:global])
+        Process.exit(stream, :kill)
+      end)
 
       log =
         capture_log(fn ->
           :erlang.trace_pattern({OutputCodec, :prepare, 2}, true, [:global])
-          :erlang.trace(stream.pid, true, [:call])
+          :erlang.trace(stream, true, [:call])
 
           try do
             previous = Process.flag(:priority, :high)
-            send(stream.pid, :go)
-            deadline = suspend_encoding_bulk(stream.pid)
+            send(stream, :go)
+            deadline = suspend_encoding_bulk(stream)
             Process.flag(:priority, previous)
             wait_until(fn -> Deadline.now() > deadline end, timeout: 2_000, interval: 10)
-            :erlang.trace(stream.pid, false, [:call])
-            true = :erlang.resume_process(stream.pid)
+            :erlang.trace(stream, false, [:call])
+            true = :erlang.resume_process(stream)
 
-            conn = Task.await(stream, 5_000)
+            conn = await_stream(stream, monitor)
             assert conn.status == 200
             assert conn.resp_body =~ "event: connected"
             refute conn.resp_body =~ "bulk"
@@ -148,6 +163,19 @@ defmodule Arbor.MCP.Server.Runtime.HTTPSessionStreamEndTest do
         end)
 
       refute log =~ "[error]"
+    end
+  end
+
+  defp await_stream(stream, monitor) do
+    receive do
+      {:stream_done, ^stream, conn} ->
+        Process.demonitor(monitor, [:flush])
+        conn
+
+      {:DOWN, ^monitor, :process, ^stream, reason} ->
+        flunk("the GET stream crashed instead of ending: #{inspect(reason)}")
+    after
+      5_000 -> flunk("the GET stream did not end")
     end
   end
 
