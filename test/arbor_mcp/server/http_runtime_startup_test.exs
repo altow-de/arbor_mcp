@@ -5,8 +5,8 @@ defmodule Arbor.MCP.Server.HTTPRuntimeStartupTest do
 
   alias Arbor.MCP.Server.HTTP.Bandit.{Connection, ConnectionSlots, Options}
   alias Arbor.MCP.Server.HTTP.CowboyClaims
-  alias Arbor.MCP.Server.Runtime.{Admission, Config, Deadline, Initialization, Ref, Services}
   alias Arbor.MCP.Server.{Runtime, Transport}
+  alias Arbor.MCP.Server.Runtime.{Admission, Config, Deadline, Initialization, Ref, Services}
 
   import ExUnit.CaptureLog
 
