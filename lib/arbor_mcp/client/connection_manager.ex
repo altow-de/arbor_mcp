@@ -57,7 +57,7 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   defp establish_timeout(opts) do
     case Keyword.get(opts, :establish_timeout) do
       nil ->
-        {:ok, handshake_timeout(opts) + EraProbe.timeout(opts)}
+        {:ok, handshake_timeout(opts) + probe_timeout(opts, spawns_server?(opts))}
 
       :infinity ->
         {:ok, :infinity}
@@ -98,6 +98,7 @@ defmodule Arbor.MCP.Client.ConnectionManager do
          {:ok, result, state_after_protocol} <-
            transport_mod
            |> establish_protocol(transport_state, opts, era_identity)
+           |> respawn_for_legacy(transport_mod, transport_manager_opts, opts)
            |> close_on_failure(transport_mod),
          state_after_protocol =
            Deadline.put_on_transport(transport_mod, state_after_protocol, nil),
@@ -145,6 +146,9 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   # before the failure may have added to it (an HTTP session id, a deferred
   # SSE client) and closing an earlier snapshot would leave that behind.
   defp close_on_failure({:ok, _result, _state} = success, _transport_mod), do: success
+
+  # A failure with no open transport left to close.
+  defp close_on_failure({:error, _reason} = failure, _transport_mod), do: failure
 
   defp close_on_failure({:error, reason, latest_state}, transport_mod) do
     ConnectionScope.transport(transport_mod, latest_state)
@@ -310,8 +314,77 @@ defmodule Arbor.MCP.Client.ConnectionManager do
                 %{probe: probe_error, initialize: initialize_error}}, latest_state}
           end
         else
-          {:error, {:era_probe_failed, probe_error}, updated_state}
+          without_legacy_evidence(transport_mod, updated_state, probe_error)
         end
+    end
+  end
+
+  # A stdio server that predates server/discover may exit on the probe
+  # (Python's `mcp` 1.8 and earlier do) or never answer it. That is no
+  # evidence on the probed pipe, which a late reply could still reach, so
+  # do_establish_connection/2 reaps that child and initializes a new one.
+  defp without_legacy_evidence(transport_mod, transport_state, probe_error) do
+    if respawn_for_legacy?(transport_mod, transport_state, probe_error),
+      do: {:respawn_for_legacy, probe_error, transport_state},
+      else: {:error, {:era_probe_failed, probe_error}, transport_state}
+  end
+
+  defp respawn_for_legacy?(transport_mod, transport_state, {:transport_error, reason}) do
+    spawned_server?(transport_mod, transport_state) and
+      (reason == :handshake_timeout or not transport_alive?(transport_mod, transport_state))
+  end
+
+  defp respawn_for_legacy?(_transport_mod, _transport_state, _probe_error), do: false
+
+  # Under :prefer_modern only, once per attempt: the probed child is closed
+  # (EOF, then TERM and KILL) before a fresh one is started from the same
+  # options for the legacy handshake, all within the establishment deadline.
+  defp respawn_for_legacy(
+         {:respawn_for_legacy, probe_error, probed_state},
+         transport_mod,
+         transport_manager_opts,
+         opts
+       ) do
+    ConnectionScope.transport(transport_mod, probed_state)
+    close_quietly(transport_mod, with_cleanup_deadline(transport_mod, probed_state))
+    deadline = Keyword.get(opts, :establish_deadline)
+
+    with :ok <- check_deadline(deadline),
+         :ok <- Lifetime.opening(),
+         :ok <- ConnectionScope.opening(),
+         {:ok, {_transport_mod, respawned}} <- connect_transport(transport_manager_opts) do
+      initialize_respawned(transport_mod, respawned, probe_error, opts, deadline)
+    else
+      {:error, reason} ->
+        {:error, {:era_probe_and_respawn_failed, %{probe: probe_error, respawn: reason}}}
+    end
+  end
+
+  defp respawn_for_legacy(result, _transport_mod, _transport_manager_opts, _opts), do: result
+
+  # Fails with the respawned transport, which close_on_failure/2 then closes.
+  defp initialize_respawned(transport_mod, respawned, probe_error, opts, deadline) do
+    with :ok <- ConnectionScope.transport(transport_mod, respawned),
+         respawned = Deadline.put_on_transport(transport_mod, respawned, deadline),
+         era_identity = EraCache.identity(transport_mod, respawned, opts),
+         {:ok, _result, _state} = success <-
+           establish_legacy_protocol(transport_mod, respawned, opts, era_identity) do
+      :telemetry.execute(
+        [:arbor_mcp, :client, :era, :fallback],
+        %{},
+        %{from: :modern, to: :legacy, reason: probe_failure_class(probe_error), respawned: true}
+      )
+
+      success
+    else
+      {:error, initialize_error, latest_state} ->
+        {:error,
+         {:era_probe_and_initialize_failed,
+          %{probe: probe_error, initialize: initialize_error, respawned: true}}, latest_state}
+
+      {:error, reason} ->
+        {:error, {:era_probe_and_respawn_failed, %{probe: probe_error, respawn: reason}},
+         respawned}
     end
   end
 
@@ -371,12 +444,21 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   # there gets `:handshake_timeout`, the time a legacy `initialize` gets for
   # the same first answer. The establishment deadline still caps it.
   defp probe_era(transport_mod, transport_state, opts) do
-    opts =
-      if spawned_server?(transport_mod, transport_state),
-        do: Keyword.put_new(opts, :era_probe_timeout, handshake_timeout(opts)),
-        else: opts
+    timeout = probe_timeout(opts, spawned_server?(transport_mod, transport_state))
+    EraProbe.probe(transport_mod, transport_state, Keyword.put(opts, :era_probe_timeout, timeout))
+  end
 
-    EraProbe.probe(transport_mod, transport_state, opts)
+  defp probe_timeout(opts, true = _spawned_server?),
+    do: Keyword.get_lazy(opts, :era_probe_timeout, fn -> handshake_timeout(opts) end)
+
+  defp probe_timeout(opts, false = _spawned_server?), do: EraProbe.timeout(opts)
+
+  # Whether `opts` connect to a stdio server, before it is spawned.
+  defp spawns_server?(opts) do
+    case prepare_transport_config(opts) do
+      {:ok, config} -> match?([{Stdio, _transport_opts} | _], Keyword.get(config, :transports))
+      _error -> false
+    end
   end
 
   defp spawned_server?(Stdio, _transport_state), do: true
@@ -399,8 +481,10 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   # the transport reports timed out, such as an HTTP POST cut short by the
   # probe's bound. A stdio probe that runs out of time fails instead as
   # {:transport_error, :handshake_timeout}, which is deliberately not
-  # evidence: the server may only be slow to start, and its late answer to the
-  # probe would share the pipe with an initialize sent after it.
+  # evidence on that pipe: the server may only be slow to start, and its late
+  # answer to the probe would share the pipe with an initialize sent after it.
+  # :prefer_modern initializes a fresh process instead (see
+  # without_legacy_evidence/3).
   defp legacy_fallback_evidence?({:probe_timeout, _reason}), do: true
   defp legacy_fallback_evidence?({:http_probe_rejected, _response}), do: true
   defp legacy_fallback_evidence?(_reason), do: false
