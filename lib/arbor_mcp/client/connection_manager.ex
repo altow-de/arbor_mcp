@@ -273,8 +273,13 @@ defmodule Arbor.MCP.Client.ConnectionManager do
       :modern ->
         establish_modern_protocol(transport_mod, transport_state, opts, era_identity, true)
 
-      :legacy ->
-        establish_legacy_protocol(transport_mod, transport_state, opts, era_identity)
+      {:legacy, version} ->
+        establish_legacy_protocol(
+          transport_mod,
+          transport_state,
+          cached_legacy_opts(opts, version),
+          era_identity
+        )
 
       :miss ->
         probe_then_maybe_legacy(transport_mod, transport_state, opts, era_identity)
@@ -322,8 +327,13 @@ defmodule Arbor.MCP.Client.ConnectionManager do
       :modern ->
         establish_modern_protocol(transport_mod, transport_state, opts, era_identity, true)
 
-      :legacy ->
-        establish_legacy_protocol(transport_mod, transport_state, opts, era_identity)
+      {:legacy, version} ->
+        establish_legacy_protocol(
+          transport_mod,
+          transport_state,
+          cached_legacy_opts(opts, version),
+          era_identity
+        )
 
       :miss ->
         initialize_then_maybe_modern(transport_mod, transport_state, opts, era_identity)
@@ -479,11 +489,21 @@ defmodule Arbor.MCP.Client.ConnectionManager do
           %{era: era, protocol_version: version}
         )
 
-        era
+        if era == :legacy, do: {:legacy, version}, else: era
 
       :miss ->
         :miss
     end
+  end
+
+  # A legacy observation keeps the revision the server negotiated, which may
+  # be an older one the fallback picked from its list; offering it again lets
+  # a server that accepts only that revision be reached on the next connection
+  # too, until the observation expires.
+  defp cached_legacy_opts(opts, version) do
+    if VersionRegistry.era_for(version) == :legacy,
+      do: Keyword.put(opts, :protocol_version, version),
+      else: opts
   end
 
   defp maybe_reset_era_cache(identity, opts) do
@@ -834,14 +854,30 @@ defmodule Arbor.MCP.Client.ConnectionManager do
             {:error, reason, state_after_send}
         end
 
-      {:error, reason} ->
-        reason = if Deadline.expired?(deadline), do: :handshake_timeout, else: reason
-        {:error, reason, transport_state}
+      # An HTTP server rejects initialize with a 400 carrying the JSON-RPC
+      # error (a modern-only one does), which the other transports deliver
+      # as the response itself: read it the same way.
+      {:error, {:http_error, 400, body}} = error ->
+        case Protocol.parse_message(body) do
+          {:error, details, _id} when is_map(details) ->
+            body
+            |> parse_handshake_response(transport_state)
+            |> with_state(transport_state)
+
+          _other ->
+            {:error, initialize_send_error(error, deadline), transport_state}
+        end
+
+      {:error, _reason} = error ->
+        {:error, initialize_send_error(error, deadline), transport_state}
 
       other ->
         {:error, other, transport_state}
     end
   end
+
+  defp initialize_send_error({:error, reason}, deadline),
+    do: if(Deadline.expired?(deadline), do: :handshake_timeout, else: reason)
 
   defp with_state({:ok, _result, _state} = success, _transport_state), do: success
   defp with_state({:error, reason}, transport_state), do: {:error, reason, transport_state}

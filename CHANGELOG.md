@@ -23,7 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   such a revision when the server rejected the one it offered and the probe
   then names others. A list that also names a modern or an unknown revision
   is not legacy evidence, `:modern_only` never falls back, and a cached
-  modern observation still never downgrades.
+  modern observation still never downgrades. A cached legacy observation
+  now also keeps the revision the server negotiated, and the next
+  connection offers that one again, so a server that accepts only an older
+  revision stays reachable until the observation expires.
+- Over HTTP, an `initialize` rejected with a 400 carrying a JSON-RPC error,
+  as an Arbor `protocol_mode: :modern_only` server sends it, was taken for a
+  transport failure. `:prefer_legacy` therefore never moved forward to the
+  modern era over HTTP, unless an earlier connection had recorded it. The
+  error is now read as the rejection it is, the way the other transports
+  deliver it: `:prefer_legacy` probes and connects, and **`:legacy_only`
+  now fails with `{:initialize_error, error}`** as it does on the other
+  transports, instead of `{:transport_connect_failed, "{:http_error, 400,
+  ...}"}`.
 
 ## [2.0.0-rc.6] — 2026-10-26
 

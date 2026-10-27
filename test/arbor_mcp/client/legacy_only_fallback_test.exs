@@ -18,6 +18,7 @@ defmodule Arbor.MCP.Client.LegacyOnlyFallbackTest do
   alias Arbor.MCP.Test.RuntimeHTTPFixture
 
   @legacy_fixture Path.expand("../../../priv/test/legacy_stdio_server.exs", __DIR__)
+  @modern_fixture Path.expand("../../../priv/test/modern_stdio_server.exs", __DIR__)
   @project_root Path.expand("../../..", __DIR__)
 
   @legacy_versions ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
@@ -171,9 +172,11 @@ defmodule Arbor.MCP.Client.LegacyOnlyFallbackTest do
     test "is legacy evidence for prefer_modern, and initialize offers the best shared one" do
       cache_key = make_ref()
 
+      # A strict server: it rejects any initialize offering another revision.
       opts = [
         discover: [{:unsupported, ["2025-06-18", "2025-03-26"]}],
         accepts: ["2025-06-18", "2025-03-26"],
+        strict: true,
         era_cache_key: cache_key
       ]
 
@@ -191,12 +194,19 @@ defmodule Arbor.MCP.Client.LegacyOnlyFallbackTest do
                  EraCache.identity(ScriptedTransport, nil, era_cache_key: cache_key)
                )
 
-      # The observation is reused: the next connection initializes at once.
+      # The observation is reused, with the revision the server took: the
+      # next connections initialize at once and offer it again, in both
+      # preference modes.
       Client.stop(client)
-      assert {:ok, again} = start_scripted(:prefer_modern, opts)
-      assert {:ok, "2025-06-18"} = Client.negotiated_version(again)
-      assert_receive {:scripted, "initialize", _version}
-      refute_received {:scripted, "server/discover", _version}
+
+      for mode <- [:prefer_modern, :prefer_legacy] do
+        assert {:ok, again} = start_scripted(mode, opts)
+        assert {:ok, "2025-06-18"} = Client.negotiated_version(again)
+        assert_receive {:scripted, "initialize", "2025-06-18"}
+        assert_receive {:scripted, "notifications/initialized", nil}
+        refute_received {:scripted, _method, _version}
+        Client.stop(again)
+      end
     end
 
     test "a per-client legacy :protocol_version on the list is offered" do
@@ -336,7 +346,7 @@ defmodule Arbor.MCP.Client.LegacyOnlyFallbackTest do
     end
 
     test "over HTTP" do
-      url = start_legacy_http_server()
+      url = start_http_server(:legacy_only)
 
       for mode <- @modes do
         assert_legacy_target(mode, transport: :http, url: url)
@@ -361,22 +371,53 @@ defmodule Arbor.MCP.Client.LegacyOnlyFallbackTest do
   end
 
   # The other strict direction, and the fall-forward that shares the retry
-  # path above: an Arbor server running :modern_only.
-  test "an Arbor modern-only server is reached in every mode but legacy_only" do
-    for mode <- @modes do
-      {:ok, server} = start_handler_server(:test, :modern_only)
-      result = start_client(mode, transport: :test, server: server)
-
-      if mode == :legacy_only do
-        assert {:error, {:initialize_error, %{"code" => -32022} = error}} = result
-        assert error["data"]["supported"] == ["2026-07-28"]
-      else
-        assert {:ok, client} = result, "#{mode}: #{inspect(result)}"
-        assert {:ok, "2026-07-28"} = Client.negotiated_version(client)
-        Client.stop(client)
+  # path above: an Arbor server running :modern_only. Every transport
+  # delivers its initialize rejection the same way, HTTP as a 400 carrying
+  # the JSON-RPC error.
+  describe "an Arbor server running protocol_mode: :modern_only" do
+    test "over the test transport and BEAM" do
+      for transport <- [:test, :beam], mode <- @modes do
+        {:ok, server} = start_handler_server(transport, :modern_only)
+        assert_modern_target(mode, transport: transport, server: server)
+        stop_quietly(server)
       end
+    end
 
-      stop_quietly(server)
+    test "over HTTP" do
+      url = start_http_server(:modern_only)
+
+      for mode <- @modes do
+        # Each mode starts without the observation the one before recorded.
+        assert_modern_target(mode, transport: :http, url: url, reset_era_cache: true)
+      end
+    end
+
+    test "over stdio" do
+      mix = System.find_executable("mix") || flunk("mix executable is required")
+
+      for mode <- @modes do
+        assert_modern_target(mode,
+          transport: :stdio,
+          command: [mix, "run", "--no-compile", "--no-start", @modern_fixture],
+          cd: @project_root,
+          env: mix_child_env(),
+          era_probe_timeout: 10_000
+        )
+      end
+    end
+  end
+
+  defp assert_modern_target(mode, opts) do
+    case start_client(mode, opts) do
+      {:ok, client} ->
+        refute mode == :legacy_only, "legacy_only connected to a modern-only server"
+        assert {:ok, "2026-07-28"} = Client.negotiated_version(client), "#{mode}"
+        Client.stop(client)
+
+      {:error, reason} ->
+        assert mode == :legacy_only, "#{mode}: #{inspect(reason)}"
+        assert {:initialize_error, %{"code" => -32022} = error} = reason
+        assert error["data"]["supported"] == ["2026-07-28"]
     end
   end
 
@@ -424,8 +465,8 @@ defmodule Arbor.MCP.Client.LegacyOnlyFallbackTest do
     :exit, _reason -> :ok
   end
 
-  defp start_legacy_http_server do
-    runtime = RuntimeHTTPFixture.start(LegacyHandler, protocol_mode: :legacy_only)
+  defp start_http_server(mode) do
+    runtime = RuntimeHTTPFixture.start(LegacyHandler, protocol_mode: mode)
     ref = {__MODULE__, make_ref()}
     {:ok, socket} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
     {:ok, {_address, port}} = :inet.sockname(socket)
@@ -437,7 +478,7 @@ defmodule Arbor.MCP.Client.LegacyOnlyFallbackTest do
         [
           runtime: runtime,
           path: "/mcp",
-          protocol_mode: :legacy_only,
+          protocol_mode: mode,
           allowed_origins: ["http://127.0.0.1:#{port}"]
         ],
         ip: {127, 0, 0, 1},
