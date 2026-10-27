@@ -246,18 +246,28 @@ wire shape.
 
 With `:prefer_modern`, ArborMCP sends a bounded `server/discover` probe first. It
 falls back to `initialize` only when the response is recognized as evidence of
-a legacy peer and the transport is still usable. A recognized modern error,
-unsupported modern revision, timeout, authentication failure, or broken
-transport is surfaced instead of being silently downgraded. `:modern_only`
-never falls back.
+a legacy peer and the transport is still usable. Over HTTP, a probe that gets
+no answer within `:era_probe_timeout` is such evidence too, as MCP 2026-07-28
+says: each POST stands alone, so a late answer to the probe cannot reach the
+`initialize` that follows. A recognized modern error, unsupported modern
+revision, authentication failure, or broken transport is surfaced instead of
+being silently downgraded. `:modern_only` never falls back.
 
 Over stdio the probe is the first message a newly spawned server reads, so
 the client waits for the server to start as well as to answer. Unless
 `:era_probe_timeout` is set, that wait is bounded by `:handshake_timeout`
 (10 s by default), the time a legacy `initialize` gets, so a server that is
-slow to start connects in every mode. A server that answers nothing within
-it fails the probe with `{:transport_error, :handshake_timeout}` and is not
-taken for a legacy one.
+slow to start connects in every mode. The establishment bound covers both:
+`:handshake_timeout` plus the probe's bound, 20 s by default.
+
+A stdio server that exits on the probe (Python `mcp` 1.8 and earlier do) or
+answers nothing within its bound gives no evidence on that pipe, and a late
+answer could still reach anything sent after the probe. Under
+`:prefer_modern` the client closes that process (EOF, then TERM and KILL),
+starts a fresh one with the same options, and initializes it: once per
+connection attempt, reconnects included, within `:establish_timeout`. A
+modern-only server then fails on `initialize` with the versions it supports.
+`:modern_only` fails with the probe error and never respawns.
 
 Successful modern observations are pinned by endpoint and relevant transport
 configuration. Legacy observations expire (five minutes by default) so an

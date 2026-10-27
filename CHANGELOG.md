@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Under `:prefer_modern`, a stdio server that exits on the `server/discover`
+  probe, as Python `mcp` 1.6 and 1.8 stdio servers do, or that does not
+  answer it within its bound is now reached with a legacy `initialize`. The
+  client closes that process (EOF, then TERM and KILL), starts a fresh one
+  from the same options and initializes it, once per connection attempt and
+  reconnect, within `:establish_timeout`. The probed pipe is never reused, so
+  a late answer to the probe cannot reach the handshake. A modern-only server
+  then fails on `initialize` with the versions it supports, reported as
+  `{:era_probe_and_initialize_failed, %{..., respawned: true}}`. The legacy
+  observation is recorded and the `[:arbor_mcp, :client, :era, :fallback]`
+  event carries `respawned: true`. `:modern_only` never respawns, and
+  `:prefer_legacy` and `:legacy_only` open with `initialize` as before.
+- `Arbor.MCP.Reliability.CircuitBreaker.call_with_deadline/3` runs an
+  operation that has its own deadline through a breaker without the
+  breaker's per-call `:timeout` cutting it short.
+
 ### Fixed
 
 - Over stdio, the modern `server/discover` probe gave a newly spawned server
@@ -18,12 +36,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loaded host. A slow legacy server's error answer, which `:prefer_modern`
   falls back on, came too late as well. Over stdio the probe now waits as
   long as a legacy `initialize` does, `:handshake_timeout` (10 s by
-  default), unless `:era_probe_timeout` is given. HTTP keeps the 2 s probe,
-  and the default `:establish_timeout` is unchanged. A stdio server that
-  never answers still fails, with the same error, and a probe timeout over
-  stdio is still not taken as evidence of a legacy server. **Behavior
-  change:** such a server now fails after `:handshake_timeout` rather than
-  after 2 s.
+  default), unless `:era_probe_timeout` is given, and the default
+  `:establish_timeout` counts that bound: `:handshake_timeout` plus the
+  probe's bound, 20 s over stdio. HTTP keeps the 2 s probe and the 12 s
+  default. **Behavior change:** under `:modern_only` a stdio server that
+  never answers now fails after `:handshake_timeout` rather than 2 s, with
+  the same error.
+- Inside the reliability wrapper with a circuit breaker, a receive with its
+  own timeout (the era probe's, `initialize`'s) was cut short at the
+  breaker's 5 s per-call `:timeout`, so a wrapped stdio server slower than
+  that to start still failed. The receive's own timeout now bounds it.
+- The configuration, transport and troubleshooting guides said an HTTP probe
+  timeout never leads to `initialize`. Under the preference modes it is
+  legacy evidence, as MCP 2026-07-28 says, and has been since the modern era
+  landed: each POST stands alone, so a late answer cannot reach the
+  `initialize` that follows. The guides now say so; HTTP behavior is
+  unchanged.
 
 ## [2.0.0-rc.6] — 2026-10-26
 

@@ -119,9 +119,9 @@ Client mode options:
 - `:handshake_timeout` bounds the legacy `initialize` exchange the same way;
   the default is `10_000` milliseconds.
 - `:establish_timeout` bounds establishing the connection as a whole, probe,
-  fallback, handshake and connection retries included; the default is
-  `:handshake_timeout` plus `:era_probe_timeout` (counted as `2_000` when it
-  is not given, over stdio too), and on expiry `start_link/1` fails with
+  fallback, respawn, handshake and connection retries included; the default
+  is `:handshake_timeout` plus the probe's bound (`:era_probe_timeout` or its
+  default): 12 s, or 20 s over stdio. On expiry `start_link/1` fails with
   `{:error, :establish_timeout}`.
 - `:era_cache_legacy_ttl` controls how long a legacy observation is reused;
   the default is `300_000` milliseconds. Modern observations do not expire
@@ -133,11 +133,24 @@ Client mode options:
   cannot be identified from its connected state. Never include raw secrets;
   ArborMCP hashes the configured identity.
 
-Fallback is deliberately narrow. A modern timeout, transport failure,
-recognized modern error, authentication error, or cached-modern probe failure
-does not trigger `initialize`. Similarly, `:prefer_legacy` probes modern only
+Fallback is deliberately narrow. `:prefer_modern` initializes after the probe
+only on evidence of a legacy server, as MCP 2026-07-28 defines it: a JSON-RPC
+error that is not a recognized modern one, an HTTP `400`, `404` or `405`
+rejection of the probe, or an HTTP probe that gets no answer within
+`:era_probe_timeout`. Each HTTP POST stands alone, so a late answer to the
+probe cannot reach the `initialize` that follows. A recognized modern error,
+authentication error, transport failure, or cached-modern probe failure does
+not trigger `initialize`.
+
+Over stdio the probed pipe is never reused for `initialize`. A stdio server
+that exits on the probe, as Python `mcp` 1.8 and earlier do, or that does not
+answer it within its bound is closed (EOF, then TERM and KILL) and started
+again from the same options, and `:prefer_modern` initializes the new
+process. That happens once per connection attempt, within
+`:establish_timeout`; a modern-only server then fails on `initialize` with
+the versions it supports. Similarly, `:prefer_legacy` probes modern only
 after a protocol-level legacy failure while the transport remains usable.
-Strict modes never fall back.
+Strict modes never fall back or respawn.
 
 `protocol_version` is a legacy revision preference, not an era switch or a
 statement of the latest upstream MCP revision. The
