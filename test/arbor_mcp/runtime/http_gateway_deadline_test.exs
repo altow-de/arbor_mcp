@@ -99,14 +99,16 @@ defmodule Arbor.MCP.Server.Runtime.HTTPGatewayDeadlineTest do
   defp trace_release(runtime) do
     {:ok, gateway} = HTTPGateway.address(runtime)
     release = {Admission, :release, 2}
-    1 = :erlang.trace_pattern(release, [{:_, [], [{:return_trace}]}], [:global])
-    1 = :erlang.trace(gateway, true, [:call])
 
+    # Registered first, so the global pattern is removed even if enabling
+    # the trace below fails.
     on_exit(fn ->
       :erlang.trace_pattern(release, false, [:global])
       if Process.alive?(gateway), do: :erlang.trace(gateway, false, [:call])
     end)
 
+    assert 1 == :erlang.trace_pattern(release, [{:_, [], [{:return_trace}]}], [:global])
+    assert 1 == :erlang.trace(gateway, true, [:call])
     gateway
   end
 end
