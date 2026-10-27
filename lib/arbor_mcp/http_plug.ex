@@ -539,7 +539,7 @@ defmodule Arbor.MCP.HttpPlug do
              session_metadata(resolved, token_info, :http),
              conn.method == "GET"
            ),
-         {:ok, conn} <- runtime_protocol_version(conn, request, session),
+         {:ok, conn} <- runtime_protocol_version(conn, request, session, opts.protocol_mode),
          :ok <- RuntimeWriter.current(conn) do
       conn = conn |> maybe_add_cors_headers(opts) |> add_protocol_version_header()
       serve_runtime_session_method(conn, resolved, session)
@@ -1129,14 +1129,11 @@ defmodule Arbor.MCP.HttpPlug do
          _session_id,
          _session_reference
        ) do
-    supported = VersionRegistry.known_versions()
-
     error_response =
-      JSONRPC.error(
+      RequestContext.error_response(
+        {:unsupported_protocol_version, version},
         request_id,
-        ErrorCodes.unsupported_protocol_version(),
-        "Unsupported MCP protocol version",
-        %{"requested" => version, "supported" => supported}
+        opts.protocol_mode
       )
 
     conn
@@ -1448,7 +1445,7 @@ defmodule Arbor.MCP.HttpPlug do
              request,
              session_metadata(resolved, token_info, :http)
            ),
-         {:ok, conn} <- runtime_protocol_version(conn, request, session),
+         {:ok, conn} <- runtime_protocol_version(conn, request, session, opts.protocol_mode),
          :ok <- RuntimeWriter.current(conn),
          format = runtime_output_format(conn, request),
          {:ok, _token} <-
@@ -1559,7 +1556,8 @@ defmodule Arbor.MCP.HttpPlug do
   end
 
   defp runtime_validate_context(request, opts) do
-    with {:ok, context} <- RequestContext.from_message(request),
+    with :ok <- accepted_initialize_version(request, opts.protocol_mode),
+         {:ok, context} <- RequestContext.from_message(request),
          :ok <- RequestContext.validate_protocol_mode(context, opts.protocol_mode),
          :ok <- RequestContext.validate_method(context) do
       :ok
@@ -1568,6 +1566,28 @@ defmodule Arbor.MCP.HttpPlug do
         {:error, {:runtime_context_rejected, request["id"], reason}}
     end
   end
+
+  defp accepted_initialize_version(
+         %{"method" => "initialize", "params" => %{"protocolVersion" => version}},
+         mode
+       )
+       when is_binary(version) do
+    if accepted_initialize?(version, mode),
+      do: :ok,
+      else: {:error, {:unsupported_protocol_version, version}}
+  end
+
+  defp accepted_initialize_version(_request, _mode), do: :ok
+
+  defp accepted_initialize?(version, mode) do
+    VersionRegistry.supported?(version, accepted_protocol_mode(mode))
+  end
+
+  defp accepted_protocol_mode(mode)
+       when mode in [:legacy_only, :modern_only, :prefer_legacy, :prefer_modern],
+       do: mode
+
+  defp accepted_protocol_mode(_mode), do: VersionRegistry.protocol_mode()
 
   defp runtime_validate_headers(conn, request) do
     if modern_http_request?(conn, request) do
@@ -1626,14 +1646,14 @@ defmodule Arbor.MCP.HttpPlug do
         get_or_create_session_id(conn, RuntimeSession.initialization_request(request) || request)
   end
 
-  defp runtime_protocol_version(conn, request, session) do
+  defp runtime_protocol_version(conn, request, session, mode) do
     if is_list(request) and is_nil(RuntimeSession.initialization_request(request)) do
       validate_runtime_legacy_version(conn, request, session)
     else
       request = RuntimeSession.initialization_request(request) || request
 
       if modern_http_request?(conn, request) or request["method"] == "initialize",
-        do: validate_protocol_version(conn, request, nil, nil),
+        do: validate_protocol_version(conn, request, nil, nil, mode),
         else: validate_runtime_legacy_version(conn, request, session)
     end
   end
@@ -2250,7 +2270,7 @@ defmodule Arbor.MCP.HttpPlug do
     do: session_manager.ensure_session(session_id, metadata)
 
   defp validate_delete_protocol_version(conn, request, session_manager, session_id, true),
-    do: validate_legacy_protocol_version(conn, request, session_manager, session_id)
+    do: validate_legacy_protocol_version(conn, request, session_manager, session_id, nil)
 
   defp validate_delete_protocol_version(conn, _request, _manager, _session_id, false),
     do: {:ok, conn}
@@ -2633,7 +2653,7 @@ defmodule Arbor.MCP.HttpPlug do
     do: {:ok, conn}
 
   defp validate_sse_session_lifecycle(conn, request, session_manager, session_id, false) do
-    validate_legacy_protocol_version(conn, request, session_manager, session_id)
+    validate_legacy_protocol_version(conn, request, session_manager, session_id, nil)
   end
 
   defp initial_sse_opts(%{initial_sse_event_builder: builder} = opts, session_id)
@@ -3467,7 +3487,7 @@ defmodule Arbor.MCP.HttpPlug do
 
   # --- New Helper Functions ---
 
-  defp validate_protocol_version(conn, request, session_manager, session_id) do
+  defp validate_protocol_version(conn, request, session_manager, session_id, mode \\ nil) do
     if modern_http_request?(conn, request) do
       request_id = Map.get(request, "id")
 
@@ -3496,7 +3516,7 @@ defmodule Arbor.MCP.HttpPlug do
           end
       end
     else
-      validate_legacy_protocol_version(conn, request, session_manager, session_id)
+      validate_legacy_protocol_version(conn, request, session_manager, session_id, mode)
     end
   end
 
@@ -3514,42 +3534,19 @@ defmodule Arbor.MCP.HttpPlug do
          conn,
          %{"method" => "initialize"} = request,
          _session_manager,
-         _session_id
+         _session_id,
+         mode
        ) do
     requested_version = get_in(request, ["params", "protocolVersion"])
-    response_version = supported_or_preferred_version(requested_version)
 
-    case get_req_header(conn, "mcp-protocol-version") do
-      [] ->
-        {:ok, assign(conn, :request_protocol_version, response_version)}
-
-      [version] when is_binary(version) ->
-        cond do
-          not VersionRegistry.supported?(version) ->
-            protocol_version_error(
-              "Unsupported MCP-Protocol-Version: #{version}. Server supports #{response_version}.",
-              response_version
-            )
-
-          is_binary(requested_version) and version != requested_version ->
-            protocol_version_error(
-              "MCP-Protocol-Version header does not match initialize params.protocolVersion.",
-              response_version
-            )
-
-          true ->
-            {:ok, assign(conn, :request_protocol_version, response_version)}
-        end
-
-      _duplicated ->
-        protocol_version_error(
-          "MCP-Protocol-Version header must occur exactly once.",
-          response_version
-        )
+    if is_binary(requested_version) and not accepted_initialize?(requested_version, mode) do
+      {:error, {:unsupported_protocol_version, Map.get(request, "id"), requested_version}}
+    else
+      validate_initialize_header(conn, requested_version)
     end
   end
 
-  defp validate_legacy_protocol_version(conn, _request, session_manager, session_id) do
+  defp validate_legacy_protocol_version(conn, _request, session_manager, session_id, _mode) do
     expected_version =
       session_protocol_version(session_manager, session_id) || VersionRegistry.latest_version()
 
@@ -3588,6 +3585,39 @@ defmodule Arbor.MCP.HttpPlug do
         protocol_version_error(
           "MCP-Protocol-Version header must occur exactly once.",
           expected_version
+        )
+    end
+  end
+
+  defp validate_initialize_header(conn, requested_version) do
+    response_version = supported_or_preferred_version(requested_version)
+
+    case get_req_header(conn, "mcp-protocol-version") do
+      [] ->
+        {:ok, assign(conn, :request_protocol_version, response_version)}
+
+      [version] when is_binary(version) ->
+        cond do
+          not VersionRegistry.supported?(version) ->
+            protocol_version_error(
+              "Unsupported MCP-Protocol-Version: #{version}. Server supports #{response_version}.",
+              response_version
+            )
+
+          is_binary(requested_version) and version != requested_version ->
+            protocol_version_error(
+              "MCP-Protocol-Version header does not match initialize params.protocolVersion.",
+              response_version
+            )
+
+          true ->
+            {:ok, assign(conn, :request_protocol_version, response_version)}
+        end
+
+      _duplicated ->
+        protocol_version_error(
+          "MCP-Protocol-Version header must occur exactly once.",
+          response_version
         )
     end
   end

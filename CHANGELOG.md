@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request state is sealed with `:crypto` directly and checks the tag length.
   The floor keeps applications' dependency graphs off the affected releases.
 
+### Fixed
+
+- An HTTP mount that rejects a protocol version (`-32022`) lists `supported`
+  as the revisions its `protocol_mode` accepts, in that mode's preference
+  order. A `:legacy_only` mount no longer advertises `2026-07-28`, and a
+  `:modern_only` mount no longer advertises the legacy revisions. The message
+  is `Unsupported protocol version`, matching the other transports. The same
+  list is returned for an `initialize` version the mount does not accept, and
+  `Arbor.MCP.Plugs.ProtocolVersion` uses it when a mode is configured.
+
 ## [2.0.0-rc.6] — 2026-10-26
 
 ### Added
