@@ -78,7 +78,11 @@ defmodule Arbor.MCP.Client.ConnectionManager do
       do_establish_connection(state, opts)
     end
 
-    retry_opts = retry_policy |> Retry.mcp_defaults() |> never_retry_unconfirmed_cleanup()
+    retry_opts =
+      retry_policy
+      |> Retry.mcp_defaults()
+      |> never_retry_unconfirmed_cleanup(spawns_server?(opts))
+
     Retry.with_retry(connection_operation, retry_opts)
   end
 
@@ -86,7 +90,9 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   # never happens while one an earlier attempt opened may still be running,
   # whatever the policy's own :should_retry? says: it could hold the port or
   # lock the new one needs.
-  defp never_retry_unconfirmed_cleanup(retry_opts) do
+  defp never_retry_unconfirmed_cleanup(retry_opts, false = _spawns_server?), do: retry_opts
+
+  defp never_retry_unconfirmed_cleanup(retry_opts, true = _spawns_server?) do
     should_retry? = Keyword.fetch!(retry_opts, :should_retry?)
 
     Keyword.put(retry_opts, :should_retry?, fn reason ->
@@ -100,6 +106,15 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   def cleanup_unconfirmed?({:probed_server_stop_unconfirmed, _details}), do: true
   def cleanup_unconfirmed?({:cleanup_failed, _reason, {:error, _cleanup}}), do: true
   def cleanup_unconfirmed?(_reason), do: false
+
+  @doc false
+  # The part of a spawned server's close result that says whether the server
+  # itself stopped. A reliability component that would not stop is the
+  # wrapper's failure, not the server's.
+  def server_stop_result(:ok), do: :ok
+  def server_stop_result({:error, {:reliability_cleanup, _reason}}), do: :ok
+  def server_stop_result({:error, _reason} = error), do: error
+  def server_stop_result(other), do: {:error, other}
 
   defp do_establish_connection(state, opts) do
     opts = maybe_default_legacy_sse_opts(opts)
@@ -179,19 +194,15 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   defp close_on_failure({:error, reason, latest_state}, transport_mod) do
     ConnectionScope.transport(transport_mod, latest_state)
 
-    case close_quietly(transport_mod, with_cleanup_deadline(transport_mod, latest_state)) do
-      :ok ->
-        {:error, reason}
+    cleanup = close_quietly(transport_mod, with_cleanup_deadline(transport_mod, latest_state))
 
-      cleanup ->
-        if spawned_server?(transport_mod, latest_state),
-          do: {:error, {:cleanup_failed, reason, cleanup_error(cleanup)}},
-          else: {:error, reason}
+    with true <- spawned_server?(transport_mod, latest_state),
+         {:error, _server} = unconfirmed <- server_stop_result(cleanup) do
+      {:error, {:cleanup_failed, reason, unconfirmed}}
+    else
+      _confirmed_or_not_spawned -> {:error, reason}
     end
   end
-
-  defp cleanup_error({:error, _reason} = error), do: error
-  defp cleanup_error(other), do: {:error, other}
 
   # Cleanup gets its own budget, whatever is left of the establishment
   # deadline: it must still happen when the deadline is what failed.
@@ -396,9 +407,15 @@ defmodule Arbor.MCP.Client.ConnectionManager do
     ConnectionScope.transport(transport_mod, probed_state)
     deadline = Keyword.get(opts, :establish_deadline)
 
-    with {:closed, :ok} <-
-           {:closed,
-            close_quietly(transport_mod, with_cleanup_deadline(transport_mod, probed_state))},
+    closed = close_quietly(transport_mod, with_cleanup_deadline(transport_mod, probed_state))
+
+    if closed != :ok and server_stop_result(closed) == :ok,
+      do:
+        Logger.warning("Respawning although part of the cleanup failed",
+          reason: LogSummary.describe(closed)
+        )
+
+    with {:closed, :ok} <- {:closed, server_stop_result(closed)},
          :ok <- check_deadline(deadline),
          :ok <- Lifetime.opening(),
          :ok <- ConnectionScope.opening(),
@@ -541,8 +558,9 @@ defmodule Arbor.MCP.Client.ConnectionManager do
 
   defp probe_timeout(opts, false = _spawned_server?), do: EraProbe.timeout(opts)
 
+  @doc false
   # Whether `opts` connect to a stdio server, before it is spawned.
-  defp spawns_server?(opts) do
+  def spawns_server?(opts) do
     case prepare_transport_config(opts) do
       {:ok, config} -> match?([{Stdio, _transport_opts} | _], Keyword.get(config, :transports))
       _error -> false

@@ -92,11 +92,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reconnection could start a stdio server beside one that was never
   stopped. A health check that gave up on a hung server dropped the
   connection without closing it, so the old server kept running next to
-  the reconnected one; it is now closed first. And a reconnect went on after
-  an attempt or teardown whose stdio server could not be confirmed stopped.
-  Now the client stops reconnecting, settles in `:disconnected`, emits the
-  new `[:arbor_mcp, :client, :reconnect, :cleanup_unconfirmed]` event with
-  the reason, and `stop/2` returns the cleanup error.
+  the reconnected one; it is now closed first, off the client loop and
+  within the client's cleanup budget, in a connection scope too. And a
+  reconnect went on after an attempt or teardown whose stdio server could
+  not be confirmed stopped. Now, when the server process's own stop is
+  unconfirmed (a close that runs out of the budget included), the client
+  stops reconnecting, settles in `:disconnected`, emits the new
+  `[:arbor_mcp, :client, :reconnect, :cleanup_unconfirmed]` event with the
+  reason, and `stop/2` returns the cleanup error. Other cleanup failures,
+  such as a reliability component that would not stop, are logged and the
+  client reconnects. To tell those apart, `ReliabilityWrapper.close/1` now
+  reports a component that would not stop as
+  `{:error, {:reliability_cleanup, reason}}`.
 - Over stdio, the modern `server/discover` probe gave a newly spawned server
   only `:era_probe_timeout` (2 s by default) to start and answer. Under the
   default `:prefer_modern`, and under `:modern_only`, a server that took

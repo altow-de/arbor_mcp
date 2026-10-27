@@ -16,6 +16,7 @@ defmodule Arbor.MCP.Client.StdioReconnectCleanupTest do
   import Arbor.MCP.Test.ScriptedStdioServer, only: [methods: 1, start_client: 4, starts: 1]
 
   alias Arbor.MCP.Client
+  alias Arbor.MCP.Client.ConnectionManager
   alias Arbor.MCP.TestHelpers
 
   @moduletag :tmp_dir
@@ -89,6 +90,102 @@ defmodule Arbor.MCP.Client.StdioReconnectCleanupTest do
       assert {:ok, %{connection_status: :disconnected}} = Client.get_status(client)
       assert starts(log) == 1
       assert {:error, _cleanup} = Client.stop(client)
+    end
+  end
+
+  describe "a cleanup failure that is not the server's" do
+    # Only the server process's own stop decides: a worker or a reliability
+    # component that failed to stop leaves no server running.
+    test "does not stop the reconnect", %{tmp_dir: tmp_dir} do
+      log = Path.join(tmp_dir, "auxiliary.log")
+
+      {:ok, client} =
+        start_client(:once, :modern_only, log,
+          health_check_interval: 200,
+          reconnect: true,
+          reconnect_backoff: [initial: 10, max: 40]
+        )
+
+      on_exit(fn -> stop(client) end)
+      :sys.replace_state(client, &%{&1 | cleanup_result: {:error, :auxiliary_cleanup_failed}})
+
+      assert_receive {:reconnect, :success, ^client, _metadata}, 10_000
+      refute_received {:reconnect, :cleanup_unconfirmed, ^client, _metadata}
+    end
+
+    test "is told apart from the server's in a close result" do
+      assert ConnectionManager.server_stop_result(:ok) == :ok
+      # The reliability wrapper tags a component that would not stop.
+      assert ConnectionManager.server_stop_result({:error, {:reliability_cleanup, :timeout}}) ==
+               :ok
+
+      assert ConnectionManager.server_stop_result({:error, :timeout}) == {:error, :timeout}
+    end
+
+    test "inside the reliability wrapper, the server's own stop still decides",
+         %{tmp_dir: tmp_dir} do
+      log = Path.join(tmp_dir, "wrapped-unconfirmed.log")
+
+      {:ok, client} =
+        start_client(:once, :modern_only, log,
+          reliability: [circuit_breaker: [failure_threshold: 5]],
+          health_check_interval: 300,
+          cleanup_timeout: 600,
+          reconnect: true,
+          reconnect_backoff: [initial: 10, max: 40]
+        )
+
+      on_exit(fn -> stop(client) end)
+      TestHelpers.wait_until(fn -> length(methods(log)) >= 2 end, timeout: 5_000)
+      [actor] = stdio_actors(client)
+      true = :erlang.suspend_process(actor)
+
+      assert_receive {:reconnect, :cleanup_unconfirmed, ^client, _metadata}, 10_000
+      refute_received {:reconnect, :success, ^client, _metadata}
+      assert starts(log) == 1
+    end
+  end
+
+  describe "a health check in a connection scope" do
+    # There the native close runs in the client's own process; a teardown
+    # the client starts itself is still bounded by its cleanup budget, and
+    # running out of it counts as unconfirmed.
+    test "gives up on an unconfirmed close within the cleanup budget", %{tmp_dir: tmp_dir} do
+      log = Path.join(tmp_dir, "scoped.log")
+      command = Arbor.MCP.Test.ScriptedStdioServer.command(:once, log)
+
+      result =
+        Client.with_connection(
+          {:stdio, command: command},
+          [
+            protocol_mode: :modern_only,
+            health_check_interval: 300,
+            reconnect: true,
+            reconnect_backoff: [initial: 10, max: 40],
+            # The client's own cleanup budget, well short of the 3.5 s the
+            # stdio close of a stuck server takes.
+            client_cleanup_timeout: 1_000
+          ],
+          fn client ->
+            TestHelpers.wait_until(fn -> length(methods(log)) >= 2 end, timeout: 5_000)
+            [actor] = stdio_actors(client)
+            true = :erlang.suspend_process(actor)
+            suspended = System.monotonic_time(:millisecond)
+
+            assert_receive {:reconnect, :cleanup_unconfirmed, ^client, metadata}, 10_000
+            elapsed = System.monotonic_time(:millisecond) - suspended
+
+            # One 300 ms health-check interval, then a close cut off at the
+            # 1 s budget; the stdio close itself would take 3.5 s.
+            assert elapsed < 3_000, "the client was held for #{elapsed} ms"
+            assert {:server_stop_unconfirmed, {:error, _cleanup}} = metadata.reason
+            assert {:ok, %{connection_status: :disconnected}} = Client.get_status(client)
+            :done
+          end
+        )
+
+      assert result in [{:ok, :done}] or match?({:error, {:cleanup_failed, _, :done}}, result)
+      assert starts(log) == 1
     end
   end
 

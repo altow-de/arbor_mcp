@@ -215,9 +215,17 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
     result = close_wrapped(state)
     components = Enum.map([state.circuit_breaker_pid, state.health_check_pid], &stop_component/1)
 
+    # A component that would not stop is the wrapper's own failure, not the
+    # wrapped transport's: say which, so a caller can tell them apart.
     case result do
-      :ok -> Enum.find(components, :ok, &(&1 != :ok))
-      {:error, _reason} = error -> error
+      :ok ->
+        case Enum.find(components, :ok, &(&1 != :ok)) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:reliability_cleanup, reason}}
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
