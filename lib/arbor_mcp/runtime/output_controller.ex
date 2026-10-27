@@ -21,6 +21,8 @@ defmodule Arbor.MCP.Server.Runtime.OutputController do
 
   alias Arbor.MCP.Server.Subscriptions.Origin
 
+  @call_timeout_ms 5_000
+
   def start_link(opts),
     do: GenServer.start_link(__MODULE__, opts, timeout: Initialization.remaining(opts[:table]))
 
@@ -47,13 +49,50 @@ defmodule Arbor.MCP.Server.Runtime.OutputController do
   def retire(table, token, reason), do: call(table, {:retire, token, reason})
   def failed(table, token, reason), do: call(table, {:failed, token, reason})
 
-  def http_failure(table, token, binding, format),
-    do: http_control_call(table, {:http_failure, token, binding, format})
+  # The gateway waits for its failure frame until the failure deadline that
+  # mark_failure/3 charged, not a fixed interval. A slow Controller may already
+  # have queued that frame when a short wait expires, and the gateway would
+  # then retire the binding and discard it. Once the deadline has passed, no
+  # failure frame can be prepared or written, so giving up there discards
+  # nothing.
+  def http_failure(table, token, binding, format) do
+    case failure_deadline(table, token) do
+      {:ok, deadline} ->
+        http_control_call(table, {:http_failure, token, binding, format}, deadline)
 
-  def http_observation(table, token), do: http_control_call(table, {:http_observation, token})
+      :error ->
+        {:error, :http_failure_expired}
+    end
+  end
 
-  defp http_control_call(table, request) do
-    GenServer.call(controller(table), request, 50)
+  # The observation of a failure frame shares that frame's deadline. Any other
+  # observation gets the ordinary Controller call budget.
+  def http_observation(table, token) do
+    deadline =
+      case failure_deadline(table, token) do
+        {:ok, deadline} -> deadline
+        :error -> now() + @call_timeout_ms
+      end
+
+    http_control_call(table, {:http_observation, token}, deadline)
+  end
+
+  defp failure_deadline(table, token) do
+    case :ets.lookup(table, {:output_failure, token}) do
+      [{_key, %{deadline: deadline}}] -> {:ok, deadline}
+      _missing -> :error
+    end
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp http_control_call(table, request, deadline) do
+    with remaining when remaining > 0 <- deadline - now(),
+         pid when is_pid(pid) <- controller(table) do
+      GenServer.call(pid, request, remaining)
+    else
+      _expired -> {:error, :output_unavailable}
+    end
   catch
     :exit, _reason -> {:error, :output_unavailable}
   end
@@ -189,7 +228,7 @@ defmodule Arbor.MCP.Server.Runtime.OutputController do
 
   defp call(table, request) do
     case controller(table) do
-      pid when is_pid(pid) -> GenServer.call(pid, request, 5_000)
+      pid when is_pid(pid) -> GenServer.call(pid, request, @call_timeout_ms)
       _ -> {:error, :output_unavailable}
     end
   catch
