@@ -39,6 +39,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be nested inside its own `contents` list. One content item or a list of
   them is still wrapped as `contents`, and a map with `text` or `blob` is
   always an item, even beside a `contents` key.
+- A modern `tools/call` served by a handler process looks for the tool's
+  `x-mcp-header` annotations across the `tools/list` pages within one
+  `handler_call_timeout` in all, instead of one per page. A handler returning
+  up to 100 cursored pages, each just under the default 10 s, could hold the
+  request for about 1,000 s and run its `list_tools` callback 100 times. Past
+  the deadline the request fails closed with `tool_schema_unavailable`, as
+  past the page bound, and so does a page ready only after the deadline or
+  a timeout that `GenServer.call/3` wouldn't take; the walk still ends at
+  the first page that has the tool.
+- POST event streams now stop at the response deadline even when the socket
+  or stream consumer keeps returning data. This ports the 1.x maintenance
+  fix from `87b495e`.
 
 ## [2.0.0-rc.6] — 2026-10-26
 
