@@ -1346,7 +1346,9 @@ Set `:subscription_keepalive_interval_ms` to a positive integer or
 until the next notification or server-initiated closure.
 
 Other modern requests that use an SSE response stream also write comment
-keepalives; `subscriptions/listen` uses only the subscription interval above.
+keepalives; `subscriptions/listen` uses only the subscription interval above,
+and a legacy request's event stream gets none, since a legacy disconnect is
+not a cancellation.
 Set `:request_keepalive_interval_ms` to a positive integer (default `15_000`)
 or `:infinity`, either on an `Arbor.MCP.HttpPlug` mount or in an owned
 server's `http:` options. A failed write cancels the request handler and

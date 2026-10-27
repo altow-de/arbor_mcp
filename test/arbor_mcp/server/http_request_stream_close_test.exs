@@ -348,6 +348,40 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
     assert Process.alive?(socket)
   end
 
+  test "a legacy request's event stream gets no request keepalives" do
+    runtime = start_runtime(protocol_mode: :prefer_modern)
+    session = legacy_session(runtime)
+
+    body =
+      Jason.encode!(%{
+        jsonrpc: "2.0",
+        id: 7,
+        method: "tools/call",
+        params: %{name: "hold", arguments: %{}, _meta: %{"progressToken" => "legacy"}}
+      })
+
+    headers = [{"mcp-protocol-version", "2025-11-25"}, {"mcp-session-id", session}]
+
+    socket =
+      stream_post(runtime, body, headers, [gate: true], protocol_mode: :prefer_modern)
+
+    await = {Arbor.MCP.HttpPlug.RuntimeWriter, :await, 2}
+    :erlang.trace_pattern(await, true, [])
+    on_exit(fn -> :erlang.trace_pattern(await, false, []) end)
+    :erlang.trace(socket, true, [:call, {:tracer, self()}])
+    send(socket, :go)
+
+    # A keepalive's failed write would cancel the request, and the legacy
+    # revisions say a disconnect SHOULD NOT; so its wait sends none at all.
+    assert_receive {:trace, ^socket, :call, {_writer, :await, [_conn, :infinity]}}, 1_000
+    assert_receive {:tool_started, worker}, 1_000
+    send(worker, :release)
+    {wires, {:returned, conn}} = finish_stream(socket)
+    assert wire_shape(wires) == "R"
+    assert List.last(wires) =~ "\"id\":7"
+    assert conn.state == :chunked
+  end
+
   test "a streaming initialize is answered before any request keepalive can send headers" do
     runtime = start_runtime([])
 
@@ -575,16 +609,23 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
 
     socket =
       spawn(fn ->
+        headers =
+          [
+            {"content-type", "application/json"},
+            {"accept", "application/json, text/event-stream"}
+            | List.keystore(
+                headers,
+                "mcp-protocol-version",
+                0,
+                List.keyfind(headers, "mcp-protocol-version", 0) ||
+                  {"mcp-protocol-version", "2026-07-28"}
+              )
+          ]
+
         conn =
-          Enum.reduce(
-            [
-              {"content-type", "application/json"},
-              {"accept", "application/json, text/event-stream"},
-              {"mcp-protocol-version", "2026-07-28"} | headers
-            ],
-            Plug.Test.conn(:post, "/mcp", body),
-            fn {name, value}, conn -> Plug.Conn.put_req_header(conn, name, value) end
-          )
+          Enum.reduce(headers, Plug.Test.conn(:post, "/mcp", body), fn {name, value}, conn ->
+            Plug.Conn.put_req_header(conn, name, value)
+          end)
 
         {_adapter, state} = conn.adapter
 
@@ -666,6 +707,47 @@ defmodule Arbor.MCP.Server.HTTPRequestStreamCloseTest do
       %{"result" => _result} ->
         "R"
     end
+  end
+
+  defp legacy_session(runtime) do
+    opts = Arbor.MCP.HttpPlug.init(runtime: runtime, protocol_mode: :prefer_modern)
+
+    initialize =
+      %{
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: %{
+          protocolVersion: "2025-11-25",
+          capabilities: %{},
+          clientInfo: %{name: "close-test", version: "1"}
+        }
+      }
+      |> legacy_post([])
+      |> Arbor.MCP.HttpPlug.call(opts)
+
+    assert initialize.status == 200
+    [session] = Plug.Conn.get_resp_header(initialize, "mcp-session-id")
+
+    initialized =
+      %{jsonrpc: "2.0", method: "notifications/initialized"}
+      |> legacy_post([{"mcp-session-id", session}])
+      |> Arbor.MCP.HttpPlug.call(opts)
+
+    assert initialized.status == 202
+    session
+  end
+
+  defp legacy_post(message, headers) do
+    Enum.reduce(
+      [
+        {"content-type", "application/json"},
+        {"accept", "application/json"},
+        {"mcp-protocol-version", "2025-11-25"} | headers
+      ],
+      Plug.Test.conn(:post, "/mcp", Jason.encode!(message)),
+      fn {name, value}, conn -> Plug.Conn.put_req_header(conn, name, value) end
+    )
   end
 
   defp writer_domain(runtime) do

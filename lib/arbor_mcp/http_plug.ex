@@ -1488,7 +1488,7 @@ defmodule Arbor.MCP.HttpPlug do
                |> Map.put(:session_id, RuntimeSession.id(session))
                |> runtime_dispatch_opts(conn)
            ),
-         wait = runtime_wait(request, opts),
+         wait = runtime_wait(conn, request, opts),
          {:ok, response, conn} <- await_runtime_output(conn, format, wait),
          :ok <- runtime_response_ready(response) do
       conn = maybe_prepare_runtime_response(conn, format, opts, session, request)
@@ -1560,15 +1560,28 @@ defmodule Arbor.MCP.HttpPlug do
     |> maybe_put_session_header(RuntimeSession.id(session))
   end
 
-  # subscriptions/listen has its own keepalive once its listener is set up,
-  # and its stream sends the SSE headers itself. A request keepalive during a
-  # slow listener setup would send them first, so the listen request gets none.
-  defp runtime_wait(request, opts) do
-    %{keepalive: request_keepalive_interval(request, opts), request_id: wait_request_id(request)}
+  # Request keepalives find a closed modern stream, whose closure cancels the
+  # request. The legacy revisions say a disconnect SHOULD NOT be taken for a
+  # cancellation, so a legacy request's event stream gets none and runs to its
+  # end. subscriptions/listen has its own keepalive once its listener is set
+  # up, and its stream sends the SSE headers itself; a request keepalive
+  # during a slow listener setup would send them first, so it gets none too.
+  defp runtime_wait(conn, request, opts) do
+    modern? = modern_http_request?(conn, request)
+
+    %{
+      keepalive: request_keepalive_interval(modern?, request, opts),
+      request_id: wait_request_id(request),
+      modern?: modern?
+    }
   end
 
-  defp request_keepalive_interval(%{"method" => "subscriptions/listen"}, _opts), do: :infinity
-  defp request_keepalive_interval(_request, opts), do: opts.request_keepalive_interval_ms
+  defp request_keepalive_interval(false, _request, _opts), do: :infinity
+
+  defp request_keepalive_interval(true, %{"method" => "subscriptions/listen"}, _opts),
+    do: :infinity
+
+  defp request_keepalive_interval(true, _request, opts), do: opts.request_keepalive_interval_ms
 
   # A terminal error may echo only an id the Runtime accepts; any other id is
   # an invalid request, and its error uses a null id.
@@ -1594,7 +1607,7 @@ defmodule Arbor.MCP.HttpPlug do
     do: {:ok, response, conn}
 
   defp sse_runtime_output(%{state: :chunked} = conn, _closed, wait),
-    do: end_closed_stream(conn, wait.request_id)
+    do: end_closed_stream(conn, wait)
 
   defp sse_runtime_output(conn, response, _wait), do: {:ok, response, conn}
 
@@ -1604,12 +1617,13 @@ defmodule Arbor.MCP.HttpPlug do
   # writer registry admits no output for a closed invocation, so this single
   # fixed-size frame goes straight to the request's own socket, as an adapter
   # writes its own error response for a request that has not sent headers. A
-  # failed write just ends the stream: the client is gone.
-  defp end_closed_stream(conn, request_id) do
-    cancel_closed_request(conn)
+  # failed write just ends the stream: the client is gone. Only a modern
+  # request is cancelled with its stream; a legacy one runs to its end.
+  defp end_closed_stream(conn, wait) do
+    if wait.modern?, do: cancel_closed_request(conn)
 
     error =
-      JSONRPC.error(request_id, ErrorCodes.internal_error(), "Internal server error", %{
+      JSONRPC.error(wait.request_id, ErrorCodes.internal_error(), "Internal server error", %{
         "type" => "invocation_closed"
       })
 
@@ -1920,7 +1934,7 @@ defmodule Arbor.MCP.HttpPlug do
     conn = write_runtime_response(conn, effect, wire, format)
 
     if kind == :notification do
-      case await_runtime_output(conn, format, runtime_wait(request, opts)) do
+      case await_runtime_output(conn, format, runtime_wait(conn, request, opts)) do
         {:ok, {:ok, effect, wire}, conn} ->
           write_runtime_output(conn, effect, wire, format, session, request, opts)
 
@@ -1937,8 +1951,9 @@ defmodule Arbor.MCP.HttpPlug do
     end
   end
 
-  # Headers already sent with a chunked response cannot be withdrawn. Only a
-  # modern request streams, and it carries no session header to withdraw.
+  # Headers already sent with a chunked response cannot be withdrawn. No
+  # streamed request is an initialize: a legacy initialize is answered with
+  # JSON, and modern requests have none, so no session header is withdrawn.
   defp suppress_session_header(%{state: :chunked} = conn),
     do: assign(conn, :suppress_session_header, true)
 

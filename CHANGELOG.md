@@ -140,7 +140,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   using only `:subscription_keepalive_interval_ms`. A request whose invocation
   closes after its SSE response started (for example on Runtime stop) now ends
   with a JSON-RPC error for its id instead of a truncated stream. JSON
-  responses and legacy streams are unchanged.
+  responses and legacy-era requests, including their request event streams,
+  get no request keepalives.
 
 ## [2.0.0-rc.6] — 2026-10-26
 
