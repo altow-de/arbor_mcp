@@ -382,7 +382,9 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
     :ok = Client.notify(client, "notifications/example", %{"n" => 1})
     assert {:ok, _} = Client.call_tool(client, "quick", %{}, timeout: 5_000)
 
-    assert_receive {:posted, "notifications/example"}
+    # The first of the two to arrive, whichever it is.
+    assert_receive {:posted, first}
+    assert first == "notifications/example"
     assert_receive {:posted, "tools/call"}
     refute_received {:posted, _method}
   end
