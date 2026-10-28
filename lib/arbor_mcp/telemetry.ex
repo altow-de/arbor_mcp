@@ -22,6 +22,9 @@ defmodule Arbor.MCP.Telemetry do
     * Metadata: `%{method: String.t()}`
   * `[:arbor_mcp, :client, :request, :completed]` - Response matched to pending request
     * Metadata: `%{method: String.t() | nil, request_id: integer()}`
+  * `[:arbor_mcp, :client, :request, :caller_exited]` - A request's caller exited, so
+    the client cancelled it upstream (see `cancel_on_caller_exit:`)
+    * Metadata: `%{method: String.t() | nil, request_id: integer()}`
 
   #### Receiver
   * `[:arbor_mcp, :client, :receiver, :started]` - Receiver task started

@@ -818,6 +818,18 @@ dual-era client: once `server/discover` succeeds, ArborMCP disables that stream,
 clears legacy session state, and uses JSON or POST-owned SSE for each modern
 request. `subscriptions/listen` opens its own POST response stream.
 
+A modern request never runs in the client process, so concurrent calls
+through one client don't wait for each other, and the client keeps answering
+other calls while one runs. An ordinary request POSTs from its own task, at
+most `:max_client_workers` (default `256`) at a time; one with a progress
+token or an `io.modelcontextprotocol/logLevel` gets its own request stream.
+The caller's timeout bounds the request either way, and a request that times
+out or is cancelled has its connection closed. A 401 or 403 is answered in
+the client process, one challenge at a time across requests, and the
+request's task or stream then sends it again with the new token. The
+`:auth_provider` answers it; without one, an ordinary request's challenge
+runs the OAuth flow there, and a request stream's fails its request.
+
 ### TLS trust store
 
 Outbound HTTPS verifies peers against the operating system's trust store
