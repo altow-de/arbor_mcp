@@ -39,14 +39,17 @@ defmodule Arbor.MCP.Client.Types do
 
   @typedoc """
   An MRTR round returned to the caller by `mrtr: :manual` (MCP 2026-07-28):
-  the server's validated `inputRequests`, keyed by their ids, and its opaque
-  `requestState`, if any. The caller answers the input requests and passes
-  the answers back with `input_responses:` and the state with
-  `request_state:` on the next round of the same call.
+  the server's validated `inputRequests`, keyed by their ids (empty when it
+  sent only a request state), its opaque `requestState` and the round's
+  `_meta`, both `nil` when it sent none. The caller
+  answers the input requests and passes the answers back with
+  `input_responses:` and the state with `request_state:` on the next round
+  of the same call.
   """
   @type input_required :: %{
           input_requests: %{optional(String.t()) => map()},
-          request_state: String.t() | nil
+          request_state: String.t() | nil,
+          meta: map() | nil
         }
 
   @typedoc """

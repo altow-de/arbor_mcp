@@ -639,11 +639,13 @@ defmodule Arbor.MCP.Client do
   - `:mrtr` - How an MCP 2026-07-28 `input_required` round is answered:
     `:auto` (default) answers it with the client handler and retries;
     `:manual` returns it as `{:input_required, %{input_requests: requests,
-    request_state: state}}` for the caller to answer
+    request_state: state, meta: meta}}` for the caller to answer
   - `:input_responses`, `:request_state` - With `mrtr: :manual`, continue
     the call with the caller's answers and the round's `request_state`
   - `:client_capabilities` - With `mrtr: :manual`, the capabilities this one
-    request declares instead of the client's start capabilities
+    request declares instead of the client's start capabilities. Requests
+    that can't return `input_required`, such as `list_tools/2`, take it
+    without `mrtr: :manual`
 
   `Arbor.MCP.Client.Operations.Tools.call_tool/4` lists the other request
   options. `nil` leaves `:mrtr`, `:input_responses`, `:request_state` and
@@ -670,14 +672,15 @@ defmodule Arbor.MCP.Client do
 
   Repeat the arguments, `:client_capabilities`, `:meta` and
   `:progress_token` on every round of one call: an arbor_mcp server binds
-  `requestState` to them and refuses a round that differs. A round passes
-  the checks automatic MRTR makes, apart from `:max_mrtr_rounds`; the
-  caller runs the rounds. `:input_responses`, `:request_state` and
-  `:client_capabilities` without `mrtr: :manual`, or on a connection that
-  settled on a legacy revision, return
-  `{:error, %Arbor.MCP.Error.ValidationError{}}`. See "Forwarding clients"
-  in the configuration guide for the full contract. `read_resource/3` and
-  `get_prompt/4` take the same options.
+  `requestState` to them and refuses a round that differs. For the same
+  reason `reset_timeout_on_progress: true` with `mrtr: :manual` needs an
+  explicit `:progress_token`. A round passes the checks automatic MRTR
+  makes, apart from `:max_mrtr_rounds`; the caller runs the rounds.
+  `:input_responses`, `:request_state` and `:client_capabilities` without
+  `mrtr: :manual`, or on a connection that settled on a legacy revision,
+  return `{:error, %Arbor.MCP.Error.ValidationError{}}`. See "Forwarding
+  clients" in the configuration guide for the full contract. `read_resource/3`
+  and `get_prompt/4` take the same options.
   """
   @spec call_tool(t(), String.t(), map(), keyword() | timeout()) ::
           {:ok, Arbor.MCP.Response.t() | map()}
@@ -827,7 +830,7 @@ defmodule Arbor.MCP.Client do
   Reads a resource by URI. Takes `:cache_mode`, as `list_tools/2` does.
 
   With `mrtr: :manual`, an MCP 2026-07-28 `input_required` round comes back
-  as `{:input_required, %{input_requests: ..., request_state: ...}}`, and
+  as `{:input_required, %{input_requests: ..., request_state: ..., meta: ...}}`, and
   `:input_responses`, `:request_state` and `:client_capabilities` apply as
   described in "Forwarding a call" under `call_tool/4`.
   """
@@ -1041,7 +1044,7 @@ defmodule Arbor.MCP.Client do
   Gets a prompt with the given arguments.
 
   With `mrtr: :manual`, an MCP 2026-07-28 `input_required` round comes back
-  as `{:input_required, %{input_requests: ..., request_state: ...}}`, and
+  as `{:input_required, %{input_requests: ..., request_state: ..., meta: ...}}`, and
   `:input_responses`, `:request_state` and `:client_capabilities` apply as
   described in "Forwarding a call" under `call_tool/4`.
   """

@@ -258,7 +258,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
          control
        ) do
     if ManualMRTR.manual?(opts) do
-      ManualMRTR.input_required(client, method, result, opts, control.deadline)
+      manual_round(client, method, result, opts, control)
     else
       continue_mrtr(
         client,
@@ -270,6 +270,31 @@ defmodule Arbor.MCP.Client.Internal.Request do
         round,
         control
       )
+    end
+  end
+
+  # A manual round reports the same events as an automatic one. Each call
+  # hands over at most one round, so a handed-over round is round 1 of the
+  # call, and a round that fails its checks fails at round 0.
+  defp manual_round(client, method, result, opts, control) do
+    case ManualMRTR.input_required(client, method, result, opts, control.deadline) do
+      {:input_required, %{input_requests: input_requests}} = handover ->
+        :telemetry.execute(
+          [:arbor_mcp, :client, :mrtr, :round],
+          %{round: 1, input_requests: map_size(input_requests)},
+          %{method: mrtr_method_class(method), mode: :manual}
+        )
+
+        handover
+
+      {:error, reason} = error ->
+        :telemetry.execute(
+          [:arbor_mcp, :client, :mrtr, :failure],
+          %{round: 0},
+          %{method: mrtr_method_class(method), reason: mrtr_failure_class(reason), mode: :manual}
+        )
+
+        error
     end
   end
 
@@ -303,7 +328,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
           :telemetry.execute(
             [:arbor_mcp, :client, :mrtr, :round],
             %{round: next_round, input_requests: map_size(input_requests)},
-            %{method: mrtr_method_class(method)}
+            %{method: mrtr_method_class(method), mode: :auto}
           )
 
           retry_params = MRTR.retry_params(original_params, input_responses, request_state)
@@ -328,7 +353,8 @@ defmodule Arbor.MCP.Client.Internal.Request do
           %{round: round},
           %{
             method: mrtr_method_class(method),
-            reason: client_mrtr_failure_class(reason, round, maximum)
+            reason: client_mrtr_failure_class(reason, round, maximum),
+            mode: :auto
           }
         )
 
@@ -347,15 +373,12 @@ defmodule Arbor.MCP.Client.Internal.Request do
   defp client_mrtr_failure_class(_reason, round, maximum) when round >= maximum,
     do: :round_limit
 
-  defp client_mrtr_failure_class(:timeout, _round, _maximum), do: :timeout
+  defp client_mrtr_failure_class(reason, _round, _maximum), do: mrtr_failure_class(reason)
 
-  defp client_mrtr_failure_class(%Error.ProtocolError{code: -32_021}, _round, _maximum),
-    do: :missing_capability
-
-  defp client_mrtr_failure_class(%Error.ProtocolError{}, _round, _maximum),
-    do: :protocol_error
-
-  defp client_mrtr_failure_class(_reason, _round, _maximum), do: :input_fulfillment_failed
+  defp mrtr_failure_class(:timeout), do: :timeout
+  defp mrtr_failure_class(%Error.ProtocolError{code: -32_021}), do: :missing_capability
+  defp mrtr_failure_class(%Error.ProtocolError{}), do: :protocol_error
+  defp mrtr_failure_class(_reason), do: :input_fulfillment_failed
 
   # The absolute deadline travels with the request so the client does not
   # send it after the caller has given up (see RequestHandler.handle_request/5).

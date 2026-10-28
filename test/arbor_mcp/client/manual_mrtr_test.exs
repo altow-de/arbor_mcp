@@ -36,6 +36,8 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
 
     @impl true
     def handle_list_tools(_cursor, state) do
+      send(state.test_pid, {:app_list, Context.current().client_capabilities})
+
       tools =
         for name <- ~w(ask choose context),
             do: %{name: name, description: name, inputSchema: %{"type" => "object"}}
@@ -237,9 +239,10 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
                       }
                     },
                     request_state: request_state
-                  }} = Client.call_tool(client, "ask", %{}, mrtr: :manual, format: format)
+                  } = round} = Client.call_tool(client, "ask", %{}, mrtr: :manual, format: format)
 
           assert is_binary(request_state)
+          assert Map.has_key?(round, :meta)
         end
 
         refute_received {:elicited, _message}
@@ -332,6 +335,19 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
 
         assert {:ok, _result} = Client.call_tool(client, "context", %{}, format: :map)
         assert_received {:app_context, :modern, ^started, nil, nil}
+      end
+
+      test "a request that can't pause declares capabilities without mrtr: :manual",
+           %{transport: transport} do
+        client = connect(transport, capabilities: Map.put(@form, "sampling", %{}))
+
+        assert {:ok, _tools} = Client.list_tools(client, client_capabilities: @form)
+        assert_received {:app_list, @form}
+
+        assert {:error, %ValidationError{reason: "requires mrtr: :manual"}} =
+                 Client.call_tool(client, "context", %{}, client_capabilities: @form)
+
+        refute_received {:app_context, _era, _capabilities, _responses, _state}
       end
 
       test "the server chooses its input from the request's capabilities",
@@ -569,7 +585,8 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
 
     test "a valid round comes back the same in both formats" do
       for format <- [:map, :struct] do
-        assert {:input_required, %{input_requests: @elicitation, request_state: "sealed"}} =
+        assert {:input_required,
+                %{input_requests: @elicitation, request_state: "sealed", meta: nil}} =
                  Client.call_tool(scripted([input_required(@elicitation)]), "ask", %{},
                    mrtr: :manual,
                    format: format
@@ -581,6 +598,99 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
 
       assert {:input_required, %{input_requests: @elicitation, request_state: nil}} =
                Client.call_tool(scripted([round]), "ask", %{}, mrtr: :manual)
+    end
+
+    test "the round's _meta comes back as meta, within the byte limit" do
+      meta = %{"io.example/trace" => "abc", "note" => %{"step" => 1}}
+      round = Map.put(input_required(@elicitation), "_meta", meta)
+
+      for format <- [:map, :struct] do
+        assert {:input_required, %{meta: ^meta, input_requests: @elicitation}} =
+                 Client.call_tool(scripted([round]), "ask", %{}, mrtr: :manual, format: format)
+      end
+
+      # The byte limit counts the _meta: this round fits only without it.
+      limit = byte_size(Jason.encode!(input_required(@elicitation))) + 1
+      big = Map.put(input_required(@elicitation), "_meta", %{"pad" => String.duplicate("x", 64)})
+
+      assert {:input_required, _round} =
+               Client.call_tool(scripted([input_required(@elicitation)]), "ask", %{},
+                 mrtr: :manual,
+                 max_mrtr_bytes: limit
+               )
+
+      assert {:error, %ProtocolError{message: "MRTR byte limit exceeded"}} =
+               Client.call_tool(scripted([big]), "ask", %{}, mrtr: :manual, max_mrtr_bytes: limit)
+    end
+
+    test "a _meta that is not an object is an error" do
+      round = Map.put(input_required(@elicitation), "_meta", "trace")
+
+      assert {:error,
+              %ProtocolError{code: -32_602, message: "input_required _meta must be an object"}} =
+               Client.call_tool(scripted([round]), "ask", %{}, mrtr: :manual)
+    end
+  end
+
+  describe "telemetry" do
+    setup do
+      id = {__MODULE__, make_ref()}
+
+      :telemetry.attach_many(
+        id,
+        [[:arbor_mcp, :client, :mrtr, :round], [:arbor_mcp, :client, :mrtr, :failure]],
+        &__MODULE__.forward_mrtr_telemetry/4,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(id) end)
+    end
+
+    test "a manual round reports the automatic events with mode: :manual" do
+      assert {:input_required, _round} =
+               Client.call_tool(scripted([input_required(@elicitation)]), "ask", %{},
+                 mrtr: :manual
+               )
+
+      assert_received {:mrtr_telemetry, [:arbor_mcp, :client, :mrtr, :round],
+                       %{round: 1, input_requests: 1}, metadata}
+
+      assert metadata == %{method: "tools/call", mode: :manual}
+
+      # The automatic path reports the same event, with mode: :auto.
+      assert {:ok, _result} =
+               Client.call_tool(scripted([input_required(@elicitation)]), "ask", %{},
+                 format: :map
+               )
+
+      assert_received {:mrtr_telemetry, [:arbor_mcp, :client, :mrtr, :round],
+                       %{round: 1, input_requests: 1}, %{method: "tools/call", mode: :auto}}
+
+      refute_received {:mrtr_telemetry, _event, _measurements, _metadata}
+    end
+
+    test "a manual round that fails its checks reports a failure class" do
+      sample = %{"summary" => %{"method" => "sampling/createMessage", "params" => %{}}}
+
+      for {client, reason} <- [
+            {scripted([input_required(sample)]), :missing_capability},
+            {scripted([%{"resultType" => "input_required"}]), :protocol_error},
+            {scripted([input_required(@elicitation)], protocol_version: "2025-06-18"),
+             :protocol_error}
+          ] do
+        assert {:error, %ProtocolError{}} = Client.call_tool(client, "ask", %{}, mrtr: :manual)
+
+        assert_received {:mrtr_telemetry, [:arbor_mcp, :client, :mrtr, :failure], %{round: 0},
+                         metadata}
+
+        assert metadata == %{method: "tools/call", reason: reason, mode: :manual}
+      end
+
+      assert {:error, _reason} =
+               Client.call_tool(scripted([input_required(sample)]), "ask", %{}, mrtr: :auto)
+
+      assert_received {:mrtr_telemetry, [:arbor_mcp, :client, :mrtr, :failure], %{round: 0},
+                       %{method: "tools/call", reason: :missing_capability, mode: :auto}}
     end
   end
 
@@ -626,17 +736,95 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
     test "client_capabilities and the continuation need mrtr: :manual" do
       client = scripted([])
 
-      for mrtr <- [[], [mrtr: nil], [mrtr: :auto]],
+      operations = [
+        &Client.call_tool(client, "ask", %{}, &1),
+        &Client.get_prompt(client, "greeting", %{}, &1),
+        &Client.read_resource(client, "memo://note", &1)
+      ]
+
+      for operation <- operations,
+          mrtr <- [[], [mrtr: nil], [mrtr: :auto]],
           {key, value} <- [
             client_capabilities: @form,
             input_responses: @tom,
             request_state: "sealed"
           ] do
         assert {:error, %ValidationError{field: ^key, reason: "requires mrtr: :manual"}} =
-                 Client.call_tool(client, "ask", %{}, [{key, value} | mrtr])
+                 operation.([{key, value} | mrtr])
       end
 
       refute_received {:wire, _request}
+    end
+
+    test "a request that can't return input_required takes client_capabilities without it" do
+      tools = %{
+        "resultType" => "complete",
+        "tools" => [],
+        "ttlMs" => 0,
+        "cacheScope" => "private"
+      }
+
+      completion = %{"resultType" => "complete", "completion" => %{"values" => []}}
+      client = scripted([tools, completion])
+      capabilities = %{"sampling" => %{}}
+
+      assert {:ok, _tools} = Client.list_tools(client, client_capabilities: capabilities)
+      assert_received {:wire, %{"method" => "tools/list", "params" => %{"_meta" => meta}}}
+      assert meta[@caps_key] == capabilities
+
+      ref = %{"type" => "ref/prompt", "name" => "greeting"}
+      argument = %{"name" => "name", "value" => "T"}
+      opts = [client_capabilities: capabilities]
+      assert {:ok, _completion} = Client.complete(client, ref, argument, opts)
+
+      assert_received {:wire,
+                       %{"method" => "completion/complete", "params" => %{"_meta" => meta}}}
+
+      assert meta[@caps_key] == capabilities
+
+      # Still a 2026-07-28 option.
+      legacy = scripted([], protocol_version: "2025-06-18")
+
+      assert {:error, %ValidationError{field: :client_capabilities, reason: reason}} =
+               Client.list_tools(legacy, client_capabilities: capabilities)
+
+      assert reason =~ "requires MCP 2026-07-28"
+      refute_received {:wire, _request}
+    end
+
+    test "manual rounds with reset_timeout_on_progress need an explicit progress token" do
+      client = scripted([])
+      reason = "manual MRTR with reset_timeout_on_progress needs an explicit :progress_token"
+      round = [mrtr: :manual, reset_timeout_on_progress: true, timeout: 5_000]
+
+      for operation <- [
+            &Client.call_tool(client, "ask", %{}, &1),
+            &Client.get_prompt(client, "greeting", %{}, &1),
+            &Client.read_resource(client, "memo://note", &1)
+          ] do
+        assert {:error, %ValidationError{field: :progress_token, reason: ^reason}} =
+                 operation.(round)
+      end
+
+      refute_received {:wire, _request}
+
+      # A token the caller chose is the same on every round.
+      for token_opts <- [[progress_token: "up-1"], [meta: %{"progressToken" => "up-1"}]] do
+        for _round <- 1..2 do
+          assert {:ok, _result} = Client.call_tool(client, "ask", %{}, round ++ token_opts)
+          assert_received {:wire, %{"params" => %{"_meta" => %{"progressToken" => "up-1"}}}}
+        end
+      end
+
+      # Automatic MRTR keeps one generated token for all its rounds, and a
+      # request that can't pause has no rounds.
+      assert {:ok, _result} =
+               Client.call_tool(client, "ask", %{},
+                 reset_timeout_on_progress: true,
+                 timeout: 5_000
+               )
+
+      assert_received {:wire, %{"params" => %{"_meta" => %{"progressToken" => "progress-" <> _}}}}
     end
 
     test "a continuation is only valid for the operations that can return input_required" do
@@ -659,7 +847,7 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
 
       refute_received {:wire, _request}
 
-      # Capabilities may go on any modern request.
+      # Capabilities may go on any modern request, with mrtr: :manual or not.
       assert {:ok, _result} = Client.list_tools(client, mrtr: :manual, client_capabilities: @form)
       assert_received {:wire, %{"method" => "tools/list", "params" => %{"_meta" => meta}}}
       assert meta[@caps_key] == @form
@@ -761,6 +949,11 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
 
       refute_received {:wire, _request}
     end
+  end
+
+  def forward_mrtr_telemetry(event, measurements, metadata, test_pid) do
+    # The events run in the calling process; other tests' calls aren't ours.
+    if self() == test_pid, do: send(test_pid, {:mrtr_telemetry, event, measurements, metadata})
   end
 
   # Servers

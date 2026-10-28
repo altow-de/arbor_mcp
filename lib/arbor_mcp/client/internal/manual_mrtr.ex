@@ -4,7 +4,7 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
   # such as a gateway, which must leave each MRTR round to that client:
   #
   # - `mrtr: :manual` returns a validated `input_required` round to the caller
-  #   as `{:input_required, %{input_requests: ..., request_state: ...}}`
+  #   as `{:input_required, %{input_requests: ..., request_state: ..., meta: ...}}`
   #   instead of answering it with the client handler.
   # - `input_responses:` and `request_state:` continue the call on its next
   #   round (`tools/call`, `resources/read` and `prompts/get`).
@@ -12,13 +12,15 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
   #   request's `_meta`, so the server chooses its input requests from what
   #   the downstream client declared.
   #
-  # The continuation and the capabilities need `mrtr: :manual`: under
-  # automatic MRTR the client's own handler would answer a round that was
-  # chosen for capabilities it may not have. They also need a 2026-07-28
-  # connection, which the client process decides when it builds the request
-  # (see Arbor.MCP.Internal.RequestParams.for_request/3). `nil` leaves any of
-  # these options unset, so a forwarding caller can pass the values it got
-  # from downstream without filtering them first.
+  # The continuation needs `mrtr: :manual`, and so do capabilities on a
+  # request that can return input_required: under automatic MRTR the client's
+  # own handler would answer a round that was chosen for capabilities it may
+  # not have. A request that can't pause, such as `tools/list`, may declare
+  # capabilities without it. All three need a 2026-07-28 connection, which
+  # the client process decides when it builds the request (see
+  # Arbor.MCP.Internal.RequestParams.for_request/3). `nil` leaves any of these
+  # options unset, so a forwarding caller can pass the values it got from
+  # downstream without filtering them first.
   #
   # The values are usually the downstream client's data, so a malformed one
   # is an `{:error, %Arbor.MCP.Error.ValidationError{}}`, not a raise. The
@@ -27,6 +29,7 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
 
   alias Arbor.MCP.Client.MRTR
   alias Arbor.MCP.Error
+  alias Arbor.MCP.Protocol.ErrorCodes
 
   @mrtr_methods ["tools/call", "resources/read", "prompts/get"]
 
@@ -56,8 +59,9 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
   def prepare(method, params, opts) do
     set = set_options(opts)
 
-    with :ok <- require_manual(set, opts),
+    with :ok <- require_manual(set, method, opts),
          :ok <- require_mrtr_method(set, method),
+         :ok <- require_progress_token(method, params, opts),
          :ok <- validate_input_responses(Keyword.get(set, :input_responses), opts),
          :ok <- validate_request_state(Keyword.get(set, :request_state)),
          :ok <- validate_capabilities(Keyword.get(set, :client_capabilities)) do
@@ -74,14 +78,36 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
   # automatic MRTR makes before it calls the handler: the result's shape and
   # the `:max_input_requests` and `:max_mrtr_bytes` limits here, then the era
   # and the declared capabilities in the client process. `:max_mrtr_rounds`
-  # doesn't apply: the caller runs the rounds.
+  # doesn't apply: the caller runs the rounds. The round's `_meta` is part of
+  # the result the byte limit covers.
   @spec input_required(GenServer.server(), String.t(), map(), keyword(), integer()) ::
           {:input_required, input_required()} | {:error, term()}
   def input_required(client, method, result, opts, deadline) do
     with {:ok, input_requests, request_state} <- MRTR.validate_result(method, result, opts),
+         {:ok, meta} <- result_meta(result),
          :ok <-
            check_round(client, input_requests, Keyword.get(opts, :client_capabilities), deadline) do
-      {:input_required, %{input_requests: input_requests, request_state: request_state}}
+      {:input_required,
+       %{input_requests: input_requests, request_state: request_state, meta: meta}}
+    end
+  end
+
+  # Automatic MRTR never reads the round's `_meta`. Handed to the caller, it
+  # must at least be the object the schema defines.
+  defp result_meta(result) do
+    case Map.get(result, "_meta", Map.get(result, :_meta)) do
+      nil ->
+        {:ok, nil}
+
+      meta when is_map(meta) ->
+        {:ok, meta}
+
+      _invalid ->
+        {:error,
+         Error.protocol_error(
+           ErrorCodes.invalid_params(),
+           "input_required _meta must be an object"
+         )}
     end
   end
 
@@ -103,13 +129,44 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
   end
 
-  defp require_manual([], _opts), do: :ok
+  defp require_manual(set, method, opts) do
+    case Enum.find(set, fn {key, _value} -> needs_manual?(key, method) end) do
+      {key, _value} ->
+        if manual?(opts),
+          do: :ok,
+          else: {:error, Error.validation_error(key, nil, "requires mrtr: :manual")}
 
-  defp require_manual([{key, _value} | _rest], opts) do
-    if manual?(opts),
-      do: :ok,
-      else: {:error, Error.validation_error(key, nil, "requires mrtr: :manual")}
+      nil ->
+        :ok
+    end
   end
+
+  # Capabilities on a request that can't return input_required never reach
+  # the client handler: there is no round for it to answer.
+  defp needs_manual?(:client_capabilities, method), do: method in @mrtr_methods
+  defp needs_manual?(_continuation, _method), do: true
+
+  # The token the client adds for reset_timeout_on_progress differs on every
+  # round, and a server that binds requestState to `_meta`, as arbor_mcp does,
+  # rejects the next round.
+  defp require_progress_token(method, params, opts) do
+    if manual?(opts) and method in @mrtr_methods and
+         Keyword.get(opts, :reset_timeout_on_progress) == true and not progress_token?(params) do
+      {:error,
+       Error.validation_error(
+         :progress_token,
+         nil,
+         "manual MRTR with reset_timeout_on_progress needs an explicit :progress_token"
+       )}
+    else
+      :ok
+    end
+  end
+
+  defp progress_token?(%{"_meta" => meta}) when is_map(meta),
+    do: not is_nil(Map.get(meta, "progressToken") || Map.get(meta, :progressToken))
+
+  defp progress_token?(_params), do: false
 
   defp require_mrtr_method(set, method) do
     case Keyword.take(set, [:input_responses, :request_state]) do
