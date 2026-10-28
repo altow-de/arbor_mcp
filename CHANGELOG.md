@@ -130,6 +130,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - POST event streams now stop at the response deadline even when the socket
   or stream consumer keeps returning data. This ports the 1.x maintenance
   fix from `87b495e`.
+- An HTTP request that timed out or failed could reach its client with no
+  response at all when the server was busy. The HTTP gateway gave the
+  output controller only 50 ms to queue the JSON-RPC error. If the
+  controller answered later, the gateway had already closed the request, so
+  the error was discarded. The gateway now waits for the controller's answer
+  until the error's own delivery deadline, after which it could not have been
+  sent anyway. It waits asynchronously, so other requests are not held up
+  while one waits.
 
 ## [2.0.0-rc.6] — 2026-10-26
 
