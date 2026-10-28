@@ -142,9 +142,14 @@ defmodule Arbor.MCP.HttpPlug do
   zero; `text/event-stream;q=0` refuses one, and a wildcard such as `*/*`
   gets JSON. `notifications/progress` and
   `notifications/message` are written only there, followed by one final
-  JSON-RPC response that closes the stream. A disconnect or chunk failure
-  cancels that modern request's worker without affecting other
-  requests or subscriptions.
+  JSON-RPC response that closes the stream. SSE comment keepalives are sent
+  every `:request_keepalive_interval_ms` milliseconds (default: `15_000`;
+  set `:infinity` to disable). A failed write cancels that modern request's
+  worker without affecting other requests or subscriptions. The first write
+  after a TCP peer closes usually succeeds, so a write-detected close is
+  usually noticed within two intervals; Cowboy also cancels by terminating the
+  request process when it sees the connection close. JSON responses do not
+  send keepalives.
 
   Mount subscription authorizers are composed with the Runtime service policy;
   both must authorize. Mount queue, message-byte, aggregate-byte and lifetime
@@ -185,6 +190,7 @@ defmodule Arbor.MCP.HttpPlug do
   alias Arbor.MCP.Plugs.ProtectedResourceMetadata
   alias Arbor.MCP.Protocol.{ErrorCodes, Methods}
   alias Arbor.MCP.Server.{AuthInfo, RequestContext, Subscriptions}
+  alias Arbor.MCP.Server.Runtime
 
   alias Arbor.MCP.Server.Runtime.{
     HTTPGateway,
@@ -235,6 +241,8 @@ defmodule Arbor.MCP.HttpPlug do
         subscription_keepalive_interval!(
           Keyword.get(opts, :subscription_keepalive_interval_ms, 15_000)
         ),
+      request_keepalive_interval_ms:
+        request_keepalive_interval!(Keyword.get(opts, :request_keepalive_interval_ms, 15_000)),
       legacy_http_sse: legacy_http_sse,
       legacy_http_sse_path:
         normalize_legacy_http_sse_path(Keyword.get(opts, :legacy_http_sse_path, "/sse")),
@@ -1470,6 +1478,7 @@ defmodule Arbor.MCP.HttpPlug do
          {:ok, conn} <- runtime_protocol_version(conn, request, session),
          :ok <- RuntimeWriter.current(conn),
          format = runtime_output_format(conn, request),
+         conn = maybe_prepare_runtime_stream(conn, format, opts, session, request),
          {:ok, _token} <-
            HTTPGateway.submit(runtime, binding, request,
              format: format,
@@ -1479,21 +1488,14 @@ defmodule Arbor.MCP.HttpPlug do
                |> Map.put(:session_id, RuntimeSession.id(session))
                |> runtime_dispatch_opts(conn)
            ),
-         response <- RuntimeWriter.await(conn),
+         wait = runtime_wait(conn, request, opts),
+         {:ok, response, conn} <- await_runtime_output(conn, format, wait),
          :ok <- runtime_response_ready(response) do
-      conn =
-        conn
-        |> Plug.Conn.put_private(
-          :arbor_mcp_http_initialization,
-          not is_nil(RuntimeSession.initialization_request(request))
-        )
-        |> maybe_add_cors_headers(opts)
-        |> add_protocol_version_header()
-        |> maybe_put_session_header(RuntimeSession.id(session))
+      conn = maybe_prepare_runtime_response(conn, format, opts, session, request)
 
       case response do
         {:ok, effect, wire} ->
-          write_runtime_output(conn, effect, wire, format, session, request)
+          write_runtime_output(conn, effect, wire, format, session, request, opts)
 
         {:listener, binding, listener, registration} ->
           Arbor.MCP.HttpPlug.RuntimeSubscriptionStream.serve(
@@ -1505,6 +1507,9 @@ defmodule Arbor.MCP.HttpPlug do
           )
       end
     else
+      {:stream_closed, conn} ->
+        conn
+
       {:error, reason} = error
       when reason in [
              :http_invocation_closed,
@@ -1528,6 +1533,139 @@ defmodule Arbor.MCP.HttpPlug do
   defp runtime_response_ready({:ok, _effect, _wire}), do: :ok
   defp runtime_response_ready({:listener, _binding, _pid, _registration}), do: :ok
   defp runtime_response_ready(error), do: error
+
+  defp maybe_prepare_runtime_stream(conn, :sse, opts, session, request) do
+    conn
+    |> prepare_runtime_response(opts, session, request)
+    |> put_resp_header("content-type", "text/event-stream")
+    |> put_resp_header("x-accel-buffering", "no")
+    |> put_resp_header("cache-control", "no-cache")
+  end
+
+  defp maybe_prepare_runtime_stream(conn, _format, _opts, _session, _request), do: conn
+
+  defp maybe_prepare_runtime_response(conn, :sse, _opts, _session, _request), do: conn
+
+  defp maybe_prepare_runtime_response(conn, _format, opts, session, request),
+    do: prepare_runtime_response(conn, opts, session, request)
+
+  defp prepare_runtime_response(conn, opts, session, request) do
+    conn
+    |> Plug.Conn.put_private(
+      :arbor_mcp_http_initialization,
+      not is_nil(RuntimeSession.initialization_request(request))
+    )
+    |> maybe_add_cors_headers(opts)
+    |> add_protocol_version_header()
+    |> maybe_put_session_header(RuntimeSession.id(session))
+  end
+
+  # Request keepalives find a closed modern stream, whose closure cancels the
+  # request. The legacy revisions say a disconnect SHOULD NOT be taken for a
+  # cancellation, so a legacy request's event stream gets none and runs to its
+  # end. subscriptions/listen has its own keepalive once its listener is set
+  # up, and its stream sends the SSE headers itself; a request keepalive
+  # during a slow listener setup would send them first, so it gets none too.
+  defp runtime_wait(conn, request, opts) do
+    modern? = modern_http_request?(conn, request)
+
+    %{
+      keepalive: request_keepalive_interval(modern?, request, opts),
+      request_id: wait_request_id(request),
+      modern?: modern?
+    }
+  end
+
+  defp request_keepalive_interval(false, _request, _opts), do: :infinity
+
+  defp request_keepalive_interval(true, %{"method" => "subscriptions/listen"}, _opts),
+    do: :infinity
+
+  defp request_keepalive_interval(true, _request, opts), do: opts.request_keepalive_interval_ms
+
+  # A terminal error may echo only an id the Runtime accepts; any other id is
+  # an invalid request, and its error uses a null id.
+  defp wait_request_id(%{"id" => id}) when is_binary(id) or is_integer(id), do: id
+  defp wait_request_id(_request), do: nil
+
+  # Every recursive call is a tail call: a request can wait through one
+  # keepalive per interval for its whole deadline without growing its stack.
+  defp await_runtime_output(conn, :sse, wait) do
+    case RuntimeWriter.await(conn, wait.keepalive) do
+      :idle -> keepalive_runtime_output(conn, wait)
+      response -> sse_runtime_output(conn, response, wait)
+    end
+  end
+
+  defp await_runtime_output(conn, _format, _wait),
+    do: {:ok, RuntimeWriter.await(conn), conn}
+
+  # Once a keepalive or notification has sent the SSE headers, only an output
+  # frame can continue the response: no error status, JSON rejection or
+  # subscription stream may send headers again.
+  defp sse_runtime_output(%{state: :chunked} = conn, {:ok, _effect, _wire} = response, _wait),
+    do: {:ok, response, conn}
+
+  defp sse_runtime_output(%{state: :chunked} = conn, _closed, wait),
+    do: end_closed_stream(conn, wait)
+
+  defp sse_runtime_output(conn, response, _wait), do: {:ok, response, conn}
+
+  # The invocation closed without an output frame (for example on Runtime
+  # stop) after the stream's 200 went out. A connected client still gets a
+  # terminal JSON-RPC error for its request instead of a truncated stream. The
+  # writer registry admits no output for a closed invocation, so this single
+  # fixed-size frame goes straight to the request's own socket, as an adapter
+  # writes its own error response for a request that has not sent headers. A
+  # failed write just ends the stream: the client is gone. Only a modern
+  # request is cancelled with its stream; a legacy one runs to its end.
+  defp end_closed_stream(conn, wait) do
+    if wait.modern?, do: cancel_closed_request(conn)
+
+    error =
+      JSONRPC.error(wait.request_id, ErrorCodes.internal_error(), "Internal server error", %{
+        "type" => "invocation_closed"
+      })
+
+    case chunk_terminal(conn, ["data: ", Jason.encode!(error), "\r\n\r\n"]) do
+      {:ok, conn} -> {:stream_closed, conn}
+      _failed -> {:stream_closed, conn}
+    end
+  end
+
+  defp chunk_terminal(conn, frame) do
+    Plug.Conn.chunk(conn, frame)
+  catch
+    _kind, _reason -> {:error, :http_write_uncertain}
+  end
+
+  defp keepalive_runtime_output(conn, wait) do
+    case RuntimeWriter.request_keepalive(conn) do
+      {:ok, conn} ->
+        await_runtime_output(conn, :sse, wait)
+
+      {:not_entered, conn} ->
+        await_runtime_output(conn, :sse, wait)
+
+      {:closed, conn} ->
+        cancel_closed_request(conn)
+        {:stream_closed, conn}
+
+      {:raised, kind, reason, stacktrace} ->
+        cancel_closed_request(conn)
+        :erlang.raise(kind, reason, stacktrace)
+    end
+  end
+
+  defp cancel_closed_request(conn) do
+    binding = RuntimeWriter.binding(conn)
+
+    with {:ok, proof} <- HTTPWriterBinding.validate(binding, RuntimeWriter.runtime(conn)) do
+      Runtime.cancel_scope(RuntimeWriter.runtime(conn), proof.scope)
+    end
+
+    HTTPWriterRegistry.retire(binding, :request_stream_closed)
+  end
 
   defp runtime_json(body) do
     case Jason.decode(body) do
@@ -1783,7 +1921,7 @@ defmodule Arbor.MCP.HttpPlug do
 
   defp decode_runtime_wire(wire), do: Jason.decode!(wire)
 
-  defp write_runtime_output(conn, effect, wire, format, session, request) do
+  defp write_runtime_output(conn, effect, wire, format, session, request, opts) do
     kind = HTTPWriterRegistry.kind(effect)
 
     if kind != :notification and finalize_runtime_session(session, request, wire, conn) != :ok,
@@ -1791,18 +1929,20 @@ defmodule Arbor.MCP.HttpPlug do
 
     initialization_error? = kind == :response and initialization_error?(request, wire)
 
-    conn =
-      if initialization_error?,
-        do:
-          conn |> assign(:suppress_session_header, true) |> delete_resp_header("mcp-session-id"),
-        else: conn
+    conn = if initialization_error?, do: suppress_session_header(conn), else: conn
 
     conn = write_runtime_response(conn, effect, wire, format)
 
     if kind == :notification do
-      case RuntimeWriter.await(conn) do
-        {:ok, effect, wire} -> write_runtime_output(conn, effect, wire, format, session, request)
-        _closed -> raise RuntimeWriter.AdmissionError
+      case await_runtime_output(conn, format, runtime_wait(conn, request, opts)) do
+        {:ok, {:ok, effect, wire}, conn} ->
+          write_runtime_output(conn, effect, wire, format, session, request, opts)
+
+        {:stream_closed, conn} ->
+          conn
+
+        _closed ->
+          raise RuntimeWriter.AdmissionError
       end
     else
       if initialization_error?, do: RuntimeSession.terminate(session)
@@ -1810,6 +1950,15 @@ defmodule Arbor.MCP.HttpPlug do
       conn
     end
   end
+
+  # Headers already sent with a chunked response cannot be withdrawn. No
+  # streamed request is an initialize: a legacy initialize is answered with
+  # JSON, and modern requests have none, so no session header is withdrawn.
+  defp suppress_session_header(%{state: :chunked} = conn),
+    do: assign(conn, :suppress_session_header, true)
+
+  defp suppress_session_header(conn),
+    do: conn |> assign(:suppress_session_header, true) |> delete_resp_header("mcp-session-id")
 
   defp initialization_error?(%{"method" => "initialize"}, wire) when wire != "",
     do: Map.has_key?(decode_runtime_wire(wire), "error")
@@ -1832,7 +1981,7 @@ defmodule Arbor.MCP.HttpPlug do
   defp initialization_error?(_request, _wire), do: false
 
   defp write_runtime_response(conn, effect, "", _format),
-    do: RuntimeWriter.perform(conn, effect, "", &Plug.Conn.send_resp(&1, 202, &2))
+    do: RuntimeWriter.perform(conn, effect, "", &send_accepted/2)
 
   # A successful deprecated POST acknowledges a durable replay commit. The
   # existing physical companion conservatively retains JSON bytes even though
@@ -1871,6 +2020,11 @@ defmodule Arbor.MCP.HttpPlug do
       end
     end)
   end
+
+  # An empty output has nothing to add to a stream whose headers already went
+  # out; the stream then ends when the plug returns.
+  defp send_accepted(%{state: :chunked} = conn, _wire), do: conn
+  defp send_accepted(conn, wire), do: Plug.Conn.send_resp(conn, 202, wire)
 
   defp write_legacy_response(conn, effect, wire, primary) do
     case Arbor.MCP.Server.Runtime.OutputTicket.session(primary) do
@@ -3317,6 +3471,17 @@ defmodule Arbor.MCP.HttpPlug do
   defp subscription_keepalive_interval!(interval) do
     raise ArgumentError,
           ":subscription_keepalive_interval_ms must be a positive integer or :infinity, " <>
+            "got: #{inspect(interval)}"
+  end
+
+  defp request_keepalive_interval!(:infinity), do: :infinity
+
+  defp request_keepalive_interval!(interval) when is_integer(interval) and interval > 0,
+    do: interval
+
+  defp request_keepalive_interval!(interval) do
+    raise ArgumentError,
+          ":request_keepalive_interval_ms must be a positive integer or :infinity, " <>
             "got: #{inspect(interval)}"
   end
 

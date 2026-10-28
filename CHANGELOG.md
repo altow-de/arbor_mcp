@@ -130,6 +130,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - POST event streams now stop at the response deadline even when the socket
   or stream consumer keeps returning data. This ports the 1.x maintenance
   fix from `87b495e`.
+- Modern HTTP request SSE streams now send configurable comment keepalives
+  (`:request_keepalive_interval_ms`, default 15 seconds) on mounted and owned
+  HTTP servers. A failed write cancels the handler and frees its Runtime
+  capacity. Over TCP the first write after a peer closes usually succeeds and
+  the next one fails, so on Bandit a closed stream is usually noticed within
+  two intervals. Cowboy cancels the request as soon as it sees the connection
+  close, by terminating the request process. `subscriptions/listen` keeps
+  using only `:subscription_keepalive_interval_ms`. A request whose invocation
+  closes after its SSE response started (for example on Runtime stop) now ends
+  with a JSON-RPC error for its id instead of a truncated stream. JSON
+  responses and legacy-era requests, including their request event streams,
+  get no request keepalives.
 - An HTTP request that timed out or failed could reach its client with no
   response at all when the server was busy. The HTTP gateway gave the
   output controller only 50 ms to queue the JSON-RPC error. If the
