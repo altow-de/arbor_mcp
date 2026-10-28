@@ -389,9 +389,8 @@ defmodule Arbor.MCP.Transport.HTTP do
 
   @doc false
   # Sends `message` synchronously from the calling process, running any
-  # authentication its response asks for. The client re-sends a request this
-  # way when a legacy-era async POST without an auth provider hands back an
-  # auth challenge, so only one authentication runs at a time.
+  # authentication its response asks for. Used before an SSE connection is
+  # established; established clients send requests from their own POST tasks.
   # An authentication failure returns the transport state too, so the
   # provider's record of what it tried is kept.
   @spec send_authenticated(term(), t()) ::
@@ -488,10 +487,8 @@ defmodule Arbor.MCP.Transport.HTTP do
   # A POST task does not authenticate: with several in flight, each would run
   # the OAuth flow. It hands an auth challenge to the client process, which
   # answers one at a time across its requests: with the auth provider, or,
-  # for a modern request without one, with the OAuth flow a synchronous send
-  # runs (see answer_challenge_inline/2). A legacy-era task without a
-  # provider hands its request back instead, and the client re-sends it with
-  # send_authenticated/2.
+  # without one, with the OAuth flow a synchronous send runs (see
+  # answer_challenge_inline/2). The task then re-sends with its stream consumer.
   defp perform_async(message, state, parent, attempts \\ 0) do
     stream =
       PostStream.consumer(parent,
@@ -499,19 +496,17 @@ defmodule Arbor.MCP.Transport.HTTP do
         max_kept_bytes: state.max_response_bytes
       )
 
-    client_answers? = not is_nil(state.auth_provider) or state.protocol_era == :modern
-
     case perform_http_request(message, state, event_stream: stream) do
       {:ok, response} ->
-        case {extract_auth_status(response), client_answers?} do
-          {:ok, _client_answers?} ->
+        case extract_auth_status(response) do
+          :ok ->
             {handle_http_response(response, state, message), state}
 
           # As a modern request stream does: the client process answers the
           # challenge, one at a time across its requests, and this task sends
           # the request again itself, so the client isn't held up meanwhile.
           # At most an initial 401 and a 403 step-up.
-          {{kind, www_auth}, true} when attempts < 2 ->
+          {kind, www_auth} when attempts < 2 ->
             case await_authentication(parent, kind, www_auth, state) do
               {:ok, token} ->
                 perform_async(message, apply_token_to_state(state, token), parent, attempts + 1)
@@ -520,11 +515,8 @@ defmodule Arbor.MCP.Transport.HTTP do
                 {authentication_failure(reason, response, state, message), state}
             end
 
-          {_challenge, true} ->
+          _challenge ->
             {handle_http_response(response, state, message), state}
-
-          {_challenge, false} ->
-            {{:error, {:reauthenticate, message}}, state}
         end
 
       {:error, reason} ->
@@ -752,8 +744,8 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   @doc false
-  # Answers, from the client process, the 401 or 403 that a modern POST task
-  # without an auth provider handed back (see perform_async/4): runs the
+  # Answers, from the client process, the 401 or 403 that a POST task or
+  # request stream without an auth provider handed back: runs the
   # OAuth flow a synchronous send would run, and returns the token for the
   # task to send its request again with. Only the authentication runs here,
   # one challenge at a time; the request itself is re-sent by its task.

@@ -1,0 +1,437 @@
+defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
+  use ExUnit.Case, async: false
+
+  @moduletag :capture_log
+
+  alias Arbor.MCP.Client
+  alias Arbor.MCP.Transport.HTTP
+
+  defmodule Handler do
+    @moduledoc false
+    @behaviour Arbor.MCP.Client.Handler
+
+    @impl true
+    def init(opts), do: {:ok, Keyword.fetch!(opts, :owner)}
+    @impl true
+    def handle_ping(owner), do: {:ok, %{}, owner}
+    @impl true
+    def handle_list_roots(owner), do: {:ok, [], owner}
+    @impl true
+    def handle_create_message(_params, owner), do: {:error, "unused", owner}
+
+    @impl true
+    def handle_progress(id, params, owner) do
+      send(owner, {:progress, id, params})
+      {:ok, owner}
+    end
+
+    @impl true
+    def handle_log_message(id, params, owner) do
+      send(owner, {:log, id, params})
+      {:ok, owner}
+    end
+  end
+
+  test "a legacy POST reauthenticated by inline OAuth answers a ping before its result" do
+    ping = %{"jsonrpc" => "2.0", "id" => "server-ping", "method" => "ping", "params" => %{}}
+    {client, counter} = start_client(hold_after([ping]))
+
+    task = call(client)
+    assert_receive {:holding, server}, 2_000
+    assert_receive {:oauth_started, ^client}, 2_000
+    assert_receive {:client_answered, "server-ping", %{"result" => %{}}}, 2_000
+    send(server, :release)
+
+    assert {:ok, %{"content" => []}} = Task.await(task)
+    assert_one_flow(counter, client)
+  end
+
+  test "progress and logs on a reauthenticated legacy POST arrive before its result" do
+    notifications = [
+      notification("notifications/progress", %{"progressToken" => "progress", "progress" => 1}),
+      notification("notifications/message", %{"level" => "info", "data" => "working"})
+    ]
+
+    {client, counter} = start_client(hold_after(notifications))
+    task = call(client, progress_token: "progress")
+
+    assert_receive {:holding, server}, 2_000
+    assert_receive {:progress, id, %{"progressToken" => "progress", "progress" => 1}}, 2_000
+    assert is_integer(id)
+    # Legacy log notifications carry no request id on the wire.
+    assert_receive {:log, nil, %{"data" => "working"}}, 2_000
+    send(server, :release)
+
+    assert {:ok, %{"content" => []}} = Task.await(task)
+    assert_one_flow(counter, client)
+  end
+
+  test "two concurrent legacy 401s run one inline OAuth flow and reuse its token" do
+    {client, counter} = start_client(&finish/2, barrier: true)
+    tasks = for _ <- 1..2, do: call(client)
+
+    # Both requests were sent without a token before either challenge is answered.
+    servers = for _ <- 1..2, do: receive_challenge()
+    Enum.each(servers, &send(&1, :challenge))
+
+    assert [{:ok, _}, {:ok, _}] = Task.await_many(tasks)
+    assert_receive {:oauth_started, ^client}, 2_000
+    refute_received {:oauth_started, _}
+    assert_one_flow(counter, client)
+
+    posts = Agent.get(counter, & &1.posts)
+    assert map_size(posts) == 2
+    assert Enum.all?(posts, fn {_id, headers} -> headers == [[], ["Bearer token-1"]] end)
+  end
+
+  test "a legacy request cancelled before its challenge is not authenticated or re-sent" do
+    {client, counter} = start_client(&finish/2, barrier: true)
+    task = call(client)
+    server = receive_challenge()
+    [id] = Client.get_pending_requests(client)
+
+    {_ref, {post_task, ^id}} =
+      Enum.find(:sys.get_state(client).async_post_tasks, fn {_ref, {_pid, request_id}} ->
+        request_id == id
+      end)
+
+    monitor = Process.monitor(post_task)
+    assert :ok = Client.send_cancelled(client, id, "test cancellation")
+    assert {:error, :cancelled} = Task.await(task)
+    send(server, :challenge)
+    assert_receive {:DOWN, ^monitor, :process, ^post_task, :normal}, 2_000
+    assert {:ok, %{connection_status: :ready}} = Client.get_status(client)
+
+    assert Agent.get(counter, & &1.tokens) == 0
+    assert Agent.get(counter, & &1.posts) == %{id => [[]]}
+    refute_received {:oauth_started, _}
+  end
+
+  for opt <- [
+        [progress_token: "progress"],
+        [meta: %{"io.modelcontextprotocol/logLevel" => "info"}]
+      ] do
+    @stream_opt opt
+    test "a provider-less modern request stream authenticates with #{inspect(opt)}" do
+      message =
+        if @stream_opt[:progress_token],
+          do:
+            notification("notifications/progress", %{
+              "progressToken" => "progress",
+              "progress" => 1
+            }),
+          else: notification("notifications/message", %{"level" => "info", "data" => "working"})
+
+      {client, counter} = start_client(hold_after([message]), era: :modern)
+      task = call(client, @stream_opt)
+
+      assert_receive {:oauth_started, ^client}, 2_000
+      assert_receive {:holding, server}, 2_000
+
+      if @stream_opt[:progress_token] do
+        assert_receive {:progress, id, %{"progress" => 1}}, 2_000
+        assert is_integer(id)
+      else
+        assert_receive {:log, id, %{"data" => "working"}}, 2_000
+        assert is_integer(id)
+      end
+
+      assert {:ok, %{connection_status: :ready}} = Client.get_status(client)
+      send(server, :release)
+
+      assert {:ok, %{"resultType" => "complete", "content" => []}} = Task.await(task)
+      assert_one_flow(counter, client)
+    end
+  end
+
+  test "a legacy inline flow can step up once on a retried POST" do
+    {client, counter} = start_client(&finish/2, step_up: true)
+    assert {:ok, %{"content" => []}} = Task.await(call(client))
+    assert Agent.get(counter, & &1.tokens) == 2
+    assert :sys.get_state(client).transport_state.granted_scopes == ["tools.call", "admin"]
+    assert :sys.get_state(client).transport_state.access_token == "token-2"
+  end
+
+  test "a legacy POST stops after an initial challenge and one scope step-up" do
+    {client, counter} = start_client(&finish/2, step_up: true, reject_retries: true)
+
+    assert {:error, %{type: :transport_error, transport: :http, reason: {:http_error, 403, ""}}} =
+             Task.await(call(client))
+
+    assert Agent.get(counter, & &1.tokens) == 2
+    assert [headers] = Agent.get(counter, &Map.values(&1.posts))
+    assert headers == [[], ["Bearer token-1"], ["Bearer token-2"]]
+  end
+
+  test "a provider-less legacy POST waits for authentication only until its deadline" do
+    bypass = Bypass.open()
+
+    Bypass.expect_once(bypass, "POST", "/mcp", fn conn ->
+      challenge(conn, 401, "Bearer")
+    end)
+
+    {:ok, transport} = HTTP.connect(url: "http://127.0.0.1:#{bypass.port}/mcp", use_sse: false)
+    transport = HTTP.settle_protocol_era(transport, :legacy, "2025-11-25")
+    transport = HTTP.put_deadline(transport, System.monotonic_time(:millisecond) + 1_000)
+    request = Jason.encode!(%{"jsonrpc" => "2.0", "id" => 7, "method" => "tools/call"})
+
+    assert {:ok, _} = HTTP.send_async(request, transport)
+    assert_receive {:async_post_task, monitor, task, 7}, 2_000
+    assert_receive {:http_post_auth_challenge, ^task, ref, %{token: nil}}, 2_000
+    assert_receive {:async_post_result, {:error, :timeout}, %{request_id: 7}}, 2_000
+    assert_receive {:DOWN, ^monitor, :process, ^task, :normal}, 2_000
+
+    send(task, {:http_post_auth_result, ref, {:ok, "too-late"}})
+  end
+
+  defp receive_challenge do
+    assert_receive {:unauthenticated, server}, 2_000
+    server
+  end
+
+  defp assert_one_flow(counter, client) do
+    assert Agent.get(counter, & &1.tokens) == 1
+    transport = :sys.get_state(client).transport_state
+    assert transport.auth_provider == nil
+    assert transport.access_token == "token-1"
+  end
+
+  defp call(client, opts \\ []) do
+    Task.async(fn ->
+      Client.call_tool(client, "protected", %{}, [timeout: 5_000, format: :map] ++ opts)
+    end)
+  end
+
+  defp start_client(answer_call, opts \\ []) do
+    bypass = Bypass.open()
+    origin = "http://127.0.0.1:#{bypass.port}"
+    era = Keyword.get(opts, :era, :legacy)
+    version = if era == :legacy, do: "2025-11-25", else: "2026-07-28"
+    owner = self()
+    counter = start_supervised!({Agent, fn -> %{posts: %{}, codes: %{}, tokens: 0} end})
+    oauth_server(bypass, origin, counter)
+
+    Bypass.stub(bypass, "GET", "/mcp", &Plug.Conn.resp(&1, 405, ""))
+    Bypass.stub(bypass, "DELETE", "/mcp", &Plug.Conn.resp(&1, 200, ""))
+
+    Bypass.stub(bypass, "POST", "/mcp", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      case Jason.decode!(body) do
+        %{"method" => method, "id" => id} when method in ["initialize", "server/discover"] ->
+          json(conn, response(id, establishment(era, version)))
+
+        %{"method" => "tools/call"} = request ->
+          protected_call(conn, request, counter, origin, owner, answer_call, opts)
+
+        %{"id" => id} = reply when not is_map_key(reply, "method") ->
+          send(owner, {:client_answered, id, reply})
+          Plug.Conn.resp(conn, 202, "")
+
+        _notification ->
+          Plug.Conn.resp(conn, 202, "")
+      end
+    end)
+
+    client =
+      start_supervised!(
+        {Client,
+         transport: :http,
+         url: origin <> "/mcp",
+         protocol_mode: if(era == :legacy, do: :legacy_only, else: :modern_only),
+         protocol_version: version,
+         handler: {Handler, owner: owner},
+         use_sse: false,
+         health_check_interval: nil,
+         reconnect: false}
+      )
+
+    # An :auth map auto-creates a provider. Seed only the inline flow's config
+    # after establishment to exercise real authorization-code OAuth without one.
+    # The no-config handoff itself is covered separately above: registration
+    # requires explicit configuration and must not acquire insecure defaults.
+    :sys.replace_state(client, fn state ->
+      config = %{
+        client_id: "inline-client",
+        client_secret: "inline-secret",
+        credential_issuer: origin,
+        metadata_fetch: [allow_insecure_loopback: true]
+      }
+
+      %{state | transport_state: %{state.transport_state | auth_config: config}}
+    end)
+
+    handler = {__MODULE__, make_ref()}
+
+    :telemetry.attach(
+      handler,
+      [:arbor_mcp, :auth, :flow, :started],
+      fn _, _, _, _ ->
+        send(owner, {:oauth_started, self()})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    {client, counter}
+  end
+
+  defp protected_call(conn, %{"id" => id} = request, counter, origin, owner, answer, opts) do
+    authorization = Plug.Conn.get_req_header(conn, "authorization")
+
+    attempt =
+      Agent.get_and_update(counter, fn state ->
+        posts = Map.update(state.posts, id, [authorization], &(&1 ++ [authorization]))
+        {length(posts[id]), %{state | posts: posts}}
+      end)
+
+    case authorization do
+      [] ->
+        if opts[:barrier] && attempt == 1 do
+          send(owner, {:unauthenticated, self()})
+
+          receive do
+            :challenge -> :ok
+          after
+            10_000 -> flunk("test did not release the challenge")
+          end
+        end
+
+        challenge(conn, 401, ~s(Bearer resource_metadata="#{origin}/prm", scope="tools.call"))
+
+      ["Bearer " <> token] ->
+        if opts[:reject_retries] || (opts[:step_up] && token == "token-1") do
+          challenge(
+            conn,
+            403,
+            ~s(Bearer error="insufficient_scope", resource_metadata="#{origin}/prm", scope="tools.call admin")
+          )
+        else
+          assert token in ["token-1", "token-2"]
+          answer.(request, conn)
+        end
+    end
+  end
+
+  defp oauth_server(bypass, origin, counter) do
+    Bypass.stub(bypass, "GET", "/prm", fn conn ->
+      json(conn, %{"resource" => origin <> "/mcp", "authorization_servers" => [origin]})
+    end)
+
+    Bypass.stub(bypass, "GET", "/.well-known/openid-configuration", fn conn ->
+      json(conn, %{
+        "issuer" => origin,
+        "authorization_endpoint" => origin <> "/authorize",
+        "token_endpoint" => origin <> "/token",
+        "grant_types_supported" => ["authorization_code"],
+        "token_endpoint_auth_methods_supported" => ["client_secret_post"]
+      })
+    end)
+
+    Bypass.stub(bypass, "GET", "/authorize", fn conn ->
+      params = URI.decode_query(conn.query_string)
+      assert params["code_challenge_method"] == "S256"
+
+      code =
+        Agent.get_and_update(counter, fn state ->
+          code = "code-#{map_size(state.codes) + 1}"
+          {code, %{state | codes: Map.put(state.codes, code, params)}}
+        end)
+
+      callback =
+        params["redirect_uri"] <>
+          "?" <> URI.encode_query(%{"code" => code, "state" => params["state"]})
+
+      conn |> Plug.Conn.put_resp_header("location", callback) |> Plug.Conn.resp(302, "")
+    end)
+
+    Bypass.stub(bypass, "POST", "/token", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      params = URI.decode_query(body)
+      assert params["grant_type"] == "authorization_code"
+      assert params["client_id"] == "inline-client"
+      assert params["client_secret"] == "inline-secret"
+      authorization = Agent.get(counter, &Map.fetch!(&1.codes, params["code"]))
+
+      challenge =
+        :crypto.hash(:sha256, params["code_verifier"]) |> Base.url_encode64(padding: false)
+
+      assert challenge == authorization["code_challenge"]
+      assert params["redirect_uri"] == authorization["redirect_uri"]
+      assert params["resource"] == origin <> "/mcp"
+      n = Agent.get_and_update(counter, &{&1.tokens + 1, %{&1 | tokens: &1.tokens + 1}})
+
+      json(conn, %{
+        "access_token" => "token-#{n}",
+        "token_type" => "Bearer",
+        "scope" => authorization["scope"]
+      })
+    end)
+  end
+
+  defp establishment(:legacy, version) do
+    %{
+      "protocolVersion" => version,
+      "capabilities" => %{"tools" => %{}},
+      "serverInfo" => %{"name" => "inline", "version" => "1"}
+    }
+  end
+
+  defp establishment(:modern, version) do
+    %{
+      "resultType" => "complete",
+      "supportedVersions" => [version],
+      "capabilities" => %{"tools" => %{}},
+      "ttlMs" => 0,
+      "cacheScope" => "private"
+    }
+  end
+
+  defp hold_after(messages) do
+    owner = self()
+
+    fn request, conn ->
+      conn =
+        conn
+        |> Plug.Conn.put_resp_content_type("text/event-stream")
+        |> Plug.Conn.send_chunked(200)
+
+      {:ok, conn} = Plug.Conn.chunk(conn, Enum.map_join(messages, &event/1))
+      send(owner, {:holding, self()})
+
+      receive do
+        :release -> :ok
+      after
+        10_000 -> flunk("test did not release the response stream")
+      end
+
+      {:ok, conn} =
+        Plug.Conn.chunk(
+          conn,
+          event(response(request["id"], %{"resultType" => "complete", "content" => []}))
+        )
+
+      conn
+    end
+  end
+
+  defp finish(request, conn), do: json(conn, response(request["id"], %{"content" => []}))
+
+  defp notification(method, params),
+    do: %{"jsonrpc" => "2.0", "method" => method, "params" => params}
+
+  defp response(id, result), do: %{"jsonrpc" => "2.0", "id" => id, "result" => result}
+  defp event(message), do: "data: #{Jason.encode!(message)}\n\n"
+
+  defp challenge(conn, status, www_auth),
+    do:
+      conn
+      |> Plug.Conn.put_resp_header("www-authenticate", www_auth)
+      |> Plug.Conn.resp(status, "")
+
+  defp json(conn, body),
+    do:
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.resp(200, Jason.encode!(body))
+end

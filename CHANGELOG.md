@@ -51,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Provider-less legacy Streamable HTTP POSTs now authenticate through the
+  client and retry from their own task with the stream consumer intact. Server
+  requests (such as `ping`), progress and log notifications on the retried SSE
+  response are handled while it remains open. Concurrent challenges share
+  the resulting token, authentication waits respect the request deadline,
+  and cancelled requests are not re-sent.
+  Modern request streams opened for progress or logging also use inline OAuth
+  when no auth provider is configured.
 - Over modern (2026-07-28) Streamable HTTP, a client without an
   `:auth_provider` that got a 401 or 403 sent the request again from the
   client process. That POST held the client until the server answered it:

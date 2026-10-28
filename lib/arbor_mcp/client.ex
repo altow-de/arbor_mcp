@@ -2612,20 +2612,6 @@ defmodule Arbor.MCP.Client do
     {:noreply, state}
   end
 
-  # The server asked a legacy-era task's POST to authenticate, and the client
-  # has no auth provider (modern-era tasks ask the client instead, above).
-  # Re-sending from this process runs at most one authentication at a time,
-  # and later challenges reuse the credentials it obtained. A POST that
-  # carried no request (a notification, a batch, a reply to a server request)
-  # is re-sent too; a request whose caller has given up is not.
-  defp handle_async_post_result({:error, {:reauthenticate, message}}, meta, state) do
-    request_id = Map.get(meta, :request_id)
-
-    if is_nil(request_id) or Map.has_key?(state.pending_requests, request_id),
-      do: resend_authenticated(message, meta, state),
-      else: {:noreply, state}
-  end
-
   # The caller receives the failure, as from a synchronous send, so it is not
   # logged as an error here.
   defp handle_async_post_result({:error, reason}, meta, state) do
@@ -2633,30 +2619,6 @@ defmodule Arbor.MCP.Client do
 
     {:noreply,
      fail_async_post_request(state, Map.get(meta, :request_id), reason, Map.get(meta, :deadline))}
-  end
-
-  defp resend_authenticated(message, meta, state) do
-    request_id = Map.get(meta, :request_id)
-    deadline = Map.get(meta, :deadline)
-    previous = Deadline.on_transport(HTTP, state.transport_state)
-    transport = Deadline.put_on_transport(HTTP, state.transport_state, deadline)
-    restore = &%{state | transport_state: Deadline.put_on_transport(HTTP, &1, previous)}
-
-    case HTTP.send_authenticated(message, transport) do
-      {:ok, transport, response_data} ->
-        RequestHandler.handle_post_response(response_data, request_id, restore.(transport))
-
-      {:ok, transport} ->
-        {:noreply, restore.(transport)}
-
-      {:error, reason, transport} ->
-        Logger.debug("Authenticated resend failed", reason: LogSummary.describe(reason))
-        {:noreply, fail_async_post_request(restore.(transport), request_id, reason, deadline)}
-
-      {:error, reason} ->
-        Logger.debug("Authenticated resend failed", reason: LogSummary.describe(reason))
-        {:noreply, fail_async_post_request(state, request_id, reason, deadline)}
-    end
   end
 
   defp cache_tool_list(
@@ -2690,8 +2652,14 @@ defmodule Arbor.MCP.Client do
 
   defp own_post_task?(state, task) do
     Enum.any?(state.async_post_tasks || %{}, fn
-      {_ref, {pid, _request_id}} -> pid == task
-      _other -> false
+      {_ref, {pid, request_id}} ->
+        # A legacy POST can still be in flight after its caller cancelled.
+        # It must not authenticate and re-send a request that is no longer pending.
+        pid == task and
+          (is_nil(request_id) or Map.has_key?(state.pending_requests, request_id))
+
+      _other ->
+        false
     end)
   end
 
@@ -2719,8 +2687,8 @@ defmodule Arbor.MCP.Client do
 
   defp scopes_granted?(_granted, _scopes), do: false
 
-  # Only a modern POST task asks without an auth provider: the transport's
-  # own OAuth flow answers it, here, as it would a synchronous send.
+  # Without an auth provider the transport's own OAuth flow answers the
+  # challenge here, as it would a synchronous send.
   defp run_stream_challenge(%HTTP{auth_provider: nil} = transport_state, challenge),
     do: HTTP.answer_challenge_inline(transport_state, challenge)
 

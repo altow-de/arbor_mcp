@@ -426,13 +426,12 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
   # challenge steps as the ordinary HTTP path: an initial 401 followed by an
   # optional 403 insufficient-scope step-up.
   #
-  # The stream doesn't run the provider itself. With several streams open, each
+  # The stream doesn't authenticate itself. With several streams open, each
   # would refresh, and a rotating refresh token used twice fails. The client
   # process answers every stream's challenges in turn and reuses a token
   # another stream already obtained, so the stream waits for its answer.
   defp maybe_retry_with_auth(status, response_headers, state)
-       when status in [401, 403] and not is_nil(state.auth_provider) and
-              state.auth_attempts < 2 do
+       when status in [401, 403] and state.auth_attempts < 2 do
     www_auth = Headers.get(response_headers, "www-authenticate")
     ref = make_ref()
 

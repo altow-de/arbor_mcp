@@ -396,7 +396,7 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
       assert Agent.get(attempts, & &1) == 2
     end
 
-    test "on a legacy-era connection still hands its request back to be re-sent" do
+    test "on a legacy-era connection asks its client and preserves an unanswered challenge" do
       bypass = Bypass.open()
 
       Bypass.expect_once(bypass, "POST", "/mcp", fn conn ->
@@ -412,12 +412,16 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
       request = encoded_call(8)
 
       assert {:ok, _transport} = HTTP.send_async(request, transport)
+      assert_receive {:async_post_task, _monitor, task, 8}
 
-      assert_receive {:async_post_result, {:error, {:reauthenticate, ^request}},
-                      %{request_id: 8}},
+      assert_receive {:http_post_auth_challenge, ^task, ref, %{status: 401, token: nil}},
                      2_000
 
-      refute_received {:http_post_auth_challenge, _task, _ref, _challenge}
+      send(task, {:http_post_auth_result, ref, {:error, :no_credentials}})
+
+      assert_receive {:async_post_result, {:error, {:unauthorized, 401, "", _challenge}},
+                      %{request_id: 8}},
+                     2_000
     end
   end
 
@@ -439,7 +443,7 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
     %Client{
       transport_mod: HTTP,
       transport_state: transport_state,
-      pending_requests: %{},
+      pending_requests: %{1 => {{self(), make_ref()}, :single, "tools/call"}},
       pending_batches: %{},
       cancelled_requests: MapSet.new(),
       async_post_tasks: %{make_ref() => {self(), 1}}
