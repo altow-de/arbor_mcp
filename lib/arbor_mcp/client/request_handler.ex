@@ -1194,7 +1194,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
           |> cache_result(response_id, response_data)
           |> cancel_progress_timeout(response_id)
           |> forget_caller({:request, response_id})
-          |> settle_progress(response_id)
+          |> settle_progress(response_id, response_data)
 
         {:ok, {from, :single}} ->
           :telemetry.execute(
@@ -1208,7 +1208,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
           %{state | pending_requests: new_pending_requests}
           |> forget_caller({:request, response_id})
-          |> settle_progress(response_id)
+          |> settle_progress(response_id, response_data)
 
         {:ok, {:batch, batch_id}} ->
           handle_batch_response_item(response_data, response_id, batch_id, state)
@@ -1417,20 +1417,39 @@ defmodule Arbor.MCP.Client.RequestHandler do
   #   answer (a result, an error, a timeout, a cancellation) or has exited,
   #   or with every other when the connection goes (the client's disconnect
   #   and teardown clear the map).
-  # - `progress_tombstones` holds the tokens of requests settled within the
-  #   cleanup grace, with when each expires. Connection-level progress names
-  #   its request only by token, and a settled request's late notification
-  #   (legacy HTTP can send one on the GET stream after the POST's response)
-  #   would otherwise reach a newer request that reuses the token. While a
-  #   token is tombstoned, connection-level progress naming it reaches no
-  #   target. Client-generated tokens are unique and never meet one.
-  defp remember_progress_target(state, id, request, {caller, _tag}, deadline, %{progress_to: pid})
+  # - `progress_tombstones` holds the tokens of settled requests, each with
+  #   the window `{from, until}` in which it is held back. Connection-level
+  #   progress names its request only by token, and a settled request's late
+  #   notification (legacy HTTP can send one on the GET stream after the
+  #   POST's response) would otherwise reach a newer request that reuses the
+  #   token. While a token is held back, connection-level progress naming it
+  #   reaches no target. Client-generated tokens are unique and never meet
+  #   one.
+  #   - A request that settles holds its token back at once, for the
+  #     cleanup grace.
+  #   - An input_required round doesn't settle its call: the next round,
+  #     automatic or manual, carries the same token. Its token is reserved
+  #     for that continuation until the round's deadline, and only then held
+  #     back for the grace. A continuation that arrives first takes the
+  #     reservation, so its progress is delivered.
+  # - Deadlines are on this node's clock: a remote caller's monotonic time
+  #   can't be compared with it.
+  defp remember_progress_target(
+         state,
+         id,
+         request,
+         {caller, _tag},
+         deadline,
+         %{progress_to: pid} = meta
+       )
        when is_pid(pid) and is_pid(caller) do
+    token = get_in(request, ["params", "_meta", "progressToken"])
+
     target = %{
       pid: pid,
-      token: get_in(request, ["params", "_meta", "progressToken"]),
+      token: token,
       caller: caller,
-      deadline: deadline
+      deadline: local_deadline(caller, deadline, meta)
     }
 
     # Settling drops each entry; a request settled on a path that doesn't
@@ -1440,24 +1459,55 @@ defmodule Arbor.MCP.Client.RequestHandler do
         Map.has_key?(state.pending_requests, request_id)
       end)
 
-    Map.put(state, :progress_targets, Map.put(live, id, target))
+    state
+    |> Map.put(:progress_targets, Map.put(live, id, target))
+    |> take_reservation(token)
   end
 
   defp remember_progress_target(state, _id, _request, _from, _deadline, _meta), do: state
 
+  # A local caller's deadline is on this clock already. A remote caller's
+  # relative timeout counts from now, as legacy_request_cutoff/3 does.
+  defp local_deadline(caller, deadline, _meta) when node(caller) == node(), do: deadline
+  defp local_deadline(_caller, _deadline, meta), do: remote_relative_deadline(meta)
+
+  # The continuation of an input_required round takes the token's
+  # reservation; a token already held back stays held back.
+  defp take_reservation(state, token) do
+    now = now()
+
+    case Map.get(Map.get(state, :progress_tombstones) || %{}, token) do
+      {from, _until} when from > now ->
+        Map.update!(state, :progress_tombstones, &Map.delete(&1, token))
+
+      _held_or_none ->
+        state
+    end
+  end
+
   @doc false
-  # The caller of request `id` has its answer: its progress reaches no
-  # target from now on, and its token is tombstoned for the cleanup grace.
-  @spec settle_progress(map(), term()) :: map()
-  def settle_progress(state, id) do
+  # The caller of request `id` has its answer, `response` if the server sent
+  # one: its progress reaches no target from now on, and its token is held
+  # back, at once, or from the round's deadline if the answer is an
+  # input_required round whose continuation will carry the token.
+  @spec settle_progress(map(), term(), term()) :: map()
+  def settle_progress(state, id, response \\ nil) do
     {target, targets} = Map.pop(progress_targets(state), id)
     state = Map.put(state, :progress_targets, targets)
 
     case (target && target.token) || request_token(state, id) do
       nil -> state
-      token -> tombstone_token(state, token, id)
+      token -> tombstone_token(state, token, id, hold_from(response, target, state))
     end
   end
+
+  defp hold_from({:ok, result}, target, state) do
+    if MRTR.input_required?(result),
+      do: (target && target.deadline) || now() + (state.default_timeout || 5_000),
+      else: now()
+  end
+
+  defp hold_from(_response, _target, _state), do: now()
 
   defp request_token(state, id) do
     Enum.find_value(Map.get(state, :progress_requests) || %{}, fn
@@ -1466,13 +1516,13 @@ defmodule Arbor.MCP.Client.RequestHandler do
     end)
   end
 
-  defp tombstone_token(state, token, id) do
+  defp tombstone_token(state, token, id, from) do
     now = now()
 
     tombstones =
       (Map.get(state, :progress_tombstones) || %{})
-      |> Map.filter(fn {_token, expires_at} -> expires_at > now end)
-      |> Map.put(token, now + @caller_timeout_grace)
+      |> Map.filter(fn {_token, {_from, until}} -> until > now end)
+      |> Map.put(token, {from, from + @caller_timeout_grace})
 
     requests =
       case Map.get(state, :progress_requests) || %{} do
@@ -1487,8 +1537,12 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
   defp tombstoned?(state, token) do
     case Map.get(Map.get(state, :progress_tombstones) || %{}, token) do
-      expires_at when is_integer(expires_at) -> expires_at > now()
-      nil -> false
+      {from, until} ->
+        now = now()
+        from <= now and now < until
+
+      nil ->
+        false
     end
   end
 

@@ -434,7 +434,9 @@ end
   arrives.
 - **Delivery stops once the call returns,** with a result, an error, a
   timeout or a cancellation, even while the client is still cleaning up
-  after a caller's own `:timeout`. Progress that arrives later, as late
+  after a caller's own `:timeout`. The client measures the caller's
+  deadline on its own clock, so a caller on another node gets its progress
+  whatever that node's clock says. Progress that arrives later, as late
   notifications on stdio or legacy HTTP can, isn't sent.
 - **A request's target gets only that request's progress.** A message on a
   modern request stream that names another request's token is dropped. After
@@ -443,6 +445,12 @@ end
   a late notification can't reach a newer request that reuses the token.
   Such a newer request gets its progress at its target only once that
   second has passed.
+- **An `input_required` round doesn't settle its call.** Its token stays
+  reserved until the round's deadline, or the client's default timeout when
+  the round had none, for the next round to reuse: an automatic one, or a
+  manual one that passes the same `:progress_token`. The next round's
+  progress arrives as usual. If no round continues it by then, the token is
+  held back for a second from that point, as for any settled request.
 - **Use tokens that are unique on the connection.** The client's generated
   tokens are. A gateway that forwards downstream requests shouldn't reuse
   downstream tokens upstream, since different downstream clients may pick

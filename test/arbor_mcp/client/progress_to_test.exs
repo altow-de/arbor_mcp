@@ -315,6 +315,45 @@ defmodule Arbor.MCP.Client.ProgressToTest do
     end
   end
 
+  # On these transports progress is routed by token, so a round's
+  # input_required answer must not hold back the token its continuation
+  # reuses.
+  describe "MRTR continuations over token-routed transports" do
+    for transport <- [:test, :beam, :stdio] do
+      test "an automatic continuation keeps its progress (#{transport})" do
+        client = connect(unquote(transport), :modern_only)
+
+        assert {:ok, %{"content" => [%{"text" => "Welcome, Lin"}]}} =
+                 Client.call_tool(client, "ask", %{},
+                   progress_to: self(),
+                   timeout: 10_000,
+                   format: :map
+                 )
+
+        assert_receive {:arbor_mcp_progress, ^client, token, %{"message" => "asking"}}
+        assert_receive {:arbor_mcp_progress, ^client, ^token, %{"message" => "answered"}}
+      end
+
+      test "a manual continuation keeps its progress (#{transport})" do
+        client = connect(unquote(transport), :modern_only)
+        round = [mrtr: :manual, progress_to: self(), progress_token: "m-1", timeout: 10_000]
+
+        assert {:input_required, %{request_state: state}} =
+                 Client.call_tool(client, "ask", %{}, round)
+
+        assert_receive {:arbor_mcp_progress, ^client, "m-1", %{"message" => "asking"}}
+
+        answers = %{"name" => %{"action" => "accept", "content" => %{"name" => "Tom"}}}
+        continuation = round ++ [input_responses: answers, request_state: state, format: :map]
+
+        assert {:ok, %{"content" => [%{"text" => "Welcome, Tom"}]}} =
+                 Client.call_tool(client, "ask", %{}, continuation)
+
+        assert_receive {:arbor_mcp_progress, ^client, "m-1", %{"message" => "answered"}}
+      end
+    end
+  end
+
   describe "a gateway" do
     for mode <- [:modern_only, :legacy_only] do
       test "relays the upstream progress of every round to its downstream client (#{mode})" do
@@ -583,6 +622,97 @@ defmodule Arbor.MCP.Client.ProgressToTest do
       refute_received {:forwarded, _target, _message}
     end
 
+    test "an abandoned input_required round's token is held back from its deadline" do
+      client = scripted()
+      test_pid = self()
+
+      round =
+        start_call(client,
+          mrtr: :manual,
+          progress_to: self(),
+          progress_token: "left",
+          timeout: 150
+        )
+
+      assert_receive {:wire, %{"id" => id, "method" => "tools/call"}}
+
+      result = %{
+        "resultType" => "input_required",
+        "inputRequests" => %{
+          "name" => %{
+            "method" => "elicitation/create",
+            "params" => %{"message" => "Name?", "requestedSchema" => %{"type" => "object"}}
+          }
+        },
+        "requestState" => "sealed"
+      }
+
+      send(
+        client,
+        {:transport_message, Jason.encode!(%{"jsonrpc" => "2.0", "id" => id, "result" => result})}
+      )
+
+      assert {:input_required, _round} = Task.await(round)
+
+      # Reserved for a continuation until the round's deadline, then held back
+      # for the cleanup grace.
+      %{"left" => {from, until}} = :sys.get_state(client).progress_tombstones
+      assert from > System.monotonic_time(:millisecond)
+      assert until - from == 1_000
+
+      # Nothing continued it by then: a request that reuses the token now
+      # gets no connection-level progress for it.
+      :ok =
+        Arbor.MCP.TestHelpers.wait_until(fn -> System.monotonic_time(:millisecond) >= from end,
+          timeout: 2_000
+        )
+
+      target = spawn_link(fn -> forward_to(test_pid, "late") end)
+      reuse = start_call(client, progress_to: target, progress_token: "left")
+      assert_receive {:wire, %{"id" => reuse_id, "method" => "tools/call"}}
+
+      progress(client, "left", 1)
+      _state = :sys.get_state(client)
+      refute_received {:forwarded, _target, _message}
+
+      respond(client, reuse_id)
+      assert {:ok, _result} = Task.await(reuse)
+    end
+
+    # The caller's monotonic clock may be another node's: the client measures
+    # the caller's deadline on its own clock, from the relative timeout.
+    test "a remote caller's deadline is taken on the client's clock" do
+      client = scripted()
+      state = :sys.get_state(client)
+      caller = remote_pid()
+
+      # A caller node whose monotonic clock trails this one by a minute.
+      meta = %{
+        timeout: 30_000,
+        deadline: System.monotonic_time(:millisecond) - 60_000,
+        progress_to: self(),
+        cancel_on_caller_exit: false,
+        cache_mode: :bypass
+      }
+
+      params = %{"name" => "steps", "arguments" => %{}, "_meta" => %{"progressToken" => "far"}}
+
+      assert {:noreply, state} =
+               RequestHandler.handle_request(
+                 "tools/call",
+                 params,
+                 {caller, make_ref()},
+                 state,
+                 meta
+               )
+
+      assert_receive {:wire, %{"method" => "tools/call"}}
+
+      message = Jason.encode!(Map.put(progress_message("far", 1), "jsonrpc", "2.0"))
+      RequestHandler.parse_transport_message(message, state)
+      assert_received {:arbor_mcp_progress, _client, "far", %{"progress" => 1}}
+    end
+
     test "each request's progress goes only to its own target" do
       client = scripted()
       test_pid = self()
@@ -751,6 +881,12 @@ defmodule Arbor.MCP.Client.ProgressToTest do
     }
 
     send(client, {:transport_message, Jason.encode!(message)})
+  end
+
+  # A pid on a node this VM isn't connected to.
+  defp remote_pid do
+    node = "remote@nowhere"
+    :erlang.binary_to_term(<<131, 88, 119, byte_size(node), node::binary, 1::32, 0::32, 1::32>>)
   end
 
   defp start_call(client, opts) do
