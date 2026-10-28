@@ -289,10 +289,39 @@ wire shape.
 
 With `:prefer_modern`, ArborMCP sends a bounded `server/discover` probe first. It
 falls back to `initialize` only when the response is recognized as evidence of
-a legacy peer and the transport is still usable. A recognized modern error,
-unsupported modern revision, timeout, authentication failure, or broken
-transport is surfaced instead of being silently downgraded. `:modern_only`
-never falls back.
+a legacy peer and the transport is still usable. Over HTTP, a probe that gets
+no answer within `:era_probe_timeout` is such evidence too, as MCP 2026-07-28
+says: each POST stands alone, so a late answer to the probe cannot reach the
+`initialize` that follows. A recognized modern error, unsupported modern
+revision, authentication failure, or broken transport is surfaced instead of
+being silently downgraded. `:modern_only` never falls back.
+
+Over stdio the probe is the first message a newly spawned server reads, so
+the client waits for the server to start as well as to answer. Unless
+`:era_probe_timeout` is set, that wait is bounded by `:handshake_timeout`
+(10 s by default), the time a legacy `initialize` gets, so a server that is
+slow to start connects in every mode. The establishment bound covers both:
+`:handshake_timeout` plus the probe's bound, 20 s by default.
+
+A stdio server that exits without answering the probe (Python `mcp` 1.8
+and earlier do) or answers nothing within its bound gives no evidence on
+that pipe, and a late answer could still reach anything sent after the
+probe. Under `:prefer_modern` the client closes that process (EOF, then TERM
+and KILL) and, once the close is confirmed, starts a fresh one with the same
+options and initializes it: once per connection attempt, reconnects
+included, within `:establish_timeout`. A process that cannot be confirmed
+stopped is not replaced, by a retry or a reconnect either; `start_link/1`
+returns
+`{:error, {:transport_connect_failed, {:probed_server_stop_unconfirmed, ...}}}`.
+A modern-only server fails on the new `initialize` with the versions it
+supports. Those are the only two triggers: a live server's error answer,
+such as `-32601`, leads to `initialize` on the same pipe, and malformed
+output (a JSON-looking line that is not valid JSON-RPC, a message other
+than a notification that is not the answer, or a frame cut off or over
+`:max_frame_bytes`) fails the connection. Valid notifications, which the
+probe skips, and non-JSON lines such as banners and logs, which stdio
+ignores everywhere, are no answer. `:modern_only` fails with the probe error and never
+respawns.
 
 Successful modern observations are pinned by endpoint and relevant transport
 configuration. Legacy observations expire (five minutes by default) so an

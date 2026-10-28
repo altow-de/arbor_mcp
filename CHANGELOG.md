@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Under `:prefer_modern`, a stdio server that exits without answering the
+  `server/discover` probe, as Python `mcp` 1.6 and 1.8 stdio servers do, or
+  that does not answer it within its bound is now reached with a legacy
+  `initialize`. The client closes that process (EOF, then TERM and KILL)
+  and, once the close is confirmed, starts a fresh one from the same options
+  and initializes it, once per connection attempt and reconnect, within
+  `:establish_timeout`. The probed pipe carries nothing more, so a late
+  answer to the probe cannot reach the handshake. A process that cannot be
+  confirmed stopped is not replaced: `start_link/1` returns
+  `{:error, {:transport_connect_failed, {:probed_server_stop_unconfirmed, %{probe: ..., cleanup: ...}}}}`,
+  and no `:retry_policy` or reconnect starts another. Malformed output never
+  leads to a respawn: a JSON-looking line (one starting with `{` or `[`)
+  that is not valid JSON-RPC, a message other than a notification that is
+  not the answer to the probe, or a frame cut off or over
+  `:max_frame_bytes`. Valid JSON-RPC notifications, which the probe skips,
+  and non-JSON stdout lines (banners, logs), which the stdio transport
+  ignores everywhere, are no answer, so a server that sends only those and
+  exits is replaced like any other. A modern-only server
+  then fails on `initialize` with the versions it supports, reported as
+  `{:era_probe_and_initialize_failed, %{..., respawned: true}}`. The legacy
+  observation is recorded and the `[:arbor_mcp, :client, :era, :fallback]`
+  event carries `respawned: true`. `:modern_only` never respawns, and
+  `:prefer_legacy` and `:legacy_only` open with `initialize` as before.
+- `Arbor.MCP.Reliability.CircuitBreaker.call_with_deadline/3` runs an
+  operation that has its own deadline through a breaker without the
+  breaker's per-call `:timeout` cutting it short.
+
 ### Changed
 
 - `jose` `>= 1.11.13` is required and locked. 1.11.13 fixes five advisories:
@@ -51,6 +80,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now fails with `{:initialize_error, error}`** as it does on the other
   transports, instead of `{:transport_connect_failed, "{:http_error, 400,
   ...}"}`.
+- A failed connection attempt whose stdio server cannot be confirmed
+  stopped now fails with `{:cleanup_failed, reason, {:error, cleanup}}`,
+  the shape `Arbor.MCP.Client` already uses for unconfirmed cleanup:
+  `start_link/1` returns
+  `{:error, {:transport_connect_failed, {:cleanup_failed, reason, {:error, cleanup}}}}`.
+  A `:retry_policy` never retries it or the stdio respawn refusal, whatever
+  its `:should_retry?`, and an establishment deadline that runs out at the
+  same time no longer hides either behind `:establish_timeout`, so no new
+  server process starts beside one that may still run.
+- Reconnection could start a stdio server beside one that was never
+  stopped. A health check that gave up on a hung server dropped the
+  connection without closing it, so the old server kept running next to
+  the reconnected one; it is now closed first, off the client loop and
+  within the client's cleanup budget, in a connection scope too. And a
+  reconnect went on after an attempt or teardown whose stdio server could
+  not be confirmed stopped. Now, when the server process's own stop is
+  unconfirmed (a close that runs out of the budget included), the client
+  stops reconnecting, settles in `:disconnected`, emits the new
+  `[:arbor_mcp, :client, :reconnect, :cleanup_unconfirmed]` event with the
+  reason, and `stop/2` returns the cleanup error. Other cleanup failures,
+  such as a reliability component that would not stop, are logged and the
+  client reconnects. To tell those apart, `ReliabilityWrapper.close/1` now
+  reports a component that would not stop as
+  `{:error, {:reliability_cleanup, reason}}`.
+- Over stdio, the modern `server/discover` probe gave a newly spawned server
+  only `:era_probe_timeout` (2 s by default) to start and answer. Under the
+  default `:prefer_modern`, and under `:modern_only`, a server that took
+  longer to start failed to connect, and so did every reconnect to it, with
+  `{:era_probe_failed, {:transport_error, :handshake_timeout}}`: a BEAM
+  started with `mix run`, `npx` or `uvx` on a cold cache, or any server on a
+  loaded host. A slow legacy server's error answer, which `:prefer_modern`
+  falls back on, came too late as well. Over stdio the probe now waits as
+  long as a legacy `initialize` does, `:handshake_timeout` (10 s by
+  default), unless `:era_probe_timeout` is given, and the default
+  `:establish_timeout` counts that bound: `:handshake_timeout` plus the
+  probe's bound, 20 s over stdio. HTTP keeps the 2 s probe and the 12 s
+  default. **Behavior change:** under `:modern_only` a stdio server that
+  never answers now fails after `:handshake_timeout` rather than 2 s, with
+  the same error.
+- A stdio server that wrote part of a frame and then exited was reported
+  like one that exited cleanly, `{:connection_error, {:process_exited,
+  status}}`. Cut-off output is now
+  `{:connection_error, {:unfinished_frame, {:process_exited, status}}}`.
+- Inside the reliability wrapper with a circuit breaker, a receive with its
+  own timeout (the era probe's, `initialize`'s) was cut short at the
+  breaker's 5 s per-call `:timeout`, so a wrapped stdio server slower than
+  that to start still failed. The receive's own timeout now bounds it.
+- The configuration, transport and troubleshooting guides said an HTTP probe
+  timeout never leads to `initialize`. Under the preference modes it is
+  legacy evidence, as MCP 2026-07-28 says, and has been since the modern era
+  landed: each POST stands alone, so a late answer cannot reach the
+  `initialize` that follows. The guides now say so; HTTP behavior is
+  unchanged.
 - An ArborMCP client never received anything on an ArborMCP server's legacy
   Streamable HTTP GET stream: list changes, log messages and progress sent
   there were lost, and a callback's `Server.list_roots/2`, sampling or
