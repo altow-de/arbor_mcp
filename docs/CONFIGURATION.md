@@ -1662,6 +1662,16 @@ Arbor.MCP.Client.start_link(
 )
 ```
 
+Over Streamable HTTP the client stays an HTTP client: each request after
+establishment still POSTs from its own task, so calls run at the same time.
+The circuit breaker admits every POST, from establishment on, and records how
+it ended; an open circuit refuses a request with
+`{:error, %Arbor.MCP.Error.TransportError{reason: :circuit_open}}` before
+anything is sent. A request stream (a request with a progress token) is
+admitted, but its outcome isn't recorded, and receives aren't counted. The
+breaker's `:timeout` doesn't apply over HTTP: each exchange keeps its own
+deadline, the caller's timeout or the transport's `:request_timeout`.
+
 ## Observability
 
 ### Operational telemetry and alerts

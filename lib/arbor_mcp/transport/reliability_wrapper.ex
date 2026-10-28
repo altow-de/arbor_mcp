@@ -316,6 +316,27 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
     end
   end
 
+  @doc false
+  # For a send that its transport makes itself, outside send_message/2 (an
+  # HTTP POST from its own task, see Arbor.MCP.Transport.HTTP): the breaker
+  # admits it here, and report/2 records its outcome. The breaker's per-call
+  # :timeout doesn't apply; the send has its own deadline.
+  @spec admit(t()) :: :ok | {:error, :circuit_open | :circuit_breaker_unavailable}
+  def admit(%__MODULE__{config: %{circuit_breaker_enabled: true}, circuit_breaker_pid: pid}),
+    do: CircuitBreaker.acquire(pid)
+
+  def admit(%__MODULE__{}), do: :ok
+
+  @doc false
+  @spec report(t(), term()) :: :ok
+  def report(
+        %__MODULE__{config: %{circuit_breaker_enabled: true}, circuit_breaker_pid: pid},
+        result
+      ),
+      do: CircuitBreaker.report(pid, result)
+
+  def report(%__MODULE__{}, _result), do: :ok
+
   @doc """
   Gets circuit breaker statistics if enabled.
   """

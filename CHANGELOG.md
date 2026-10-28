@@ -51,6 +51,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Streamable HTTP client started with `reliability:` could not connect,
+  in any `protocol_mode`: the modern probe failed with
+  `{:era_probe_failed, {:unexpected_response, ...}}` and a legacy
+  `initialize` with `Failed to parse handshake response`.
+  `Arbor.MCP.Transport.ReliabilityWrapper` swapped the transport state and
+  the response of every synchronous send, which is fixed for anyone using
+  it directly. A client no longer wraps its HTTP transport: the transport
+  keeps the circuit breaker and health check itself, so each request after
+  establishment POSTs from its own task as without `reliability:`, with the
+  same cancellation and authentication. The breaker admits every POST and
+  records its outcome; a request stream is admitted but its outcome isn't
+  recorded. Its `:timeout` doesn't apply over HTTP, where each exchange
+  keeps its own deadline.
 - An unsupported-version error (`-32022`) lists `supported` as exactly the
   revisions the mount or server accepts, from the same source its request
   validation uses (`Arbor.MCP.Server.RequestContext.accepted_versions/1`), in

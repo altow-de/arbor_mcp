@@ -309,11 +309,18 @@ defmodule Arbor.MCP.Client do
     - `:failure_threshold` - Number of failures before opening (default: 5)
     - `:success_threshold` - Number of successes to close half-open circuit (default: 3)
     - `:reset_timeout` - Time before transitioning from open to half-open (default: 30_000)
-    - `:timeout` - Operation timeout in milliseconds (default: 5_000)
+    - `:timeout` - Operation timeout in milliseconds (default: 5_000); not
+      applied over HTTP, where each exchange keeps its own deadline
   - `:health_check` - Health check configuration or `false` to disable
     - `:check_interval` - Interval between health checks (default: 60_000)
     - `:failure_threshold` - Health check failures before marking unhealthy (default: 3)
     - `:recovery_threshold` - Health check successes before marking healthy (default: 2)
+
+  Over Streamable HTTP the client stays an HTTP client: each request after
+  establishment still POSTs from its own task. The circuit breaker admits
+  every POST and records how it ended; an open circuit refuses a request
+  with a `:circuit_open` transport error before anything is sent. A request
+  stream is admitted, but its outcome isn't recorded.
 
   ## Reliability Examples
 

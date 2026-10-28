@@ -94,7 +94,7 @@ defmodule Arbor.MCP.Transport.HTTP do
   alias Arbor.RPC.LogSummary
 
   alias Arbor.MCP.Protocol.VersionNegotiator
-  alias Arbor.MCP.Transport.{SecurityGuard, SSEClient}
+  alias Arbor.MCP.Transport.{ReliabilityWrapper, SecurityGuard, SSEClient}
 
   alias Arbor.MCP.Transport.HTTP.{
     BoundedClient,
@@ -139,7 +139,11 @@ defmodule Arbor.MCP.Transport.HTTP do
     tool_headers: %{},
     modern_streams: %{},
     sse_deferred_attempted: false,
-    auth_completed: false
+    auth_completed: false,
+    # The circuit breaker and health check a client's `reliability:` option
+    # started, as a ReliabilityWrapper with no wrapped state, or nil (see
+    # attach_reliability/2).
+    reliability: nil
   ]
 
   @type t :: %__MODULE__{
@@ -168,7 +172,8 @@ defmodule Arbor.MCP.Transport.HTTP do
           dns_timeout_ms: pos_integer(),
           dns_resolver: module() | function(),
           allowed_private_hosts: [String.t()],
-          deadline: integer() | nil
+          deadline: integer() | nil,
+          reliability: ReliabilityWrapper.t() | nil
         }
 
   @default_endpoint "/mcp/v1"
@@ -313,7 +318,32 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
+  @doc false
+  # Gives the transport the components of a ReliabilityWrapper that wrapped
+  # it, so a client keeps a bare HTTP transport: every request after
+  # establishment still POSTs from its own task. The breaker then admits each
+  # POST, synchronous or not, and records its outcome; a request stream is
+  # admitted, and its outcome isn't recorded. Its per-call :timeout doesn't
+  # apply: each exchange has its own deadline, the caller's or the
+  # transport's :request_timeout. close/1 stops the components.
+  @spec attach_reliability(t(), ReliabilityWrapper.t()) :: t()
+  def attach_reliability(%__MODULE__{} = state, %ReliabilityWrapper{} = wrapper),
+    do: %{state | reliability: %{wrapper | wrapped_state: nil}}
+
   @impl true
+  def send_message(message, %__MODULE__{reliability: %ReliabilityWrapper{} = reliability} = state) do
+    # A send that goes out from a task of its own is admitted there.
+    if async_send?(state) do
+      async_post(message, state)
+    else
+      with :ok <- ReliabilityWrapper.admit(reliability) do
+        result = send_message(message, %{state | reliability: nil})
+        ReliabilityWrapper.report(reliability, result)
+        reattach(result, reliability)
+      end
+    end
+  end
+
   def send_message(message, %__MODULE__{use_sse: true, sse_pid: nil} = state) do
     # SSE configured but not yet started (pre-initialization).
     # Handle synchronously like non-SSE mode, then start SSE if we get a session ID.
@@ -383,6 +413,17 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
+  defp async_send?(%__MODULE__{use_sse: true, sse_pid: sse_pid}) when is_pid(sse_pid), do: true
+  defp async_send?(%__MODULE__{}), do: false
+
+  defp reattach({:ok, %__MODULE__{} = state}, reliability),
+    do: {:ok, %{state | reliability: reliability}}
+
+  defp reattach({:ok, %__MODULE__{} = state, response}, reliability),
+    do: {:ok, %{state | reliability: reliability}, response}
+
+  defp reattach(error, _reliability), do: error
+
   @doc false
   # Sends `message` synchronously from the calling process, running any
   # authentication its response asks for. The client re-sends a request this
@@ -445,7 +486,7 @@ defmodule Arbor.MCP.Transport.HTTP do
           1_000 -> exit(:client_generation_retired)
         end
 
-        {result, sent_state} = perform_async(message, request_state, parent)
+        {result, sent_state} = admitted_async(message, request_state, parent)
 
         # Report the durable transport-state fields this POST changed
         # (session rotation, SSE metadata) so the client can merge them into
@@ -479,6 +520,27 @@ defmodule Arbor.MCP.Transport.HTTP do
          access_token: request_state.access_token,
          headers: request_state.headers
      }}
+  end
+
+  # The breaker (see attach_reliability/2) admits the POST before it is sent
+  # and records how it ended. A request handed back to be re-sent after
+  # authenticating hasn't ended yet, so it isn't recorded.
+  defp admitted_async(message, %{reliability: nil} = state, parent),
+    do: perform_async(message, state, parent)
+
+  defp admitted_async(message, %{reliability: reliability} = state, parent) do
+    case ReliabilityWrapper.admit(reliability) do
+      :ok ->
+        {result, sent_state} = perform_async(message, state, parent)
+
+        unless match?({:error, {:reauthenticate, _message}}, result),
+          do: ReliabilityWrapper.report(reliability, result)
+
+        {result, sent_state}
+
+      {:error, reason} ->
+        {{:error, reason}, state}
+    end
   end
 
   # A POST task does not authenticate: with several in flight, each would run
@@ -1370,6 +1432,9 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   @impl true
+  def close(%__MODULE__{reliability: %ReliabilityWrapper{} = reliability} = state),
+    do: ReliabilityWrapper.close(%{reliability | wrapped_state: %{state | reliability: nil}})
+
   def close(%__MODULE__{} = state) do
     :telemetry.execute([:arbor_mcp, :transport, :connection, :closed], %{}, %{
       transport: :http,
@@ -1405,6 +1470,13 @@ defmodule Arbor.MCP.Transport.HTTP do
   # client). Modern request streams are started unlinked and monitor their
   # parent instead, and async POST tasks are spawn_monitored.
   @impl true
+  def linked_processes(%__MODULE__{reliability: %ReliabilityWrapper{} = reliability} = state),
+    do:
+      ReliabilityWrapper.linked_processes(%{
+        reliability
+        | wrapped_state: %{state | reliability: nil}
+      })
+
   def linked_processes(%__MODULE__{sse_pid: sse_pid}) when is_pid(sse_pid), do: [sse_pid]
   def linked_processes(%__MODULE__{}), do: []
 
@@ -1474,6 +1546,7 @@ defmodule Arbor.MCP.Transport.HTTP do
     stream_kind = Keyword.get(opts, :stream_kind, :request)
 
     with :ok <- request_within_limit(message, state.max_request_bytes),
+         :ok <- admit_stream(state),
          :ok <- validate_stream_kind(stream_kind),
          :ok <- validate_stream_request_id(request_id, state),
          {:ok, headers} <- sanitize_http_request("POST", url, headers, state),
@@ -1505,6 +1578,11 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   def open_stream(_message, _state, _parent, _opts), do: {:error, :modern_http_stream_required}
+
+  # A stream is admitted by the breaker; it ends long after this returns, so
+  # its outcome isn't recorded (see attach_reliability/2).
+  defp admit_stream(%{reliability: nil}), do: :ok
+  defp admit_stream(%{reliability: reliability}), do: ReliabilityWrapper.admit(reliability)
 
   @doc false
   @spec close_stream(t(), Arbor.MCP.Types.request_id()) :: t()

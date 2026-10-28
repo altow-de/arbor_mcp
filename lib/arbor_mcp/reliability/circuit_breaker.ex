@@ -67,6 +67,28 @@ defmodule Arbor.MCP.Reliability.CircuitBreaker do
     admit(server, fun, fn _config_timeout -> timeout end)
   end
 
+  @doc false
+  # Admission for an operation that runs elsewhere and reports its own
+  # outcome with report/2, such as an HTTP POST from a task of its own. No
+  # execution timeout applies: the operation has its own deadline.
+  @spec acquire(GenServer.server()) ::
+          :ok | {:error, :circuit_open | :circuit_breaker_unavailable}
+  def acquire(server) do
+    case GenServer.call(server, :acquire, 5000) do
+      {:ok, _config_timeout} -> :ok
+      {:error, :circuit_open} = error -> error
+    end
+  catch
+    :exit, _reason -> {:error, :circuit_breaker_unavailable}
+  end
+
+  @doc false
+  # Records the result of an operation acquire/1 admitted, as call/3 records
+  # the result of its function: `{:error, reason}` goes through the error
+  # filter, anything else is a success.
+  @spec report(GenServer.server(), term()) :: :ok
+  def report(server, result), do: GenServer.cast(server, {:report, {:ok, result}})
+
   defp admit(server, fun, execution_timeout) do
     case GenServer.call(server, :acquire, 5000) do
       {:error, :circuit_open} = error ->
