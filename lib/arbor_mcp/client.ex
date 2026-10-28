@@ -50,6 +50,7 @@ defmodule Arbor.MCP.Client do
     Diagnostics,
     EraCache,
     Lifetime,
+    MRTR,
     NotificationListener,
     Pagination,
     RequestHandler,
@@ -635,9 +636,53 @@ defmodule Arbor.MCP.Client do
   - `:max_total_timeout` - With `:reset_timeout_on_progress`, the longest the
     call may take however much progress it makes (default: no limit)
   - `:format` - Return format (:map or :struct, default: :struct)
+  - `:mrtr` - How an MCP 2026-07-28 `input_required` round is answered:
+    `:auto` (default) answers it with the client handler and retries;
+    `:manual` returns it as `{:input_required, %{input_requests: requests,
+    request_state: state}}` for the caller to answer
+  - `:input_responses`, `:request_state` - With `mrtr: :manual`, continue
+    the call with the caller's answers and the round's `request_state`
+  - `:client_capabilities` - With `mrtr: :manual`, the capabilities this one
+    request declares instead of the client's start capabilities
+
+  `Arbor.MCP.Client.Operations.Tools.call_tool/4` lists the other request
+  options. `nil` leaves `:mrtr`, `:input_responses`, `:request_state` and
+  `:client_capabilities` unset.
+
+  ## Forwarding a call
+
+  A client that forwards requests for another client, such as a gateway,
+  lets that client answer each round of the call:
+
+      opts = [mrtr: :manual, client_capabilities: downstream_capabilities]
+
+      case Arbor.MCP.Client.call_tool(client, "deploy", arguments, opts) do
+        {:input_required, %{input_requests: requests, request_state: state}} ->
+          # Ask the downstream client, then continue with the same
+          # arguments and options.
+          answers = ask_downstream(requests)
+          retry = opts ++ [input_responses: answers, request_state: state]
+          Arbor.MCP.Client.call_tool(client, "deploy", arguments, retry)
+
+        other ->
+          other
+      end
+
+  Repeat the arguments, `:client_capabilities`, `:meta` and
+  `:progress_token` on every round of one call: an arbor_mcp server binds
+  `requestState` to them and refuses a round that differs. A round passes
+  the checks automatic MRTR makes, apart from `:max_mrtr_rounds`; the
+  caller runs the rounds. `:input_responses`, `:request_state` and
+  `:client_capabilities` without `mrtr: :manual`, or on a connection that
+  settled on a legacy revision, return
+  `{:error, %Arbor.MCP.Error.ValidationError{}}`. See "Forwarding clients"
+  in the configuration guide for the full contract. `read_resource/3` and
+  `get_prompt/4` take the same options.
   """
   @spec call_tool(t(), String.t(), map(), keyword() | timeout()) ::
-          {:ok, Arbor.MCP.Response.t() | map()} | {:error, term()}
+          {:ok, Arbor.MCP.Response.t() | map()}
+          | {:error, term()}
+          | {:input_required, Arbor.MCP.Client.Types.input_required()}
   def call_tool(client, tool_name, arguments, timeout_or_opts \\ 30_000)
 
   def call_tool(client, tool_name, arguments, timeout) when is_integer(timeout) do
@@ -698,7 +743,10 @@ defmodule Arbor.MCP.Client do
   Use `call_content/4` when content extraction and tool-error normalization
   are intended. This alias never adopts the legacy root facade's extraction.
   """
-  @spec call(t(), String.t(), map(), keyword()) :: {:ok, any()} | {:error, any()}
+  @spec call(t(), String.t(), map(), keyword()) ::
+          {:ok, any()}
+          | {:error, any()}
+          | {:input_required, Arbor.MCP.Client.Types.input_required()}
   def call(client, tool_name, args \\ %{}, opts \\ []) do
     call_tool(client, tool_name, args, opts)
   end
@@ -777,9 +825,16 @@ defmodule Arbor.MCP.Client do
 
   @doc """
   Reads a resource by URI. Takes `:cache_mode`, as `list_tools/2` does.
+
+  With `mrtr: :manual`, an MCP 2026-07-28 `input_required` round comes back
+  as `{:input_required, %{input_requests: ..., request_state: ...}}`, and
+  `:input_responses`, `:request_state` and `:client_capabilities` apply as
+  described in "Forwarding a call" under `call_tool/4`.
   """
   @spec read_resource(t(), String.t(), keyword() | timeout()) ::
-          {:ok, Arbor.MCP.Response.t() | map()} | {:error, term()}
+          {:ok, Arbor.MCP.Response.t() | map()}
+          | {:error, term()}
+          | {:input_required, Arbor.MCP.Client.Types.input_required()}
   def read_resource(client, uri, timeout_or_opts \\ [])
 
   def read_resource(client, uri, timeout) when is_integer(timeout) do
@@ -984,9 +1039,16 @@ defmodule Arbor.MCP.Client do
 
   @doc """
   Gets a prompt with the given arguments.
+
+  With `mrtr: :manual`, an MCP 2026-07-28 `input_required` round comes back
+  as `{:input_required, %{input_requests: ..., request_state: ...}}`, and
+  `:input_responses`, `:request_state` and `:client_capabilities` apply as
+  described in "Forwarding a call" under `call_tool/4`.
   """
   @spec get_prompt(t(), String.t(), map(), keyword() | timeout()) ::
-          {:ok, Arbor.MCP.Response.t() | map()} | {:error, term()}
+          {:ok, Arbor.MCP.Response.t() | map()}
+          | {:error, term()}
+          | {:input_required, Arbor.MCP.Client.Types.input_required()}
   def get_prompt(client, prompt_name, arguments \\ %{}, timeout_or_opts \\ [])
 
   def get_prompt(client, prompt_name, arguments, timeout) when is_integer(timeout) do
@@ -1567,6 +1629,15 @@ defmodule Arbor.MCP.Client do
   def handle_call({:fulfill_mrtr, input_requests, opts, scope_ref}, from, state)
       when is_map(input_requests) and is_list(opts) do
     RequestHandler.handle_mrtr_fulfillment(input_requests, opts, scope_ref, from, state)
+  end
+
+  # A round the caller answers itself (`mrtr: :manual`) is checked against
+  # the era and the capabilities the request declared: `capabilities` from
+  # its `client_capabilities:`, or nil for the client's start capabilities.
+  def handle_call({:check_manual_mrtr, input_requests, capabilities}, _from, state)
+      when is_map(input_requests) do
+    capabilities = capabilities || Keyword.get(state.transport_opts, :capabilities, %{})
+    {:reply, MRTR.check_manual_round(input_requests, state.protocol_version, capabilities), state}
   end
 
   def handle_call({:open_subscription, subscription_pid, filter}, _from, state) do

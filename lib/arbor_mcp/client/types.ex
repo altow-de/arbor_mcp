@@ -25,6 +25,10 @@ defmodule Arbor.MCP.Client.Types do
           | {:idempotency_key, String.t()}
           | {:idempotency_key_path, String.t() | [String.t()]}
           | {:cursor, String.t()}
+          | {:mrtr, :auto | :manual | nil}
+          | {:input_responses, %{optional(String.t()) => map()} | nil}
+          | {:request_state, String.t() | nil}
+          | {:client_capabilities, map() | nil}
           | {atom(), term()}
   @type request_opts :: [request_option()]
 
@@ -32,6 +36,25 @@ defmodule Arbor.MCP.Client.Types do
   Standard MCP response format - either success with data or error with reason.
   """
   @type mcp_response :: {:ok, any()} | {:error, any()}
+
+  @typedoc """
+  An MRTR round returned to the caller by `mrtr: :manual` (MCP 2026-07-28):
+  the server's validated `inputRequests`, keyed by their ids, and its opaque
+  `requestState`, if any. The caller answers the input requests and passes
+  the answers back with `input_responses:` and the state with
+  `request_state:` on the next round of the same call.
+  """
+  @type input_required :: %{
+          input_requests: %{optional(String.t()) => map()},
+          request_state: String.t() | nil
+        }
+
+  @typedoc """
+  The result of an operation that can pause for input (`tools/call`,
+  `resources/read`, `prompts/get`): with `mrtr: :manual`, a round can come
+  back as `{:input_required, round}` instead of `{:ok, result}`.
+  """
+  @type mrtr_response :: mcp_response() | {:input_required, input_required()}
 
   @typedoc """
   MCP method name used in requests.

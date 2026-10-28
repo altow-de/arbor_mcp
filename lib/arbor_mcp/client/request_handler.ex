@@ -63,10 +63,15 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
   # A result the server said is still fresh is answered without asking it
   # again (see ResponseCache), unless the call asked to refresh or bypass it.
-  # Only while connected: a disconnected client says so.
+  # Only while connected: a disconnected client says so. A legacy request
+  # with options only 2026-07-28 defines is refused (see send_built_request/6),
+  # not answered.
   defp cached_result(method, params, meta, state) do
     with :use <- Map.get(meta, :cache_mode, :use),
          :ready <- Map.get(state, :connection_status),
+         true <-
+           Map.get(meta, :modern_options, []) == [] or
+             VersionRegistry.modern?(Map.get(state, :protocol_version)),
          %ResponseCache{} = cache <- Map.get(state, :response_cache),
          {:ok, result} <- ResponseCache.lookup(cache, ResponseCache.key(method, params), now()) do
       :telemetry.execute([:arbor_mcp, :client, :cache, :hit], %{}, %{method: method})
@@ -223,9 +228,26 @@ defmodule Arbor.MCP.Client.RequestHandler do
   defp retryable_subscription_stream_close?(_reason), do: true
 
   defp send_built_request(method, params, id, from, state, timeout_meta) do
-    case build_request(method, params, id, state) do
+    request_opts = [
+      client_capabilities: Map.get(timeout_meta, :client_capabilities),
+      modern_options: Map.get(timeout_meta, :modern_options, [])
+    ]
+
+    case build_request(method, params, id, state, request_opts) do
       {:ok, request} ->
         send_request(request, method, id, from, state, timeout_meta)
+
+      # Decided here, against the era the connection settled on, so the check
+      # and the request it guards see the same state.
+      {:error, {:modern_only_option, option}} ->
+        {:reply,
+         {:error,
+          Error.validation_error(
+            option,
+            nil,
+            "requires MCP 2026-07-28, but the connection settled on " <>
+              (state.protocol_version || "no protocol revision")
+          )}, state}
 
       {:error, reason} ->
         {:reply,
@@ -1523,8 +1545,8 @@ defmodule Arbor.MCP.Client.RequestHandler do
     |> Maps.put_present("id", id)
   end
 
-  defp build_request(method, params, id, state) do
-    with {:ok, params} <- RequestParams.for_request(params || %{}, state) do
+  defp build_request(method, params, id, state, opts \\ []) do
+    with {:ok, params} <- RequestParams.for_request(params || %{}, state, opts) do
       {:ok, build_request(method, params, id)}
     end
   end

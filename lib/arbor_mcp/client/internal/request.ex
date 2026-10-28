@@ -1,5 +1,6 @@
 defmodule Arbor.MCP.Client.Internal.Request do
   @moduledoc false
+  alias Arbor.MCP.Client.Internal.ManualMRTR
   alias Arbor.MCP.Client.MRTR
   alias Arbor.MCP.Error
   alias Arbor.MCP.Protocol.ErrorCodes
@@ -33,8 +34,12 @@ defmodule Arbor.MCP.Client.Internal.Request do
   #   still detects a dead client).
   # - The default retry policy is only fetched (one extra call) after a
   #   failed first attempt, so successful requests never pay for it.
+  #
+  # With `mrtr: :manual` an input_required round comes back as
+  # `{:input_required, %{input_requests: ..., request_state: ...}}` (see
+  # ManualMRTR).
   @spec make_request(Arbor.MCP.Client.t(), String.t(), map(), keyword(), pos_integer()) ::
-          {:ok, any()} | {:error, any()}
+          {:ok, any()} | {:error, any()} | {:input_required, ManualMRTR.input_required()}
   @spec make_request(
           Arbor.MCP.Client.t(),
           String.t(),
@@ -43,25 +48,25 @@ defmodule Arbor.MCP.Client.Internal.Request do
           pos_integer(),
           integer() | nil
         ) ::
-          {:ok, any()} | {:error, any()}
+          {:ok, any()} | {:error, any()} | {:input_required, ManualMRTR.input_required()}
   def make_request(client, method, params, opts, default_timeout, deadline_cap \\ nil) do
     validate_options!(opts)
     stream_retry_mode = Keyword.get(opts, :http_stream_retry, :at_least_once)
 
-    case validate_http_stream_retry_mode(client, stream_retry_mode) do
-      :ok ->
-        do_make_request(
-          client,
-          method,
-          params,
-          opts,
-          default_timeout,
-          stream_retry_mode,
-          deadline_cap
-        )
-
-      {:error, _reason} = error ->
-        handle_request_result(error, opts)
+    with :ok <- validate_http_stream_retry_mode(client, stream_retry_mode),
+         {:ok, params, request_meta} <- ManualMRTR.prepare(method, params, opts) do
+      do_make_request(
+        client,
+        method,
+        params,
+        opts,
+        default_timeout,
+        stream_retry_mode,
+        deadline_cap,
+        request_meta
+      )
+    else
+      {:error, _reason} = error -> handle_request_result(error, opts)
     end
   end
 
@@ -69,6 +74,8 @@ defmodule Arbor.MCP.Client.Internal.Request do
     validate_option!(opts, :format, [:map, :struct], ":map or :struct")
     validate_option!(opts, :cache_mode, [:use, :refresh, :bypass], ":use, :refresh or :bypass")
     validate_option!(opts, :reset_timeout_on_progress, [true, false], "a boolean")
+    # `nil` leaves it unset, as for the forwarding options (see ManualMRTR).
+    validate_option!(opts, :mrtr, [nil, :auto, :manual], ":auto or :manual")
 
     for key <- [:timeout, :max_total_timeout], Keyword.has_key?(opts, key) do
       case Keyword.fetch!(opts, key) do
@@ -97,7 +104,8 @@ defmodule Arbor.MCP.Client.Internal.Request do
          opts,
          default_timeout,
          stream_retry_mode,
-         deadline_cap
+         deadline_cap,
+         request_meta
        ) do
     started_at = System.monotonic_time(:millisecond)
     explicit_timeout = Keyword.get(opts, :timeout)
@@ -105,7 +113,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
     scope_ref = make_ref()
     # What the client process reads from each round's request besides its
     # timeout (see RequestHandler.handle_request/5).
-    request_meta = %{cache_mode: Keyword.get(opts, :cache_mode, :use)}
+    request_meta = Map.put(request_meta, :cache_mode, Keyword.get(opts, :cache_mode, :use))
 
     progress_timeout = progress_timeout(client, opts, default_timeout)
     params = if progress_timeout, do: ensure_progress_token(params), else: params
@@ -165,7 +173,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
                 request_meta: request_meta
               }
 
-              continue_mrtr(
+              handle_input_required(
                 client,
                 method,
                 params,
@@ -218,7 +226,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
          ) do
       {:ok, result} = complete_or_extension ->
         if MRTR.input_required?(result) do
-          continue_mrtr(
+          handle_input_required(
             client,
             method,
             original_params,
@@ -234,6 +242,34 @@ defmodule Arbor.MCP.Client.Internal.Request do
 
       other ->
         other
+    end
+  end
+
+  # With `mrtr: :manual` the caller answers the round itself; otherwise the
+  # client handler does.
+  defp handle_input_required(
+         client,
+         method,
+         original_params,
+         result,
+         opts,
+         retry_policy,
+         round,
+         control
+       ) do
+    if ManualMRTR.manual?(opts) do
+      ManualMRTR.input_required(client, method, result, opts, control.deadline)
+    else
+      continue_mrtr(
+        client,
+        method,
+        original_params,
+        result,
+        opts,
+        retry_policy,
+        round,
+        control
+      )
     end
   end
 

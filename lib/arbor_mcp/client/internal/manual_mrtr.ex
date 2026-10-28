@@ -1,0 +1,240 @@
+defmodule Arbor.MCP.Client.Internal.ManualMRTR do
+  @moduledoc false
+  # Request options for a client that forwards a request for another client,
+  # such as a gateway, which must leave each MRTR round to that client:
+  #
+  # - `mrtr: :manual` returns a validated `input_required` round to the caller
+  #   as `{:input_required, %{input_requests: ..., request_state: ...}}`
+  #   instead of answering it with the client handler.
+  # - `input_responses:` and `request_state:` continue the call on its next
+  #   round (`tools/call`, `resources/read` and `prompts/get`).
+  # - `client_capabilities:` replaces the start capabilities in this one
+  #   request's `_meta`, so the server chooses its input requests from what
+  #   the downstream client declared.
+  #
+  # The continuation and the capabilities need `mrtr: :manual`: under
+  # automatic MRTR the client's own handler would answer a round that was
+  # chosen for capabilities it may not have. They also need a 2026-07-28
+  # connection, which the client process decides when it builds the request
+  # (see Arbor.MCP.Internal.RequestParams.for_request/3). `nil` leaves any of
+  # these options unset, so a forwarding caller can pass the values it got
+  # from downstream without filtering them first.
+  #
+  # The values are usually the downstream client's data, so a malformed one
+  # is an `{:error, %Arbor.MCP.Error.ValidationError{}}`, not a raise. The
+  # error leaves out input responses and request state, which may hold the
+  # user's answers or a resumable token.
+
+  alias Arbor.MCP.Client.MRTR
+  alias Arbor.MCP.Error
+
+  @mrtr_methods ["tools/call", "resources/read", "prompts/get"]
+
+  # Capabilities whose value the 2026-07-28 schema defines as an object, with
+  # the members (or, for :all, every member) that must be objects too.
+  @capability_objects %{
+    "elicitation" => ["form", "url"],
+    "sampling" => ["context", "tools"],
+    "roots" => [],
+    "experimental" => :all,
+    "extensions" => :all
+  }
+
+  @type input_required :: Arbor.MCP.Client.Types.input_required()
+
+  @spec manual?(keyword()) :: boolean()
+  def manual?(opts), do: Keyword.get(opts, :mrtr) == :manual
+
+  # Validates the options, puts the continuation on the request, and returns
+  # the entries the client process applies when it builds the request:
+  # `:client_capabilities`, and `:modern_options`, the options that only a
+  # 2026-07-28 request can carry. A request without these options gets none.
+  # Params pass through unchanged when no continuation is set, whatever
+  # they are; Request.make_request/6 keeps its own handling of them.
+  @spec prepare(String.t(), term(), keyword()) ::
+          {:ok, term(), map()} | {:error, Exception.t()}
+  def prepare(method, params, opts) do
+    set = set_options(opts)
+
+    with :ok <- require_manual(set, opts),
+         :ok <- require_mrtr_method(set, method),
+         :ok <- validate_input_responses(Keyword.get(set, :input_responses), opts),
+         :ok <- validate_request_state(Keyword.get(set, :request_state)),
+         :ok <- validate_capabilities(Keyword.get(set, :client_capabilities)) do
+      params =
+        params
+        |> put_present("inputResponses", Keyword.get(set, :input_responses))
+        |> put_present("requestState", Keyword.get(set, :request_state))
+
+      {:ok, params, request_meta(set)}
+    end
+  end
+
+  # Returns a round the caller answers itself, after the same checks that
+  # automatic MRTR makes before it calls the handler: the result's shape and
+  # the `:max_input_requests` and `:max_mrtr_bytes` limits here, then the era
+  # and the declared capabilities in the client process. `:max_mrtr_rounds`
+  # doesn't apply: the caller runs the rounds.
+  @spec input_required(GenServer.server(), String.t(), map(), keyword(), integer()) ::
+          {:input_required, input_required()} | {:error, term()}
+  def input_required(client, method, result, opts, deadline) do
+    with {:ok, input_requests, request_state} <- MRTR.validate_result(method, result, opts),
+         :ok <-
+           check_round(client, input_requests, Keyword.get(opts, :client_capabilities), deadline) do
+      {:input_required, %{input_requests: input_requests, request_state: request_state}}
+    end
+  end
+
+  defp check_round(client, input_requests, capabilities, deadline) do
+    case deadline - System.monotonic_time(:millisecond) do
+      remaining when remaining > 0 ->
+        GenServer.call(client, {:check_manual_mrtr, input_requests, capabilities}, remaining)
+
+      _expired ->
+        {:error, :timeout}
+    end
+  catch
+    :exit, {:timeout, _call} -> {:error, :timeout}
+  end
+
+  defp set_options(opts) do
+    [:input_responses, :request_state, :client_capabilities]
+    |> Enum.map(&{&1, Keyword.get(opts, &1)})
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp require_manual([], _opts), do: :ok
+
+  defp require_manual([{key, _value} | _rest], opts) do
+    if manual?(opts),
+      do: :ok,
+      else: {:error, Error.validation_error(key, nil, "requires mrtr: :manual")}
+  end
+
+  defp require_mrtr_method(set, method) do
+    case Keyword.take(set, [:input_responses, :request_state]) do
+      [{key, _value} | _rest] when method not in @mrtr_methods ->
+        {:error,
+         Error.validation_error(
+           key,
+           nil,
+           "is only valid for " <> Enum.join(@mrtr_methods, ", ") <> ", not #{method}"
+         )}
+
+      _valid ->
+        :ok
+    end
+  end
+
+  defp validate_input_responses(nil, _opts), do: :ok
+
+  # The same byte limit that automatic MRTR puts on the handler's responses.
+  defp validate_input_responses(responses, opts) when is_map(responses) do
+    maximum = MRTR.max_bytes(opts)
+
+    if Enum.all?(responses, &response_entry?/1) do
+      case Jason.encode(responses) do
+        {:ok, encoded} when byte_size(encoded) <= maximum ->
+          :ok
+
+        {:ok, _encoded} ->
+          invalid_responses("exceed the MRTR byte limit of #{maximum} (:max_mrtr_bytes)")
+
+        {:error, _reason} ->
+          invalid_responses("must be JSON encodable")
+      end
+    else
+      invalid_responses("must map input request ids to response objects")
+    end
+  end
+
+  defp validate_input_responses(_responses, _opts),
+    do: invalid_responses("must map input request ids to response objects")
+
+  defp response_entry?({id, response}),
+    do: is_binary(id) and byte_size(id) > 0 and is_map(response)
+
+  defp invalid_responses(reason),
+    do: {:error, Error.validation_error(:input_responses, nil, reason)}
+
+  defp validate_request_state(nil), do: :ok
+  defp validate_request_state(state) when is_binary(state), do: :ok
+
+  defp validate_request_state(_state),
+    do: {:error, Error.validation_error(:request_state, nil, "must be a string")}
+
+  defp validate_capabilities(nil), do: :ok
+
+  defp validate_capabilities(capabilities) when is_map(capabilities) do
+    cond do
+      not Enum.all?(capabilities, &capability_entry?/1) ->
+        invalid_capabilities(
+          capabilities,
+          "must be a capabilities object whose known capabilities are objects"
+        )
+
+      not match?({:ok, _encoded}, Jason.encode(capabilities)) ->
+        invalid_capabilities(capabilities, "must be JSON encodable")
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_capabilities(capabilities),
+    do: invalid_capabilities(capabilities, "must be a capabilities object")
+
+  defp capability_entry?({key, value}) when is_atom(key) and not is_nil(key),
+    do: capability_entry?({Atom.to_string(key), value})
+
+  defp capability_entry?({key, value}) when is_binary(key) and byte_size(key) > 0 do
+    case Map.fetch(@capability_objects, key) do
+      :error -> true
+      {:ok, _members} when not is_map(value) -> false
+      {:ok, :all} -> Enum.all?(value, fn {_member, setting} -> is_map(setting) end)
+      {:ok, members} -> Enum.all?(members, &object_member?(value, &1))
+    end
+  end
+
+  defp capability_entry?(_entry), do: false
+
+  defp object_member?(value, member) do
+    case member_value(value, member) do
+      :error -> true
+      {:ok, setting} -> is_map(setting)
+    end
+  end
+
+  defp member_value(map, member) do
+    with :error <- Map.fetch(map, member) do
+      Enum.find_value(map, :error, fn
+        {key, setting} when is_atom(key) and not is_nil(key) ->
+          if Atom.to_string(key) == member, do: {:ok, setting}
+
+        _other ->
+          nil
+      end)
+    end
+  end
+
+  defp invalid_capabilities(capabilities, reason),
+    do: {:error, Error.validation_error(:client_capabilities, capabilities, reason)}
+
+  defp request_meta(set) do
+    case Keyword.keys(set) do
+      [] ->
+        %{}
+
+      modern_options ->
+        meta = %{modern_options: modern_options}
+
+        case Keyword.fetch(set, :client_capabilities) do
+          {:ok, capabilities} -> Map.put(meta, :client_capabilities, capabilities)
+          :error -> meta
+        end
+    end
+  end
+
+  defp put_present(params, _key, nil), do: params
+  defp put_present(params, key, value), do: Map.put(params, key, value)
+end
