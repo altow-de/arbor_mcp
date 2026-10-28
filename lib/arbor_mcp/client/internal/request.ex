@@ -55,6 +55,8 @@ defmodule Arbor.MCP.Client.Internal.Request do
 
     with :ok <- validate_http_stream_retry_mode(client, stream_retry_mode),
          {:ok, params, request_meta} <- ManualMRTR.prepare(method, params, opts) do
+      {params, request_meta} = with_progress_to(params, request_meta, opts)
+
       do_make_request(
         client,
         method,
@@ -70,12 +72,26 @@ defmodule Arbor.MCP.Client.Internal.Request do
     end
   end
 
+  # `progress_to: pid` also sends the request's progress to `pid` (see
+  # RequestHandler.deliver_progress/3). Progress names its request only by
+  # token, so such a request carries one; under automatic MRTR every round
+  # repeats it, and manual MRTR requires the caller's own (see ManualMRTR).
+  defp with_progress_to(params, request_meta, opts) do
+    case Keyword.get(opts, :progress_to) do
+      nil -> {params, request_meta}
+      pid -> {ensure_progress_token(params), Map.put(request_meta, :progress_to, pid)}
+    end
+  end
+
   defp validate_options!(opts) do
     validate_option!(opts, :format, [:map, :struct], ":map or :struct")
     validate_option!(opts, :cache_mode, [:use, :refresh, :bypass], ":use, :refresh or :bypass")
     validate_option!(opts, :reset_timeout_on_progress, [true, false], "a boolean")
     # `nil` leaves it unset, as for the forwarding options (see ManualMRTR).
     validate_option!(opts, :mrtr, [nil, :auto, :manual], ":auto or :manual")
+
+    unless is_nil(opts[:progress_to]) or is_pid(opts[:progress_to]),
+      do: raise(ArgumentError, "progress_to must be a pid")
 
     for key <- [:timeout, :max_total_timeout], Keyword.has_key?(opts, key) do
       case Keyword.fetch!(opts, key) do

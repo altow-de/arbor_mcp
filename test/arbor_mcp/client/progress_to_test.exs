@@ -1,0 +1,637 @@
+defmodule Arbor.MCP.Client.ProgressToTest do
+  # `progress_to: pid` also sends a request's progress to `pid`, as
+  # `{:arbor_mcp_progress, client, progress_token, params}`, so a process that
+  # forwards the request for another client, such as a gateway, can relay it.
+  #
+  # The first part runs against arbor_mcp servers over every transport that
+  # carries progress: modern and legacy Streamable HTTP (a Runtime-mounted
+  # HttpPlug on Bandit), stdio, BEAM and the in-process test transport. The
+  # second part scripts the server's messages to pin down when the client
+  # delivers.
+  use ExUnit.Case, async: true
+
+  alias Arbor.MCP.Client
+  alias Arbor.MCP.Client.RequestHandler
+  alias Arbor.MCP.Error.ValidationError
+  alias Arbor.MCP.Server.{Context, HandlerServer, Runtime}
+
+  @key :binary.copy(<<9>>, 32)
+  @fixture Path.expand("../../../priv/test/progress_stdio_server.exs", __DIR__)
+  @project_root Path.expand("../../..", __DIR__)
+  @form %{"elicitation" => %{"form" => %{}}}
+
+  defmodule AppHandler do
+    use Arbor.MCP.Server.Handler
+
+    @name_schema %{"type" => "object", "properties" => %{"name" => %{"type" => "string"}}}
+
+    @impl true
+    def init(opts), do: {:ok, %{owner: Keyword.fetch!(opts, :owner)}}
+
+    @impl true
+    def handle_list_tools(_cursor, state) do
+      tools =
+        for name <- ~w(steps held ask),
+            do: %{name: name, description: name, inputSchema: %{"type" => "object"}}
+
+      {:ok, tools, nil, state}
+    end
+
+    @impl true
+    def handle_call_tool("steps", _arguments, state) do
+      results = for step <- 1..2, do: Context.report_progress(step, 2, "step #{step}")
+      {:ok, %{content: [%{type: "text", text: inspect(results)}]}, state}
+    end
+
+    # Reports once, then waits for the test, so two calls are in flight at
+    # the same time.
+    def handle_call_tool("held", _arguments, state) do
+      :ok = Context.report_progress(1, 2)
+      send(state.owner, {:held, self(), Context.progress_token()})
+
+      receive do
+        :release -> :ok
+      after
+        5_000 -> :ok
+      end
+
+      :ok = Context.report_progress(2, 2)
+      {:ok, %{content: [%{type: "text", text: "released"}]}, state}
+    end
+
+    # Reports progress on each MRTR round.
+    def handle_call_tool("ask", _arguments, state) do
+      case Context.input_responses() do
+        nil ->
+          :ok = Context.report_progress(1, 2, "asking")
+
+          request = %{
+            "method" => "elicitation/create",
+            "params" => %{"message" => "Name?", "requestedSchema" => @name_schema}
+          }
+
+          {:input_required, %{"name" => request}, %{"step" => 1}, state}
+
+        %{"name" => %{"content" => %{"name" => name}}} ->
+          :ok = Context.report_progress(2, 2, "answered")
+          {:ok, %{content: [%{type: "text", text: "Welcome, #{name}"}]}, state}
+      end
+    end
+  end
+
+  # The gateway from "Forwarding clients" in docs/CONFIGURATION.md, as it
+  # stands there: it relays the upstream progress to its downstream client.
+  defmodule GatewayHandler do
+    use Arbor.MCP.Server.Handler
+
+    alias Arbor.MCP.Server.Context
+
+    @impl true
+    def init(opts), do: {:ok, %{upstream: Keyword.fetch!(opts, :upstream)}}
+
+    @impl true
+    def handle_list_tools(_cursor, state),
+      do: {:ok, [%{name: "ask", inputSchema: %{"type" => "object"}}], nil, state}
+
+    @impl true
+    def handle_call_tool(name, arguments, state) do
+      sealed = Context.request_state() || %{}
+      # One upstream progress token for every round of this call.
+      token =
+        sealed["token"] || "gateway-" <> Integer.to_string(System.unique_integer([:positive]))
+
+      callback = self()
+
+      opts = [
+        mrtr: :manual,
+        # What the downstream client declared for this request.
+        client_capabilities: Context.current().client_capabilities,
+        # nil on the first round; the downstream answers on its retry.
+        input_responses: Context.input_responses(),
+        request_state: sealed["upstream"],
+        progress_token: token,
+        progress_to: callback,
+        format: :map
+      ]
+
+      task =
+        Task.async(fn -> Arbor.MCP.Client.call_tool(state.upstream, name, arguments, opts) end)
+
+      case relay_progress(task, state.upstream, token) do
+        {:input_required, %{input_requests: requests, request_state: upstream}} ->
+          {:input_required, requests, %{"upstream" => upstream, "token" => token}, state}
+
+        {:ok, result} ->
+          {:ok, result, state}
+
+        {:error, reason} ->
+          {:error, reason, state}
+      end
+    end
+
+    defp relay_progress(%Task{ref: ref} = task, upstream, token) do
+      receive do
+        {:arbor_mcp_progress, ^upstream, ^token, %{"progress" => progress} = params} ->
+          _ = Context.report_progress(progress, params["total"], params["message"])
+          relay_progress(task, upstream, token)
+
+        {^ref, result} ->
+          Process.demonitor(ref, [:flush])
+          result
+      end
+    end
+  end
+
+  defmodule Recorder do
+    @behaviour Arbor.MCP.Client.Handler
+
+    @impl true
+    def init(opts), do: {:ok, %{owner: Keyword.fetch!(opts, :owner)}}
+
+    @impl true
+    def handle_ping(state), do: {:ok, %{}, state}
+
+    @impl true
+    def handle_list_roots(state), do: {:ok, [], state}
+
+    @impl true
+    def handle_create_message(_params, state), do: {:error, "not used", state}
+
+    @impl true
+    def handle_elicitation_create(_message, _schema, state),
+      do: {:ok, %{"action" => "accept", "content" => %{"name" => "Lin"}}, state}
+
+    @impl true
+    def handle_progress(_request_id, params, state) do
+      send(state.owner, {:handler_progress, params})
+      {:ok, state}
+    end
+  end
+
+  # Keeps every request pending and reports what it was sent; the test sends
+  # the server's messages itself.
+  defmodule PendingTransport do
+    def send_message(encoded, state) do
+      send(state.owner, {:wire, Jason.decode!(encoded)})
+      {:ok, state}
+    end
+  end
+
+  @transports [
+    {:http, :modern_only, []},
+    {:http, :legacy_only, [use_sse: false]},
+    {:http, :legacy_only, [use_sse: true]},
+    {:stdio, :modern_only, []},
+    {:stdio, :legacy_only, []},
+    {:beam, :modern_only, []},
+    {:beam, :legacy_only, []},
+    {:test, :modern_only, []},
+    {:test, :legacy_only, []}
+  ]
+
+  describe "delivery over each transport" do
+    for {transport, mode, opts} <- @transports do
+      test "#{transport}, #{mode}#{if opts == [], do: "", else: ", " <> inspect(opts)}" do
+        client = connect(unquote(transport), unquote(mode), unquote(opts))
+
+        assert {:ok, %{"content" => [%{"text" => "[:ok, :ok]"}]}} =
+                 Client.call_tool(client, "steps", %{},
+                   progress_to: self(),
+                   progress_token: "job-1",
+                   timeout: 10_000,
+                   format: :map
+                 )
+
+        assert_receive {:arbor_mcp_progress, ^client, "job-1",
+                        %{"progressToken" => "job-1", "progress" => 1, "total" => 2} = first}
+
+        assert first["message"] == "step 1"
+        assert_receive {:arbor_mcp_progress, ^client, "job-1", %{"progress" => 2}}
+
+        # Alongside the client handler, not instead of it.
+        assert_receive {:handler_progress, %{"progressToken" => "job-1", "progress" => 1}}
+        assert_receive {:handler_progress, %{"progressToken" => "job-1", "progress" => 2}}
+        refute_received {:arbor_mcp_progress, _client, _token, _params}
+      end
+    end
+  end
+
+  describe "against an arbor_mcp server" do
+    test "a request without a progress token gets one" do
+      client = connect(:test, :modern_only)
+
+      assert {:ok, _result} =
+               Client.call_tool(client, "steps", %{}, progress_to: self(), format: :map)
+
+      assert_receive {:arbor_mcp_progress, ^client, "progress-" <> _ = token,
+                      %{"progressToken" => token, "progress" => 1}}
+
+      assert_receive {:arbor_mcp_progress, ^client, ^token, %{"progress" => 2}}
+    end
+
+    test "a dead target misses the progress, and the request goes on" do
+      client = connect(:test, :legacy_only)
+      target = spawn(fn -> :ok end)
+      ref = Process.monitor(target)
+      assert_receive {:DOWN, ^ref, :process, ^target, _reason}
+
+      assert {:ok, %{"content" => [%{"text" => "[:ok, :ok]"}]}} =
+               Client.call_tool(client, "steps", %{},
+                 progress_to: target,
+                 progress_token: "lost",
+                 format: :map
+               )
+
+      assert_receive {:handler_progress, %{"progressToken" => "lost", "progress" => 2}}
+      assert {:ok, _pong} = Client.ping(client)
+    end
+
+    for {transport, mode} <- [{:http, :modern_only}, {:test, :legacy_only}] do
+      test "concurrent requests reach their own targets (#{transport}, #{mode})" do
+        client = connect(unquote(transport), unquote(mode))
+
+        calls =
+          for name <- ["a", "b"] do
+            Task.async(fn ->
+              result =
+                Client.call_tool(client, "held", %{},
+                  progress_to: self(),
+                  progress_token: name,
+                  timeout: 10_000,
+                  format: :map
+                )
+
+              {name, result, drain_progress()}
+            end)
+          end
+
+        # Both are in flight at once before either is released.
+        workers =
+          for _call <- calls do
+            assert_receive {:held, worker, token}, 5_000
+            {token, worker}
+          end
+
+        assert workers |> Enum.map(&elem(&1, 0)) |> Enum.sort() == ["a", "b"]
+        Enum.each(workers, fn {_token, worker} -> send(worker, :release) end)
+
+        for {name, result, progress} <- Task.await_many(calls, 10_000) do
+          assert {:ok, %{"content" => [%{"text" => "released"}]}} = result
+          assert [{^client, ^name, 1}, {^client, ^name, 2}] = progress
+        end
+      end
+    end
+
+    test "automatic MRTR rounds share one generated token, and each round reports" do
+      client = connect(:http, :modern_only)
+
+      assert {:ok, %{"content" => [%{"text" => "Welcome, Lin"}]}} =
+               Client.call_tool(client, "ask", %{}, progress_to: self(), format: :map)
+
+      assert_receive {:arbor_mcp_progress, ^client, token, %{"message" => "asking"}}
+      assert_receive {:arbor_mcp_progress, ^client, ^token, %{"message" => "answered"}}
+    end
+
+    test "manual MRTR rounds repeat the caller's token, and each round reports" do
+      client = connect(:http, :modern_only)
+      round = [mrtr: :manual, progress_to: self(), progress_token: "up-1", format: :map]
+
+      assert {:input_required, %{request_state: state}} =
+               Client.call_tool(client, "ask", %{}, round)
+
+      assert_receive {:arbor_mcp_progress, ^client, "up-1", %{"message" => "asking"}}
+
+      answers = %{"name" => %{"action" => "accept", "content" => %{"name" => "Tom"}}}
+
+      assert {:ok, %{"content" => [%{"text" => "Welcome, Tom"}]}} =
+               Client.call_tool(
+                 client,
+                 "ask",
+                 %{},
+                 round ++ [input_responses: answers, request_state: state]
+               )
+
+      assert_receive {:arbor_mcp_progress, ^client, "up-1", %{"message" => "answered"}}
+    end
+  end
+
+  describe "a gateway" do
+    for mode <- [:modern_only, :legacy_only] do
+      test "relays the upstream progress of every round to its downstream client (#{mode})" do
+        upstream = connect(:http, :modern_only)
+
+        gateway =
+          start_supervised!(
+            {HandlerServer,
+             handler: GatewayHandler,
+             handler_args: [upstream: upstream],
+             transport: :test,
+             protocol_mode: unquote(mode),
+             mrtr: true,
+             request_state: [active_key_id: "gateway", keys: %{"gateway" => @key}]},
+            id: make_ref()
+          )
+
+        downstream =
+          start_client(transport: :test, server: gateway, protocol_mode: unquote(mode))
+
+        assert {:ok, %{"content" => [%{"text" => "Welcome, Lin"}]}} =
+                 Client.call_tool(downstream, "ask", %{},
+                   progress_token: "down-1",
+                   timeout: 10_000,
+                   format: :map
+                 )
+
+        # The downstream client's own token, on both rounds.
+        assert_receive {:handler_progress, %{"progressToken" => "down-1", "message" => "asking"}}
+
+        assert_receive {:handler_progress,
+                        %{"progressToken" => "down-1", "message" => "answered"}}
+      end
+    end
+  end
+
+  describe "options" do
+    test "manual MRTR with progress_to needs an explicit progress token" do
+      client = scripted()
+      reason = "manual MRTR with progress_to needs an explicit :progress_token"
+
+      for operation <- [
+            &Client.call_tool(client, "ask", %{}, &1),
+            &Client.get_prompt(client, "greeting", %{}, &1),
+            &Client.read_resource(client, "memo://note", &1)
+          ] do
+        assert {:error, %ValidationError{field: :progress_token, reason: ^reason}} =
+                 operation.(mrtr: :manual, progress_to: self())
+      end
+
+      refute_received {:wire, _request}
+
+      # A request that can't pause has no rounds, so a generated token is fine.
+      call = Task.async(fn -> Client.list_tools(client, mrtr: :manual, progress_to: self()) end)
+      assert_receive {:wire, %{"params" => %{"_meta" => %{"progressToken" => "progress-" <> _}}}}
+      Task.shutdown(call, :brutal_kill)
+    end
+
+    test "progress_to must be a pid, and nil leaves it unset" do
+      client = scripted()
+
+      assert_raise ArgumentError, "progress_to must be a pid", fn ->
+        Client.call_tool(client, "steps", %{}, progress_to: :owner)
+      end
+
+      call = Task.async(fn -> Client.call_tool(client, "steps", %{}, progress_to: nil) end)
+      assert_receive {:wire, %{"params" => %{"_meta" => meta}}}
+      refute Map.has_key?(meta, "progressToken")
+      Task.shutdown(call, :brutal_kill)
+    end
+  end
+
+  describe "when the client delivers" do
+    test "only while the request is pending: progress stops at the response" do
+      client = scripted()
+      caller = self()
+
+      call =
+        Task.async(fn ->
+          Client.call_tool(client, "steps", %{},
+            progress_to: caller,
+            progress_token: "t",
+            format: :map
+          )
+        end)
+
+      assert_receive {:wire, %{"id" => id, "params" => %{"_meta" => %{"progressToken" => "t"}}}}
+
+      progress(client, "t", 1)
+      assert_receive {:arbor_mcp_progress, ^client, "t", %{"progress" => 1}}
+
+      respond(client, id)
+      assert {:ok, _result} = Task.await(call)
+
+      progress(client, "t", 2)
+      _state = :sys.get_state(client)
+      refute_received {:arbor_mcp_progress, _client, _token, _params}
+    end
+
+    # The request stream path doesn't route by token, so the delivery itself
+    # checks that the request is still pending.
+    test "a request stream's progress for a settled request isn't delivered" do
+      client = scripted()
+      caller = self()
+
+      call =
+        Task.async(fn ->
+          Client.call_tool(client, "steps", %{}, progress_to: caller, progress_token: "s")
+        end)
+
+      assert_receive {:wire, %{"id" => id}}
+      respond(client, id)
+      assert {:ok, _result} = Task.await(call)
+
+      message = %{
+        "method" => "notifications/progress",
+        "params" => %{"progressToken" => "s", "progress" => 3}
+      }
+
+      state = :sys.get_state(client)
+      assert {:noreply, _state} = RequestHandler.handle_request_stream_message(id, message, state)
+      refute_received {:arbor_mcp_progress, _client, _token, _params}
+    end
+
+    test "each request's progress goes only to its own target" do
+      client = scripted()
+      test_pid = self()
+
+      targets =
+        for name <- ["x", "y"] do
+          target = spawn_link(fn -> forward_to(test_pid, name) end)
+
+          Task.async(fn ->
+            Client.call_tool(client, "steps", %{}, progress_to: target, progress_token: name)
+          end)
+
+          assert_receive {:wire,
+                          %{"id" => id, "params" => %{"_meta" => %{"progressToken" => ^name}}}}
+
+          {name, id}
+        end
+
+      for {name, _id} <- Enum.reverse(targets), do: progress(client, name, 1)
+
+      assert_receive {:forwarded, "x", {:arbor_mcp_progress, ^client, "x", _params}}
+      assert_receive {:forwarded, "y", {:arbor_mcp_progress, ^client, "y", _params}}
+      _state = :sys.get_state(client)
+      refute_received {:forwarded, _target, _message}
+
+      for {_name, id} <- targets, do: respond(client, id)
+    end
+  end
+
+  # Servers and clients
+
+  defp connect(transport, mode, opts \\ [])
+
+  defp connect(:http, mode, opts) do
+    runtime =
+      start_supervised!(
+        {Runtime,
+         handler: AppHandler,
+         handler_args: [owner: self()],
+         transport: :mounted_http,
+         protocol_mode: mode},
+        id: make_ref()
+      )
+
+    plug_opts = [
+      runtime: runtime,
+      path: "/mcp",
+      protocol_mode: mode,
+      sse_mode: :stream,
+      mrtr: true,
+      request_state: [active_key_id: "progress", keys: %{"progress" => @key}],
+      principal_id: "progress-test"
+    ]
+
+    listener =
+      start_supervised!(
+        {Bandit,
+         plug: {Arbor.MCP.HttpPlug, plug_opts}, ip: {127, 0, 0, 1}, port: 0, startup_log: false},
+        id: make_ref()
+      )
+
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(listener)
+
+    start_client(
+      [
+        transport: :http,
+        url: "http://127.0.0.1:#{port}/mcp",
+        protocol_mode: mode,
+        use_sse: false,
+        security: %{origin: nil}
+      ] ++ opts
+    )
+  end
+
+  defp connect(:stdio, mode, _opts) do
+    mix = System.find_executable("mix") || flunk("mix executable is required")
+
+    start_client(
+      transport: :stdio,
+      command: [mix, "run", "--no-compile", "--no-start", @fixture, Atom.to_string(mode)],
+      cd: @project_root,
+      env: mix_child_env(),
+      protocol_mode: mode
+    )
+  end
+
+  defp connect(transport, mode, _opts) when transport in [:beam, :test] do
+    server =
+      start_supervised!(
+        {HandlerServer,
+         handler: AppHandler,
+         handler_args: [owner: self()],
+         transport: transport,
+         protocol_mode: mode,
+         mrtr: true,
+         request_state: [active_key_id: "progress", keys: %{"progress" => @key}]},
+        id: make_ref()
+      )
+
+    start_client(transport: transport, server: server, protocol_mode: mode)
+  end
+
+  # The stdio transport isolates the child's environment; the fixture needs
+  # the same Mix setup as this VM (see ModernStdioTest).
+  defp mix_child_env do
+    [{"MIX_ENV", "test"}] ++
+      for name <- ["MIX_HOME", "MIX_ARCHIVES", "MIX_DEPS_PATH", "MIX_BUILD_PATH"],
+          value = System.get_env(name),
+          do: {name, value}
+  end
+
+  defp start_client(opts) do
+    defaults = [
+      capabilities: @form,
+      handler: {Recorder, [owner: self()]},
+      health_check_interval: nil,
+      reconnect: false
+    ]
+
+    {:ok, client} = Client.start_link(Keyword.merge(defaults, opts))
+
+    on_exit(fn ->
+      try do
+        Client.disconnect(client)
+      catch
+        :exit, _reason -> :ok
+      end
+    end)
+
+    client
+  end
+
+  # A ready modern client whose requests stay pending until the test answers.
+  defp scripted do
+    owner = self()
+
+    client =
+      start_supervised!(
+        {Client,
+         _skip_connect: true,
+         handler: {Recorder, [owner: owner]},
+         capabilities: @form,
+         health_check_interval: nil},
+        id: make_ref()
+      )
+
+    :sys.replace_state(client, fn state ->
+      %{
+        state
+        | transport_mod: PendingTransport,
+          transport_state: %{owner: owner},
+          protocol_version: "2026-07-28",
+          connection_status: :ready,
+          initialized: true
+      }
+    end)
+
+    client
+  end
+
+  defp progress(client, token, progress) do
+    message = %{
+      "jsonrpc" => "2.0",
+      "method" => "notifications/progress",
+      "params" => %{"progressToken" => token, "progress" => progress}
+    }
+
+    send(client, {:transport_message, Jason.encode!(message)})
+  end
+
+  defp respond(client, id) do
+    result = %{"resultType" => "complete", "content" => []}
+
+    send(
+      client,
+      {:transport_message, Jason.encode!(%{"jsonrpc" => "2.0", "id" => id, "result" => result})}
+    )
+  end
+
+  defp forward_to(test_pid, name) do
+    receive do
+      message ->
+        send(test_pid, {:forwarded, name, message})
+        forward_to(test_pid, name)
+    end
+  end
+
+  defp drain_progress(acc \\ []) do
+    receive do
+      {:arbor_mcp_progress, client, token, %{"progress" => progress}} ->
+        drain_progress([{client, token, progress} | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+end

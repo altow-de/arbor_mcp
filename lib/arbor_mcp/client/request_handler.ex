@@ -310,7 +310,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
   end
 
   defp send_unique_request(request, method, id, from, state, meta) do
-    state = mark_tool_listing(state, method, id, request)
+    state = state |> mark_tool_listing(method, id, request) |> remember_progress_target(id, meta)
     {deadline, meta} = request_send_context(from, state, meta)
 
     result =
@@ -1362,6 +1362,8 @@ defmodule Arbor.MCP.Client.RequestHandler do
       %{request_id: request_id, method: callback}
     )
 
+    if callback == :handle_progress, do: deliver_progress(request_id, params, state)
+
     {handler, handler_state, state} = ensure_client_handler(state)
 
     if handler != :none and function_exported?(handler, callback, 3) do
@@ -1394,6 +1396,34 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
       {:noreply, state}
   end
+
+  # progress_to: a request's progress also goes to a process the caller
+  # chose, alongside the client handler. The target is recorded before the
+  # send and kept only while some request is pending: delivery checks that
+  # this one still is, so progress stops at its response, and recording the
+  # next target drops the settled ones.
+  defp remember_progress_target(state, id, %{progress_to: pid}) when is_pid(pid) do
+    live =
+      Map.filter(progress_targets(state), fn {request_id, _pid} ->
+        Map.has_key?(state.pending_requests, request_id)
+      end)
+
+    Map.put(state, :progress_targets, Map.put(live, id, pid))
+  end
+
+  defp remember_progress_target(state, _id, _meta), do: state
+
+  # A dead target misses the update, and the request goes on.
+  defp deliver_progress(request_id, params, state) do
+    with pid when is_pid(pid) <- Map.get(progress_targets(state), request_id),
+         true <- Map.has_key?(state.pending_requests, request_id) do
+      send(pid, {:arbor_mcp_progress, self(), Map.get(params, "progressToken"), params})
+    end
+
+    :ok
+  end
+
+  defp progress_targets(state), do: Map.get(state, :progress_targets) || %{}
 
   defp get_request_info(pending_requests, response_id) do
     case Map.get(pending_requests, response_id) do

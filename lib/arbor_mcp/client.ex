@@ -119,6 +119,9 @@ defmodule Arbor.MCP.Client do
     # Progress tokens of pending requests, mapped to their request ids, so a
     # connection-level notifications/progress reaches the request it reports on.
     progress_requests: %{},
+    # Requests made with progress_to:, mapped to the process that also gets
+    # their progress (see RequestHandler).
+    progress_targets: %{},
     # Requests made with reset_timeout_on_progress, mapped to the timer that
     # runs out if they go that long without progress: {timer, tag, ms}.
     progress_timeouts: %{},
@@ -646,10 +649,15 @@ defmodule Arbor.MCP.Client do
     request declares instead of the client's start capabilities. Requests
     that can't return `input_required`, such as `list_tools/2`, take it
     without `mrtr: :manual`
+  - `:progress_to` - A pid that also gets this request's progress, alongside
+    the handler, as `{:arbor_mcp_progress, client, progress_token, params}`,
+    until the response arrives. A progress token is added if the request has
+    none; with `mrtr: :manual`, pass `:progress_token`. See "Progress to
+    another process" in the Protocol Guide.
 
   `Arbor.MCP.Client.Operations.Tools.call_tool/4` lists the other request
-  options. `nil` leaves `:mrtr`, `:input_responses`, `:request_state` and
-  `:client_capabilities` unset.
+  options. `nil` leaves `:mrtr`, `:input_responses`, `:request_state`,
+  `:client_capabilities` and `:progress_to` unset.
 
   ## Forwarding a call
 
