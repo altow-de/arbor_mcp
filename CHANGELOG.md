@@ -61,8 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — `Q`, either case, names it too — is now the weight only when it matches
   that grammar exactly; any other spelling, bare, empty, misspaced, malformed
   or quoted, makes its range unusable, so those requests get JSON and the GET
-  its existing refusal (found and fixed on the 1.x line first, `ex_mcp`
-  a2d8ccc and efa779e).
+  its existing refusal. A second `q` parameter makes the range unusable
+  whatever either value says, and optional whitespace is only SP and HTAB,
+  as RFC 9110 defines it: any other whitespace-like character, a no-break
+  space for instance, is part of the value it sits in and fails the grammar
+  (found and fixed on the 1.x line first, `ex_mcp` a2d8ccc, efa779e and
+  cc2a61c).
 
 - An unsupported-version error (`-32022`) lists `supported` as exactly the
   revisions the mount or server accepts, from the same source its request
