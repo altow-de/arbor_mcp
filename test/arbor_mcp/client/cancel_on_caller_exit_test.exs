@@ -34,7 +34,7 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
        %{
          protocolVersion: "2025-06-18",
          serverInfo: %{name: "cancel-on-exit", version: "0"},
-         capabilities: %{tools: %{}}
+         capabilities: %{tools: %{}, prompts: %{}}
        }, state}
     end
 
@@ -45,6 +45,23 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
             do: %{name: name, inputSchema: %{type: "object"}}
 
       {:ok, tools, nil, state}
+    end
+
+    # Three pages; the second holds. (Prompts, because a modern tools/call
+    # walks the tool list on the server.)
+    @impl true
+    def handle_list_prompts(nil, state), do: {:ok, [%{name: "p1"}], "page-2", state}
+
+    def handle_list_prompts("page-2", state) do
+      case hold("page-2", state) do
+        {:ok, %{content: [_ | _]}, state} -> {:ok, [%{name: "p2"}], "page-3", state}
+        {:ok, _cancelled, state} -> {:ok, [], nil, state}
+      end
+    end
+
+    def handle_list_prompts("page-3", state) do
+      send(state.test_pid, {:page_requested, "page-3"})
+      {:ok, [%{name: "p3"}], nil, state}
     end
 
     @impl true
@@ -207,6 +224,38 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
     end
   end
 
+  describe "a list walk whose caller exits" do
+    test "cancels the page in flight and requests no further page" do
+      client = start_http_client()
+      {caller, caller_ref} = start_caller(fn -> Client.all_prompts(client, timeout: 5_000) end)
+      {"page-2", _handler} = receive_holding()
+
+      assert watched_by?(caller, client)
+      kill(caller, caller_ref)
+
+      assert_receive {:server_cancelled, "page-2", _reason}, 3_000
+      refute_received {:page_requested, "page-3"}
+    end
+
+    test "passes cancel_on_caller_exit to each page request" do
+      client = start_http_client()
+
+      {caller, caller_ref} =
+        start_caller(fn ->
+          Client.all_prompts(client, timeout: 5_000, cancel_on_caller_exit: false)
+        end)
+
+      {"page-2", handler} = receive_holding()
+
+      refute watched_by?(caller, client)
+      kill(caller, caller_ref)
+
+      send(handler, :release)
+      assert_receive {:server_completed, "page-2"}, 3_000
+      refute_received {:server_cancelled, "page-2", _reason}
+    end
+  end
+
   describe "an MRTR call whose caller exits" do
     test "stops the client handler answering its input" do
       client = start_http_client()
@@ -299,6 +348,75 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
       kill(quiet, quiet_ref)
       refute_received {:cancelled, %{"requestId" => ^quiet_id}}
     end
+  end
+
+  test "nil leaves the era's default" do
+    modern = start_beam_client(:modern_only)
+
+    {caller, caller_ref} =
+      start_caller(fn -> hold(modern, "nil-modern", cancel_on_caller_exit: nil) end)
+
+    {"nil-modern", _handler} = receive_holding()
+    assert watched_by?(caller, modern)
+    kill(caller, caller_ref)
+    assert_receive {:server_cancelled, "nil-modern", _reason}, 3_000
+
+    legacy = start_beam_client(:legacy_only)
+
+    {caller, caller_ref} =
+      start_caller(fn -> hold(legacy, "nil-legacy", cancel_on_caller_exit: nil) end)
+
+    {"nil-legacy", handler} = receive_holding()
+    refute watched_by?(caller, legacy)
+    kill(caller, caller_ref)
+    send(handler, :release)
+    assert_receive {:server_completed, "nil-legacy"}, 3_000
+  end
+
+  # Every public function that takes request options accepts the option
+  # (none raises), and the content helpers, which check their options
+  # themselves, pass it on.
+  test "every request function accepts cancel_on_caller_exit" do
+    client = start_beam_client(:modern_only)
+
+    for value <- [true, false, nil] do
+      opts = [cancel_on_caller_exit: value, timeout: 2_000]
+
+      calls = [
+        fn -> Client.list_tools(client, opts) end,
+        fn -> Client.call_tool(client, "quick", %{}, opts) end,
+        fn -> Client.list_resources(client, opts) end,
+        fn -> Client.list_resource_templates(client, opts) end,
+        fn -> Client.read_resource(client, "test://none", opts) end,
+        fn -> Client.list_prompts(client, opts) end,
+        fn -> Client.get_prompt(client, "none", %{}, opts) end,
+        fn -> Client.ping(client, opts) end,
+        fn -> Client.discover(client, opts) end,
+        fn -> Client.tool_definitions(client, opts) end,
+        fn -> Client.call_content(client, "quick", %{}, opts) end,
+        fn -> Client.resource_definitions(client, opts) end,
+        fn -> Client.read_content(client, "test://none", opts) end,
+        fn -> Client.all_tools(client, opts) end,
+        fn -> Client.all_resources(client, opts) end,
+        fn -> Client.all_resource_templates(client, opts) end
+      ]
+
+      for call <- calls, do: assert(elem(call.(), 0) in [:ok, :error])
+    end
+
+    {caller, caller_ref} =
+      start_caller(fn ->
+        Client.call_content(client, "hold", %{"label" => "content"},
+          timeout: 5_000,
+          cancel_on_caller_exit: false
+        )
+      end)
+
+    {"content", handler} = receive_holding()
+    refute watched_by?(caller, client)
+    kill(caller, caller_ref)
+    send(handler, :release)
+    assert_receive {:server_completed, "content"}, 3_000
   end
 
   test "an invalid cancel_on_caller_exit is refused" do

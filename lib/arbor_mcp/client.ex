@@ -586,7 +586,9 @@ defmodule Arbor.MCP.Client do
   Limits must be positive finite integers. Ordinary request retries are disabled;
   the existing HTTP stream retry policy remains within the same total deadline.
   Cyclic cursors, malformed pages and exceeded limits return errors, without
-  reporting a partial list as complete. All list helpers use these same options.
+  reporting a partial list as complete. `:cancel_on_caller_exit` is passed to
+  every page request, so a caller that exits mid-walk cancels the page in
+  flight. All list helpers use these same options.
   """
   @spec all_tools(t(), keyword()) :: {:ok, [map()]} | {:error, term()}
   def all_tools(client, opts \\ []),

@@ -428,7 +428,16 @@ answering the round's input requests, that handler is stopped too.
 
 This is on by default for modern (2026-07-28) requests. On a legacy
 connection it happens only when the call asks for it, since there it sends a
-`notifications/cancelled` that legacy peers did not get before:
+`notifications/cancelled` that legacy peers did not get before. The
+`:cancel_on_caller_exit` option decides per call:
+
+- absent or `nil`: the era's default, as above (`nil` leaves an option
+  unset, so a gateway can pass options through unfiltered);
+- `true` or `false`: on or off, on either era;
+- anything else raises `ArgumentError`.
+
+Every request function takes it, the `all_*` list helpers included, which
+pass it to each page request.
 
 ```elixir
 # A modern request that should finish even if its caller goes away.

@@ -17,8 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream, and elsewhere (stdio, BEAM, legacy HTTP) it sends
   `notifications/cancelled`. During an MRTR round, it also stops the client
   handler that is answering the round's input requests. `false` turns it
-  off. Left unset, it is on for modern requests and off for legacy ones (see
-  Changed). Each cancellation emits
+  off. Absent or `nil`, it is on for modern requests and off for legacy ones
+  (see Changed); any other value raises `ArgumentError`. The `all_*` list
+  helpers pass it to each page request. Each cancellation emits
   `[:arbor_mcp, :client, :request, :caller_exited]`.
 - Under `:prefer_modern`, a stdio server that exits without answering the
   `server/discover` probe, as Python `mcp` 1.6 and 1.8 stdio servers do, or

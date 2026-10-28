@@ -66,7 +66,10 @@ defmodule Arbor.MCP.Client.Internal.Request do
   end
 
   defp validate_options!(opts) do
-    # `nil` leaves it to the era: on for modern requests, off for legacy ones.
+    # Absent or `nil` is the era's default (on for modern requests, off for
+    # legacy ones), as `nil` leaves the other forwarding options unset, so a
+    # gateway can pass options through unfiltered; `true` and `false` force
+    # it, and anything else raises.
     validate_option!(opts, :cancel_on_caller_exit, [nil, true, false], "a boolean")
     validate_option!(opts, :format, [:map, :struct], ":map or :struct")
     validate_option!(opts, :cache_mode, [:use, :refresh, :bypass], ":use, :refresh or :bypass")
