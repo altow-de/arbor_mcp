@@ -51,6 +51,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An unsupported-version error (`-32022`) lists `supported` as exactly the
+  revisions the mount or server accepts, from the same source its request
+  validation uses (`Arbor.MCP.Server.RequestContext.accepted_versions/1`), in
+  its preference order. An HTTP mount listed every revision the library
+  knows, so a `:legacy_only` mount advertised `2026-07-28` and a
+  `:modern_only` mount the legacy revisions. A mount without `protocol_mode`
+  accepts both eras, and now lists both, ordered by the application's
+  preferred era, where the HTTP error listed only the application mode's
+  revisions and `Arbor.MCP.Plugs.ProtocolVersion` only the legacy ones. The
+  HTTP message is `Unsupported protocol version`, as on the other
+  transports. A legacy `initialize` naming a revision the server lacks is
+  still negotiated, as the legacy revisions specify, over HTTP as over
+  stdio; only a mount that serves no legacy revision rejects it.
 - A client in the default `:prefer_modern` mode could not connect to an
   Arbor server running `protocol_mode: :legacy_only`, the documented
   rollback, over any transport. The server answers the `server/discover`

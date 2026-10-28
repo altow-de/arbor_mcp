@@ -1156,14 +1156,12 @@ defmodule Arbor.MCP.HttpPlug do
          _session_id,
          _session_reference
        ) do
-    supported = VersionRegistry.known_versions()
-
+    # The same list, from the same source, the mount's validation uses.
     error_response =
-      JSONRPC.error(
+      RequestContext.error_response(
+        {:unsupported_protocol_version, version},
         request_id,
-        ErrorCodes.unsupported_protocol_version(),
-        "Unsupported MCP protocol version",
-        %{"requested" => version, "supported" => supported}
+        opts.protocol_mode
       )
 
     conn
