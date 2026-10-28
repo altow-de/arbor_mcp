@@ -33,6 +33,180 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     end
   end
 
+  defmodule HealthProvider do
+    @moduledoc false
+    @behaviour Arbor.MCP.Authorization.Provider
+    @impl true
+    def init(opts), do: {:ok, %{owner: Keyword.fetch!(opts, :owner), token: nil}}
+    @impl true
+    def get_token(state), do: {:ok, state.token, state}
+    @impl true
+    def handle_unauthorized(_www, _scopes, state) do
+      send(state.owner, :health_provider_authenticated)
+      {:ok, "token-1", %{state | token: "token-1"}}
+    end
+
+    @impl true
+    def handle_forbidden(www, scopes, state), do: handle_unauthorized(www, scopes, state)
+  end
+
+  @tag :reauth_round3
+  test "overlapping 403 step-ups each get their own scope before their last POST retry" do
+    {client, counter} =
+      start_client(&finish/2, barrier: true, scoped_step_up: true, hold_step_up_metadata: true)
+
+    tasks =
+      for scope <- ["alpha", "beta"],
+          do:
+            Task.async(fn ->
+              Client.call_tool(client, "protected", %{"need" => scope},
+                timeout: 10_000,
+                format: :map
+              )
+            end)
+
+    Enum.each(for(_ <- 1..2, do: receive_challenge()), &send(&1, :challenge))
+
+    challenges =
+      for _ <- 1..2, into: %{} do
+        assert_receive {:scope_challenge, scope, server, id}, 2_000
+        {scope, {server, id}}
+      end
+
+    {alpha, alpha_id} = challenges["alpha"]
+    {beta, beta_id} = challenges["beta"]
+    send(alpha, :challenge)
+    assert_receive {:metadata_stalled, first}, 2_000
+    on_exit(fn -> send(first, :release) end)
+    send(beta, :challenge)
+    TestHelpers.wait_until(fn -> map_size(:sys.get_state(client).http_auth.waiters) == 2 end)
+    send(first, :release)
+    assert_receive {:metadata_stalled, second}, 2_000
+    send(second, :release)
+
+    assert [{:ok, _}, {:ok, _}] = Task.await_many(tasks)
+    state = Agent.get(counter, & &1)
+    assert state.tokens == 3
+    assert state.posts[alpha_id] == [[], ["Bearer token-1"], ["Bearer token-2"]]
+    assert state.posts[beta_id] == [[], ["Bearer token-1"], ["Bearer token-3"]]
+    assert "alpha" in state.grants["token-2"]
+    assert "beta" in state.grants["token-3"]
+    refute_received {:wrong_scope_retry, _, _}
+  end
+
+  @tag :reauth_round3
+  test "an incompatible step-up expires in the queue without starting another flow" do
+    {client, counter} =
+      start_client(&finish/2, barrier: true, scoped_step_up: true, hold_step_up_metadata: true)
+
+    alpha =
+      Task.async(fn ->
+        Client.call_tool(client, "protected", %{"need" => "alpha"}, timeout: 5_000)
+      end)
+
+    beta =
+      Task.async(fn ->
+        Client.call_tool(client, "protected", %{"need" => "beta"}, timeout: 1_000)
+      end)
+
+    Enum.each(for(_ <- 1..2, do: receive_challenge()), &send(&1, :challenge))
+
+    challenges =
+      for _ <- 1..2, into: %{} do
+        assert_receive {:scope_challenge, scope, server, id}, 2_000
+        {scope, {server, id}}
+      end
+
+    {first, _} = challenges["alpha"]
+    {second, beta_id} = challenges["beta"]
+    send(first, :challenge)
+    assert_receive {:metadata_stalled, metadata}, 2_000
+    on_exit(fn -> send(metadata, :release) end)
+    send(second, :challenge)
+    TestHelpers.wait_until(fn -> map_size(:sys.get_state(client).http_auth.waiters) == 2 end)
+
+    {_ref, {post, ^beta_id}} =
+      Enum.find(:sys.get_state(client).async_post_tasks, fn {_ref, {_pid, id}} ->
+        id == beta_id
+      end)
+
+    monitor = Process.monitor(post)
+    worker = :sys.get_state(client).http_auth.worker.pid
+    assert {:error, :timeout} = Task.await(beta, 2_000)
+    assert_receive {:DOWN, ^monitor, :process, ^post, _}, 2_000
+    assert Process.alive?(worker)
+    send(metadata, :release)
+    assert {:ok, _} = Task.await(alpha, 2_000)
+    assert Agent.get(counter, & &1.tokens) == 2
+    assert Agent.get(counter, & &1.posts[beta_id]) == [[], ["Bearer token-1"]]
+    refute_received {:metadata_stalled, _}
+  end
+
+  @tag :reauth_round3
+  test "a flow that grants less than requested does not consume the request's last retry" do
+    {client, counter} = start_client(&finish/2, scoped_step_up: true, narrow_step_up: true)
+    assert {:ok, _} = Client.call_tool(client, "protected", %{"need" => "alpha"}, format: :map)
+    state = Agent.get(counter, & &1)
+    assert state.tokens == 3
+    assert state.grants["token-2"] == ["tools.call"]
+    assert [headers] = Map.values(state.posts)
+    assert headers == [[], ["Bearer token-1"], ["Bearer token-3"]]
+    refute_received {:wrong_scope_retry, _, _}
+  end
+
+  for provider <- [:inline, :provider] do
+    @health_provider provider
+    @tag :reauth_round3
+    test "a retained HTTP health ping authenticates through #{@health_provider} without reconnecting" do
+      opts =
+        if @health_provider == :inline,
+          do: [hold_metadata: true],
+          else: [seed: false, auth_provider: {HealthProvider, owner: self()}]
+
+      {client, _counter} =
+        start_client(&finish/2, Keyword.merge(opts, retained: true, reconnect: true))
+
+      assert_receive {:retained_stream, stream}, 2_000
+      on_exit(fn -> send(stream, :release) end)
+      owner = self()
+      handler = {__MODULE__, make_ref()}
+
+      :telemetry.attach_many(
+        handler,
+        [[:arbor_mcp, :client, :disconnected], [:arbor_mcp, :client, :reconnect, :attempt]],
+        fn event, _, _, _ -> if self() == client, do: send(owner, {:health_lifecycle, event}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+      :sys.replace_state(client, &%{&1 | health_check_interval: 5_000})
+      send(client, :health_check)
+
+      if @health_provider == :inline do
+        assert_receive {:metadata_stalled, metadata}, 2_000
+        on_exit(fn -> send(metadata, :release) end)
+        state = :sys.get_state(client)
+        assert state.pending_requests == %{}
+        assert [waiter] = Map.values(state.http_auth.waiters)
+        assert waiter.request_id == state.health_check_id
+        assert (waiter.deadline - System.monotonic_time(:millisecond)) in 1..5_000
+        send(metadata, :release)
+      else
+        assert_receive :health_provider_authenticated, 2_000
+      end
+
+      assert_receive {:healthy_ping, first}, 2_000
+      TestHelpers.wait_until(fn -> :sys.get_state(client).health_check_id == nil end)
+      send(client, :health_check)
+      assert_receive {:healthy_ping, second}, 2_000
+      assert second != first
+      TestHelpers.wait_until(fn -> :sys.get_state(client).health_check_id == nil end)
+      assert Client.get_pending_requests(client) == []
+      assert {:ok, %{connection_status: :ready}} = Client.get_status(client)
+      refute_received {:health_lifecycle, _}
+    end
+  end
+
   test "a legacy POST reauthenticated by inline OAuth answers a ping before its result" do
     ping = %{"jsonrpc" => "2.0", "id" => "server-ping", "method" => "ping", "params" => %{}}
     {client, counter} = start_client(hold_after([ping]))
@@ -443,10 +617,37 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     era = Keyword.get(opts, :era, :legacy)
     version = if era == :legacy, do: "2025-11-25", else: "2026-07-28"
     owner = self()
-    counter = start_supervised!({Agent, fn -> %{posts: %{}, codes: %{}, tokens: 0} end})
+
+    counter =
+      start_supervised!({Agent, fn -> %{posts: %{}, codes: %{}, tokens: 0, grants: %{}} end})
+
     oauth_server(bypass, origin, counter, opts)
 
-    Bypass.stub(bypass, "GET", "/mcp", &Plug.Conn.resp(&1, 405, ""))
+    Bypass.stub(bypass, "GET", "/mcp", fn conn ->
+      if opts[:retained] do
+        conn =
+          conn
+          |> Plug.Conn.put_resp_content_type("text/event-stream")
+          |> Plug.Conn.send_chunked(200)
+
+        {:ok, conn} = Plug.Conn.chunk(conn, "event: priming\ndata: \n\n")
+        send(owner, {:retained_stream, self()})
+        monitor = Process.monitor(owner)
+
+        receive do
+          :release -> :ok
+          {:DOWN, ^monitor, :process, ^owner, _} -> :ok
+        after
+          30_000 -> :ok
+        end
+
+        Process.demonitor(monitor, [:flush])
+        conn
+      else
+        Plug.Conn.resp(conn, 405, "")
+      end
+    end)
+
     Bypass.stub(bypass, "DELETE", "/mcp", &Plug.Conn.resp(&1, 200, ""))
 
     Bypass.stub(bypass, "POST", "/mcp", fn conn ->
@@ -454,7 +655,26 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
 
       case Jason.decode!(body) do
         %{"method" => method, "id" => id} when method in ["initialize", "server/discover"] ->
+          conn =
+            if opts[:retained],
+              do: Plug.Conn.put_resp_header(conn, "mcp-session-id", "retained"),
+              else: conn
+
           json(conn, response(id, establishment(era, version)))
+
+        %{"method" => "ping"} = request ->
+          protected_call(
+            conn,
+            request,
+            counter,
+            origin,
+            owner,
+            fn request, conn ->
+              send(owner, {:healthy_ping, request["id"]})
+              json(conn, response(request["id"], %{}))
+            end,
+            opts
+          )
 
         %{"method" => "tools/call"} = request ->
           protected_call(conn, request, counter, origin, owner, answer_call, opts)
@@ -476,7 +696,8 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
          protocol_mode: if(era == :legacy, do: :legacy_only, else: :modern_only),
          protocol_version: version,
          handler: {Handler, owner: owner},
-         use_sse: false,
+         use_sse: Keyword.get(opts, :retained, false),
+         auth_provider: Keyword.get(opts, :auth_provider),
          health_check_interval: nil,
          reconnect: Keyword.get(opts, :reconnect, false),
          reconnect_backoff: [initial: 10, max: 10, multiplier: 1]}
@@ -542,16 +763,41 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
         )
 
       ["Bearer " <> token] ->
-        if opts[:reject_retries] || (opts[:step_up] && token == "token-1") do
-          challenge(
-            conn,
-            403,
-            ~s(Bearer error="insufficient_scope", resource_metadata="#{origin}/prm", scope="tools.call admin")
-          )
+        if opts[:scoped_step_up] do
+          scoped_step_up(conn, request, token, counter, origin, owner, answer, opts)
         else
-          assert token in ["token-1", "token-2"]
-          answer.(request, conn)
+          if opts[:reject_retries] || (opts[:step_up] && token == "token-1") do
+            challenge(
+              conn,
+              403,
+              ~s(Bearer error="insufficient_scope", resource_metadata="#{origin}/prm", scope="tools.call admin")
+            )
+          else
+            assert token in ["token-1", "token-2"]
+            answer.(request, conn)
+          end
         end
+    end
+  end
+
+  defp scoped_step_up(conn, request, token, counter, origin, owner, answer, opts) do
+    scope = request["params"]["arguments"]["need"]
+
+    if scope in Agent.get(counter, &Map.get(&1.grants, token, [])) do
+      answer.(request, conn)
+    else
+      if token == "token-1" and opts[:hold_step_up_metadata] do
+        send(owner, {:scope_challenge, scope, self(), request["id"]})
+        receive do: (:challenge -> :ok)
+      end
+
+      if token != "token-1", do: send(owner, {:wrong_scope_retry, scope, token})
+
+      challenge(
+        conn,
+        403,
+        ~s(Bearer error="insufficient_scope", resource_metadata="#{origin}/prm", scope="tools.call #{scope}")
+      )
     end
   end
 
@@ -559,7 +805,8 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     owner = self()
 
     Bypass.stub(bypass, "GET", "/prm", fn conn ->
-      if opts[:hold_metadata] do
+      if opts[:hold_metadata] ||
+           (opts[:hold_step_up_metadata] && Agent.get(counter, & &1.tokens) > 0) do
         send(owner, {:metadata_stalled, self()})
         monitor = Process.monitor(owner)
 
@@ -618,6 +865,15 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
       assert params["redirect_uri"] == authorization["redirect_uri"]
       assert params["resource"] == origin <> "/mcp"
       n = Agent.get_and_update(counter, &{&1.tokens + 1, %{&1 | tokens: &1.tokens + 1}})
+      granted = if opts[:narrow_step_up] && n == 2, do: "tools.call", else: authorization["scope"]
+
+      Agent.update(
+        counter,
+        &%{
+          &1
+          | grants: Map.put(&1.grants, "token-#{n}", String.split(granted || "", " ", trim: true))
+        }
+      )
 
       if opts[:token_error] do
         conn
@@ -627,7 +883,7 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
         json(conn, %{
           "access_token" => "token-#{n}",
           "token_type" => "Bearer",
-          "scope" => authorization["scope"]
+          "scope" => granted
         })
       end
     end)

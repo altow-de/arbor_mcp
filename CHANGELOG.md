@@ -51,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Concurrent inline OAuth scope step-ups now wait for tokens covering their own
+  scopes, with separate serialized flows when needed. Challenged scopes are
+  passed to the inline flow with credentials. Retained HTTP health pings can
+  authenticate within their health-check interval and settle their responses
+  without triggering an unnecessary reconnect.
 - Inline HTTP OAuth now runs in one monitored worker per client, so stalled
   discovery or authorization leaves the client responsive. Concurrent
   challenges share the flow with independent request deadlines; cancellation

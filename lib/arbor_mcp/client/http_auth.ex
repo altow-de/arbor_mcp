@@ -13,7 +13,17 @@ defmodule Arbor.MCP.Client.HTTPAuth do
   def challenge(state, kind, pid, request_id, ref, challenge) do
     deadline = Deadline.earliest(Map.get(challenge, :deadline), Deadline.after_ms(@auth_wait_ms))
 
-    waiter = %{kind: kind, pid: pid, request_id: request_id, ref: ref, deadline: deadline}
+    waiter = %{
+      kind: kind,
+      pid: pid,
+      request_id: request_id,
+      ref: ref,
+      deadline: deadline,
+      challenge: challenge,
+      scopes: if(challenge.status == 403, do: challenge.scopes, else: []),
+      order: System.unique_integer([:monotonic]),
+      flow: nil
+    }
 
     cond do
       Deadline.expired?(deadline) ->
@@ -44,8 +54,7 @@ defmodule Arbor.MCP.Client.HTTPAuth do
         }
 
         state = %{state | http_auth: auth}
-        state = if auth.worker, do: state, else: start_worker(state, challenge)
-        update_bound(state)
+        state |> join_flow() |> update_bound()
     end
   end
 
@@ -88,13 +97,9 @@ defmodule Arbor.MCP.Client.HTTPAuth do
           state.transport_state
       end
 
-    reply_result =
-      case result do
-        {:ok, token, _scopes} -> {:ok, token}
-        error -> error
-      end
-
-    finish_waiters(%{state | transport_state: transport}, reply_result)
+    %{state | transport_state: transport}
+    |> settle_flow(result, id)
+    |> update_bound()
   end
 
   def result(state, _pid, _id, _result), do: state
@@ -115,15 +120,16 @@ defmodule Arbor.MCP.Client.HTTPAuth do
         id,
         deadline
       ),
-      do: state |> stop_worker() |> finish_waiters({:error, :timeout})
+      do: state |> stop_worker() |> settle_flow({:error, :timeout}, id) |> update_bound()
 
   def worker_timeout(state, _id, _deadline), do: state
 
-  def down(%{http_auth: %{worker: %{monitor: ref}}} = state, ref),
+  def down(%{http_auth: %{worker: %{monitor: ref, id: id}}} = state, ref),
     do:
       state
       |> stop_worker()
-      |> finish_waiters({:error, {:oauth_failed, :authentication_worker_failed}})
+      |> settle_flow({:error, {:oauth_failed, :authentication_worker_failed}}, id)
+      |> update_bound()
 
   def down(state, monitor) do
     case Map.get(state.http_auth.monitors, monitor) do
@@ -162,34 +168,84 @@ defmodule Arbor.MCP.Client.HTTPAuth do
         Lifetime.deliver(parent, {:http_inline_auth_result, self(), id, result})
       end)
 
-    worker = %{pid: pid, monitor: monitor, id: id, timer: nil, deadline: nil}
-    %{state | http_auth: %{state.http_auth | worker: worker}}
+    worker = %{
+      pid: pid,
+      monitor: monitor,
+      id: id,
+      timer: nil,
+      deadline: nil,
+      scopes: challenge.scopes
+    }
+
+    %{state | http_auth: %{state.http_auth | worker: worker}} |> join_flow()
   end
 
-  defp update_bound(%{http_auth: %{worker: nil}} = state), do: state
+  defp join_flow(%{http_auth: %{worker: nil}} = state), do: state
+
+  defp join_flow(state) do
+    worker = state.http_auth.worker
+
+    waiters =
+      Map.new(state.http_auth.waiters, fn {ref, waiter} ->
+        joined =
+          if covers?(worker.scopes, waiter.scopes), do: %{waiter | flow: worker.id}, else: waiter
+
+        {ref, joined}
+      end)
+
+    %{state | http_auth: %{state.http_auth | waiters: waiters}}
+  end
 
   defp update_bound(%{http_auth: %{waiters: waiters}} = state) when map_size(waiters) == 0,
     do: stop_worker(state)
 
+  defp update_bound(%{http_auth: %{worker: nil}} = state) do
+    state = prune_waiters(state)
+
+    case Enum.min_by(state.http_auth.waiters, fn {_ref, waiter} -> waiter.order end, fn -> nil end) do
+      nil -> state
+      {_ref, waiter} -> state |> start_worker(waiter.challenge) |> update_bound()
+    end
+  end
+
   defp update_bound(state) do
     worker = state.http_auth.worker
 
-    deadline =
-      state.http_auth.waiters |> Enum.map(fn {_ref, waiter} -> waiter.deadline end) |> Enum.max()
+    deadlines =
+      for {_ref, waiter} <- state.http_auth.waiters, waiter.flow == worker.id, do: waiter.deadline
 
-    cancel_timer(worker.timer)
+    case deadlines do
+      [] ->
+        state |> stop_worker() |> update_bound()
 
-    timer =
-      Process.send_after(
-        self(),
-        {:http_auth_worker_timeout, worker.id, deadline},
-        Deadline.remaining(deadline)
-      )
+      _ ->
+        deadline = Enum.max(deadlines)
+        cancel_timer(worker.timer)
 
-    %{
-      state
-      | http_auth: %{state.http_auth | worker: %{worker | deadline: deadline, timer: timer}}
-    }
+        timer =
+          Process.send_after(
+            self(),
+            {:http_auth_worker_timeout, worker.id, deadline},
+            Deadline.remaining(deadline)
+          )
+
+        %{
+          state
+          | http_auth: %{state.http_auth | worker: %{worker | deadline: deadline, timer: timer}}
+        }
+    end
+  end
+
+  defp prune_waiters(state) do
+    Enum.reduce(state.http_auth.waiters, state, fn {ref, waiter}, acc ->
+      if live?(waiter, acc) do
+        acc
+      else
+        reason = if Deadline.expired?(waiter.deadline), do: :timeout, else: :stream_retired
+        reply(waiter, {:error, reason}, acc.transport_state)
+        remove_waiter(acc, ref)
+      end
+    end)
   end
 
   defp stop_worker(%{http_auth: %{worker: nil}} = state), do: state
@@ -216,6 +272,36 @@ defmodule Arbor.MCP.Client.HTTPAuth do
     end)
   end
 
+  defp settle_flow(state, result, id) do
+    Enum.reduce(state.http_auth.waiters, state, fn {ref, waiter}, acc ->
+      outcome =
+        cond do
+          Deadline.expired?(waiter.deadline) -> {:error, :timeout}
+          not eligible?(waiter, acc) -> {:error, :stream_retired}
+          true -> flow_outcome(result, waiter, id)
+        end
+
+      case outcome do
+        :queued ->
+          waiters = Map.put(acc.http_auth.waiters, ref, %{waiter | flow: nil})
+          %{acc | http_auth: %{acc.http_auth | waiters: waiters}}
+
+        reply_result ->
+          reply(waiter, reply_result, acc.transport_state)
+          remove_waiter(acc, ref)
+      end
+    end)
+  end
+
+  defp flow_outcome({:ok, token, granted}, waiter, _id) do
+    if covers?(granted, waiter.scopes), do: {:ok, token}, else: :queued
+  end
+
+  defp flow_outcome({:error, _} = error, %{flow: id}, id), do: error
+  defp flow_outcome({:error, _}, _waiter, _id), do: :queued
+
+  defp covers?(granted, required), do: Enum.all?(required, &(&1 in granted))
+
   defp remove_waiter(state, ref) do
     {waiter, waiters} = Map.pop(state.http_auth.waiters, ref)
     cancel_timer(waiter.timer)
@@ -238,9 +324,14 @@ defmodule Arbor.MCP.Client.HTTPAuth do
     do: HTTP.stream_owner?(state.transport_state, id, pid)
 
   defp eligible?(%{kind: :post, pid: pid, request_id: id}, state) do
-    (is_nil(id) or Map.has_key?(state.pending_requests, id)) and
+    request_alive?(state, id) and
       Enum.any?(state.async_post_tasks, fn {_ref, entry} -> entry == {pid, id} end)
   end
+
+  def request_alive?(_state, nil), do: true
+
+  def request_alive?(state, id),
+    do: Map.has_key?(state.pending_requests, id) or Map.get(state, :health_check_id) == id
 
   defp cancel_timer(nil), do: :ok
   defp cancel_timer(timer), do: Process.cancel_timer(timer, async: false, info: false)

@@ -815,13 +815,18 @@ defmodule Arbor.MCP.Client.RequestHandler do
       if VersionRegistry.modern?(state.protocol_version), do: "server/discover", else: "ping"
 
     with {:ok, request} <- build_request(method, %{}, id, state) do
-      case send_message(request, state) do
+      case send_health_request(request, state) do
         {:ok, updated_state, _response_data} -> {:ok, nil, updated_state}
         {:ok, updated_state} -> {:ok, id, updated_state}
         {:error, reason} -> {:error, reason}
       end
     end
   end
+
+  defp send_health_request(request, %{transport_mod: HTTP, transport_state: %HTTP{}} = state),
+    do: send_http_request(request, state)
+
+  defp send_health_request(request, state), do: send_message(request, state)
 
   @doc """
   Parses a message from the transport.
@@ -1013,9 +1018,10 @@ defmodule Arbor.MCP.Client.RequestHandler do
   def handle_post_response(response_data, request_id, state) do
     case Protocol.parse_message(response_data) do
       {kind, payload, _echoed_id} when kind in [:result, :error] ->
-        if pending_single?(state.pending_requests, request_id),
-          do: handle_single_response({kind, payload, request_id}, state),
-          else: {:noreply, state}
+        if pending_single?(state.pending_requests, request_id) or
+             Map.get(state, :health_check_id) == request_id,
+           do: handle_single_response({kind, payload, request_id}, state),
+           else: {:noreply, state}
 
       _other ->
         parse_transport_message(response_data, state)

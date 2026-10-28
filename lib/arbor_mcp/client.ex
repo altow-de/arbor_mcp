@@ -2681,9 +2681,9 @@ defmodule Arbor.MCP.Client do
     Enum.any?(state.async_post_tasks || %{}, fn
       {_ref, {pid, request_id}} ->
         # A legacy POST can still be in flight after its caller cancelled.
-        # It must not authenticate and re-send a request that is no longer pending.
+        # A health ping has its own tracked id; cancelled or settled work is retired.
         pid == task and
-          (is_nil(request_id) or Map.has_key?(state.pending_requests, request_id))
+          HTTPAuth.request_alive?(state, request_id)
 
       _other ->
         false
@@ -3572,7 +3572,25 @@ defmodule Arbor.MCP.Client do
     %{state | health_check_id: nil, health_check_ref: nil}
   end
 
-  defp send_health_ping(state) do
+  defp send_health_ping(
+         %{
+           transport_mod: HTTP,
+           transport_state: %HTTP{} = transport,
+           health_check_interval: interval
+         } = state
+       )
+       when is_integer(interval) and interval > 0 do
+    deadline = Deadline.earliest(transport.deadline, Deadline.after_ms(interval))
+
+    state =
+      do_send_health_ping(%{state | transport_state: HTTP.put_deadline(transport, deadline)})
+
+    %{state | transport_state: HTTP.put_deadline(state.transport_state, transport.deadline)}
+  end
+
+  defp send_health_ping(state), do: do_send_health_ping(state)
+
+  defp do_send_health_ping(state) do
     case RequestHandler.send_ping(state) do
       {:ok, request_id, new_state} ->
         %{new_state | health_check_id: request_id}

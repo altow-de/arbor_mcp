@@ -803,18 +803,21 @@ defmodule Arbor.MCP.Transport.HTTP do
     # Have auth_config with credentials — use FullOAuthFlow which handles
     # PRM discovery with header fallback and pre-existing credentials
     resource_url = build_url(state, "")
+    scopes = extract_scope_from_www_auth(www_auth)
 
     config =
       (state.auth_config || %{})
       |> Map.put(:resource_url, resource_url)
       |> Map.put(:www_authenticate, www_auth)
 
+    config = if scopes == [], do: config, else: Map.put(config, :scopes, scopes)
+
     Logger.info("Received 401, attempting OAuth flow with credentials")
 
     case FullOAuthFlow.execute(config) do
       {:ok, token_result} ->
         Logger.info("OAuth token obtained")
-        {:ok, put_oauth_token(state, token_result, extract_scope_from_www_auth(www_auth))}
+        {:ok, put_oauth_token(state, token_result, scopes)}
 
       {:error, reason} ->
         Logger.warning("OAuth discovery flow failed", reason: LogSummary.describe(reason))
