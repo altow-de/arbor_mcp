@@ -1969,6 +1969,31 @@ defmodule Arbor.MCP.Client do
     result
   end
 
+  # A rejection is reported before any auth challenge or terminal response,
+  # including when the sender has already used its last authenticated retry.
+  def handle_info(
+        {:http_credential_rejected, kind, pid, request_id, generation},
+        %{transport_mod: HTTP, transport_state: %HTTP{} = transport} = state
+      ) do
+    owned? =
+      case kind do
+        :post ->
+          Enum.any?(state.async_post_tasks, fn {_ref, entry} -> entry == {pid, request_id} end)
+
+        :stream ->
+          HTTP.stream_owner?(transport, request_id, pid)
+
+        _other ->
+          false
+      end
+
+    if owned?,
+      do:
+        {:noreply,
+         HTTPAuth.reject_token(state, %{status: 401, credential_generation: generation})},
+      else: {:noreply, state}
+  end
+
   # One of this client's POST tasks got a 401 or 403, as a modern request
   # stream can: answered here, in turn with every other challenge, and the
   # task sends its request again with the token, so no request is re-sent
@@ -2016,6 +2041,7 @@ defmodule Arbor.MCP.Client do
       )
       when is_map(challenge) do
     if HTTP.stream_owner?(transport_state, request_id, stream_pid) do
+      state = HTTPAuth.reject_token(state, challenge)
       {:noreply, handle_auth_challenge(state, :stream, stream_pid, request_id, ref, challenge)}
     else
       send(stream_pid, {:modern_http_stream_auth_result, ref, {:error, :stream_retired}})

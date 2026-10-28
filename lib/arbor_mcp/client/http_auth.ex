@@ -6,7 +6,7 @@ defmodule Arbor.MCP.Client.HTTPAuth do
 
   @auth_wait_ms 600_000
   @derive {Inspect, except: [:waiters]}
-  defstruct worker: nil, waiters: %{}, monitors: %{}, rejected_generation: 0
+  defstruct worker: nil, waiters: %{}, monitors: %{}
 
   # The client owns one inline flow. Its challengers retain separate deadlines
   # and monitors; the OAuth worker itself never sends an application request.
@@ -62,32 +62,11 @@ defmodule Arbor.MCP.Client.HTTPAuth do
   # A late rejection advances the high-water mark, but only the current
   # generation can retire shared credentials. No token history is retained.
   def reject_token(
-        %{transport_state: %HTTP{auth_provider: nil} = transport} = state,
+        %{transport_state: %HTTP{} = transport} = state,
         %{status: 401, credential_generation: generation}
       )
       when is_integer(generation) and generation > 0 do
-    auth = state.http_auth
-    auth = %{auth | rejected_generation: max(auth.rejected_generation, generation)}
-
-    transport =
-      if generation == transport.credential_generation do
-        headers =
-          Enum.reject(transport.headers, fn {key, _} ->
-            String.downcase(key) == "authorization"
-          end)
-
-        %{
-          transport
-          | access_token: nil,
-            granted_scopes: [],
-            headers: headers,
-            auth_completed: false
-        }
-      else
-        transport
-      end
-
-    %{state | http_auth: auth, transport_state: transport}
+    %{state | transport_state: HTTP.retire_credential(transport, generation)}
   end
 
   def reject_token(state, _challenge), do: state
@@ -136,7 +115,7 @@ defmodule Arbor.MCP.Client.HTTPAuth do
     result =
       case result do
         {:ok, _token, _scopes, generation} ->
-          if generation <= state.http_auth.rejected_generation,
+          if generation <= state.transport_state.rejected_generation,
             do: {:error, {:oauth_failed, :stale_credential}},
             else: result
 
@@ -217,6 +196,13 @@ defmodule Arbor.MCP.Client.HTTPAuth do
 
   def retire(state) do
     state = state |> stop_worker() |> finish_waiters({:error, :client_disconnected})
+
+    state =
+      case state.transport_state do
+        %HTTP{} = transport -> %{state | transport_state: %{transport | rejected_generation: 0}}
+        _other -> state
+      end
+
     %{state | http_auth: %__MODULE__{}}
   end
 
@@ -251,7 +237,7 @@ defmodule Arbor.MCP.Client.HTTPAuth do
       timer: nil,
       deadline: nil,
       scopes: challenge.scopes,
-      rejected_generation: state.http_auth.rejected_generation
+      rejected_generation: state.transport_state.rejected_generation
     }
 
     %{state | http_auth: %{state.http_auth | worker: worker}} |> join_flow()

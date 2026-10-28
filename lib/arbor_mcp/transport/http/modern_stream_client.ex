@@ -234,6 +234,14 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
     state = state |> cancel_handshake_timer() |> cancel_idle_timer()
     body = to_binary(body)
 
+    if status == 401 do
+      Lifetime.deliver(
+        state.parent,
+        {:http_credential_rejected, :stream, self(), state.request_id,
+         state.credential_generation}
+      )
+    end
+
     if byte_size(body) > state.max_response_bytes do
       {:stop, :normal, notify_closed(state, :response_too_large)}
     else

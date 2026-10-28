@@ -7,6 +7,27 @@ defmodule Arbor.MCP.Client.HTTPAuthGenerationTest do
 
   @moduletag :reauth_round6
 
+  for kind <- [:post, :stream] do
+    @tag :reauth_round7
+    test "#{kind} rejection notices require ownership and retire only the matching generation" do
+      a = credential(%HTTP{headers: []}, "A")
+      b = credential(a, "B")
+      state = state(%{b | modern_streams: %{1 => self()}})
+
+      message = fn id, generation ->
+        {:http_credential_rejected, unquote(kind), self(), id, generation}
+      end
+
+      assert {:noreply, ^state} = Client.handle_info(message.(2, b.credential_generation), state)
+      assert {:noreply, state} = Client.handle_info(message.(1, a.credential_generation), state)
+      assert state.transport_state.access_token == "B"
+      assert state.transport_state.rejected_generation == a.credential_generation
+      assert {:noreply, state} = Client.handle_info(message.(1, b.credential_generation), state)
+      assert state.transport_state.access_token == nil
+      assert state.transport_state.rejected_generation == b.credential_generation
+    end
+  end
+
   for kind <- [:post, :health_ping, :request, :subscription] do
     test "#{kind} carries the sent credential generation through an authenticated retry" do
       kind = unquote(kind)
@@ -68,15 +89,15 @@ defmodule Arbor.MCP.Client.HTTPAuthGenerationTest do
     b = credential(a, "B")
     state = state(b)
     state = reject(state, a)
-    assert state.transport_state == b
-    assert state.http_auth.rejected_generation == a.credential_generation
+    assert state.transport_state == %{b | rejected_generation: a.credential_generation}
+    assert state.transport_state.rejected_generation == a.credential_generation
     state = reject(state, b)
     assert state.transport_state.access_token == nil
     {state, worker, id, ref} = worker(state)
     state = HTTPAuth.result(state, worker, id, result(a))
 
     assert state.transport_state.access_token == nil
-    assert state.http_auth.rejected_generation == b.credential_generation
+    assert state.transport_state.rejected_generation == b.credential_generation
     assert_receive {:http_post_auth_result, ^ref, {:error, {:oauth_failed, :stale_credential}}}
   end
 
@@ -92,7 +113,7 @@ defmodule Arbor.MCP.Client.HTTPAuthGenerationTest do
 
       assert state.transport_state.access_token == "B"
       assert state.transport_state.credential_generation == b.credential_generation
-      assert state.http_auth.rejected_generation == a.credential_generation
+      assert state.transport_state.rejected_generation == a.credential_generation
       generation = b.credential_generation
 
       assert_receive {:http_post_auth_result, ^ref,
@@ -121,7 +142,7 @@ defmodule Arbor.MCP.Client.HTTPAuthGenerationTest do
 
   test "one hundred rotations and rejections retain fixed-size auth state" do
     initial = state(credential(%HTTP{headers: []}, "token-000"))
-    size = :erts_debug.size(initial.http_auth)
+    size = generation_state_size(initial)
 
     state =
       Enum.reduce(1..100, initial, fn cycle, acc ->
@@ -133,16 +154,17 @@ defmodule Arbor.MCP.Client.HTTPAuthGenerationTest do
         acc = HTTPAuth.result(acc, worker, id, result(fresh))
         assert_receive {:http_post_auth_result, ^ref, {:ok, ^token, _}}
         assert acc.transport_state.credential_generation > previous_generation
-        assert acc.http_auth.rejected_generation == previous_generation
+        assert acc.transport_state.rejected_generation == previous_generation
         assert acc.http_auth.worker == nil
         assert acc.http_auth.waiters == %{}
         assert acc.http_auth.monitors == %{}
-        assert :erts_debug.size(acc.http_auth) == size
+        assert generation_state_size(acc) == size
         acc
       end)
 
     assert state.transport_state.access_token == "token-100"
     assert HTTPAuth.retire(state).http_auth == %HTTPAuth{}
+    assert HTTPAuth.retire(state).transport_state.rejected_generation == 0
   end
 
   test "a fresh exchange may reuse bearer bytes while receiving a new generation" do
@@ -159,6 +181,13 @@ defmodule Arbor.MCP.Client.HTTPAuthGenerationTest do
 
   defp credential(transport, token),
     do: HTTP.put_oauth_token(transport, %{access_token: token, scope: "read"}, ["read"])
+
+  defp generation_state_size(state),
+    do:
+      :erts_debug.size(
+        {state.http_auth, state.transport_state.credential_generation,
+         state.transport_state.rejected_generation}
+      )
 
   defp receive_challenge(:post, pid) do
     assert_receive {:http_post_auth_challenge, ^pid, ref, challenge}, 2_000
@@ -216,7 +245,7 @@ defmodule Arbor.MCP.Client.HTTPAuthGenerationTest do
       timer: nil,
       deadline: waiter.deadline,
       scopes: ["read"],
-      rejected_generation: state.http_auth.rejected_generation
+      rejected_generation: state.transport_state.rejected_generation
     }
 
     auth = %{

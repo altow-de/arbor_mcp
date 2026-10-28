@@ -50,6 +50,49 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     def handle_forbidden(www, scopes, state), do: handle_unauthorized(www, scopes, state)
   end
 
+  for {era, stream?} <- [{:legacy, false}, {:modern, false}, {:modern, true}] do
+    @tag :reauth_round7
+    test "the exhausted 401 retires B before a new #{era} request (stream: #{stream?})" do
+      {client, counter} =
+        start_client(&finish/2, era: unquote(era), step_up: true, reject_final: true)
+
+      opts = if unquote(stream?), do: [progress_token: "terminal-401"], else: []
+      task = call(client, opts)
+      assert_receive {:terminal_401, server, id}, 2_000
+      on_exit(fn -> send(server, :reject) end)
+      b = :sys.get_state(client).transport_state
+      assert b.access_token == "token-2"
+      send(server, :reject)
+      assert {:error, %{reason: {:unauthorized, 401, "", _}}} = Task.await(task)
+      assert :sys.get_state(client).transport_state.access_token == nil
+      assert :sys.get_state(client).transport_state.granted_scopes == []
+      assert {:ok, _} = Task.await(call(client, opts))
+      state = Agent.get(counter, & &1)
+      assert state.tokens == 3
+      assert state.posts[id] == [[], ["Bearer token-1"], ["Bearer token-2"]]
+      assert [next] = state.posts |> Map.delete(id) |> Map.values()
+      assert next == [[], ["Bearer token-3"]]
+    end
+  end
+
+  @tag :reauth_round7
+  test "synchronous inline auth retires the final 401 credential" do
+    {client, counter} = start_client(&finish/2, step_up: true, reject_final: true)
+    transport = :sys.get_state(client).transport_state
+    request = Jason.encode!(%{"jsonrpc" => "2.0", "id" => "sync", "method" => "tools/call"})
+    task = Task.async(fn -> HTTP.send_authenticated(request, transport) end)
+    assert_receive {:terminal_401, server, "sync"}, 2_000
+    on_exit(fn -> send(server, :reject) end)
+    send(server, :reject)
+    assert {:error, {:unauthorized, 401, "", _}, retired} = Task.await(task)
+    assert retired.access_token == nil
+    assert retired.granted_scopes == []
+    assert retired.credential_generation == retired.rejected_generation
+    assert retired.rejected_generation > 0
+    assert Agent.get(counter, & &1.tokens) == 2
+    assert Agent.get(counter, & &1.posts["sync"]) == [[], ["Bearer token-1"], ["Bearer token-2"]]
+  end
+
   @tag :reauth_round5
   test "a 401 joining a step-up retires the shared token before the partial grant arrives" do
     {client, counter} =
@@ -974,6 +1017,11 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
 
   defp authenticated_call(conn, request, token, counter, origin, owner, answer, opts) do
     cond do
+      opts[:reject_final] && token == "token-2" ->
+        send(owner, {:terminal_401, self(), request["id"]})
+        receive do: (:reject -> :ok)
+        challenge(conn, 401, ~s(Bearer error="invalid_token"))
+
       opts[:reject_read_token] && token == "token-1" &&
           request["params"]["arguments"]["need"] == "read" ->
         if opts[:hold_read_401] do
@@ -991,16 +1039,25 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
         scoped_step_up(conn, request, token, counter, origin, owner, answer, opts)
 
       true ->
-        if opts[:reject_retries] || (opts[:step_up] && token == "token-1") do
-          challenge(
-            conn,
-            403,
-            ~s(Bearer error="insufficient_scope", resource_metadata="#{origin}/prm", scope="tools.call admin")
-          )
-        else
-          assert token in ["token-1", "token-2"]
-          answer.(request, conn)
-        end
+        ordinary_authenticated_call(conn, request, token, origin, answer, opts)
+    end
+  end
+
+  defp ordinary_authenticated_call(conn, request, token, origin, answer, opts) do
+    if opts[:reject_retries] || (opts[:step_up] && token == "token-1") do
+      challenge(
+        conn,
+        403,
+        ~s(Bearer error="insufficient_scope", resource_metadata="#{origin}/prm", scope="tools.call admin")
+      )
+    else
+      allowed =
+        if opts[:reject_final],
+          do: ["token-1", "token-2", "token-3"],
+          else: ["token-1", "token-2"]
+
+      assert token in allowed
+      answer.(request, conn)
     end
   end
 

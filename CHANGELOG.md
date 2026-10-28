@@ -51,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- HTTP authentication retires rejected credential generations on every 401,
+  including the response that exhausts POST or stream retries and synchronous
+  authenticated sends. Provider refreshes receive a new generation even when
+  bearer bytes repeat, so delayed pre-refresh challenges reuse the refreshed
+  credential instead of starting authentication again.
 - HTTP credentials and their requests now carry monotonic generations, with
   a fixed-size rejection high-water mark to prevent stale auth results from
   restoring retired credentials. Auth refusals retain their retry marker until
