@@ -22,6 +22,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An ArborMCP client never received anything on an ArborMCP server's legacy
+  Streamable HTTP GET stream: list changes, log messages and progress sent
+  there were lost, and a callback's `Server.list_roots/2`, sampling or
+  elicitation request timed out. The server opens the stream with a
+  `connected` event, which reached the client process before the receiver
+  that reads the stream had started, and the stream waited for an
+  acknowledgement that never came and closed five seconds later. An event now
+  goes to the receiver once it takes over. The client also skips events that
+  aren't MCP `message` events, such as `connected`, where it logged them as
+  unparseable, and keeps its session when the server closes the GET stream,
+  which an ArborMCP server does at its `:request_timeout_ms`: it opens the
+  stream again with `Last-Event-ID`, where it used to reconnect, start a new
+  session and fail every pending request. If the server answers the reopened
+  GET with 405, it no longer offers the stream, and the client carries on
+  POST-only, as with a server that never offered one.
+- An ArborMCP server answered every legacy Streamable HTTP request with JSON,
+  so a request's progress could only travel on the session's GET stream, and
+  `Context.report_progress/3` and `Server.notify_progress/4` returned
+  `{:error, :stream_closed}` to a client without one (`use_sse: false`). As
+  the TypeScript SDK's servers do, a legacy request that carries
+  `_meta.progressToken`, from a client that accepts `text/event-stream`, now
+  gets an event stream that carries its progress, and its callback's other
+  notifications, ahead of the result. `initialize`, batches and a client that
+  accepts only JSON still get JSON, with progress on the session's GET stream.
+- The server read the `Accept` header by looking for the text
+  `text/event-stream`, so a modern request that asked for progress or request
+  logs got an event stream even from a client that refused one with
+  `text/event-stream;q=0`, and JSON from one that wrote
+  `Text/Event-Stream`. Both eras now parse the header's media ranges: an event
+  stream needs `text/event-stream` named with a quality above zero, in any
+  case. A comma or semicolon inside a quoted parameter value, escaped quotes
+  included, separates nothing, so a range keeps its own `q`; a quoted or
+  malformed `q`, or an unterminated quoted string, doesn't opt in. A wildcard
+  such as `*/*` still gets JSON, since the MCP spec asks clients to list
+  `text/event-stream`. The Streamable HTTP GET stream uses the same rule.
+- `Server.notify_tools_changed/1`, `notify_prompts_changed/1` and
+  `notify_resources_changed/1` called outside a callback on an HTTP runtime
+  never reached a modern `subscriptions/listen` stream, though they returned
+  `:ok`. With no origin of its own, the publication took the subscription's
+  registration, and narrowing its deadline before the compatibility check
+  made it no longer equal to that registration. The check now comes first.
+- The same list changes never reached legacy Streamable HTTP sessions. They
+  now go to every legacy session whose GET stream is open at that moment,
+  through its own bounded replay, which its stream writes out; a slow or
+  dead stream holds up neither the others nor the caller. A session with no
+  open GET stream, including one whose client is about to reopen it, misses
+  the change rather than having it queued. The call returns `:ok` only when
+  every matching subscription and every open session took the change, and
+  `{:error, :partially_delivered}` otherwise, where it returned `:ok` whatever
+  happened.
+- A legacy Streamable HTTP request was cancelled when its connection went
+  away, as a modern one is, although the legacy revisions say a disconnect
+  SHOULD NOT be taken for a cancellation (a client cancels with
+  `notifications/cancelled`). It now runs to its end, under its original
+  deadline, and its response, which nothing can carry any more, is released.
+  A modern request is still cancelled with its connection.
+- A legacy session's GET stream raised `RuntimeWriter.AdmissionError` ("MCP
+  HTTP response capacity unavailable"), logged as an error, and dropped its
+  connection without ending the response, when the session was deleted, or
+  its lease or deadline ran out, while the stream was writing a page of its
+  replay. It now ends the response normally; a later stream resumes the rest
+  of the page with `Last-Event-ID`. Other refusals and failed writes still
+  raise.
 - Authorization code flow rejects malformed `:scopes` instead of silently
   turning a non-list value into an empty scope parameter. An improper list
   returns `{:error, :invalid_scopes}` instead of raising inside the check. `nil`
