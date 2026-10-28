@@ -30,6 +30,14 @@ defmodule Arbor.MCP.Client.ModernHTTPStreamAuthTest do
   end
 
   defp client_state(transport_state) do
+    transport_state =
+      if is_binary(transport_state.access_token) and transport_state.credential_generation == 0,
+        do: %{
+          transport_state
+          | credential_generation: System.unique_integer([:positive, :monotonic])
+        },
+        else: transport_state
+
     %Client{
       transport_mod: HTTP,
       transport_state: transport_state,
@@ -253,13 +261,13 @@ defmodule Arbor.MCP.Client.ModernHTTPStreamAuthTest do
                )
 
       if reused? do
-        assert_received {:modern_http_stream_auth_result, ^ref, {:ok, "fresh"}}
+        assert_received {:modern_http_stream_auth_result, ^ref, {:ok, "fresh", _generation}}
         refute_received {:provider_step_up, _, _}
       else
         assert_received {:provider_step_up, "Bearer", ["admin"]}
 
         assert_received {:modern_http_stream_auth_result, ^ref,
-                         {:ok, "request-stream-step-up-token"}}
+                         {:ok, "request-stream-step-up-token", _generation}}
       end
     end
   end
@@ -285,7 +293,7 @@ defmodule Arbor.MCP.Client.ModernHTTPStreamAuthTest do
                client_state(transport_state)
              )
 
-    assert_received {:modern_http_stream_auth_result, ^ref, {:ok, "fresh"}}
+    assert_received {:modern_http_stream_auth_result, ^ref, {:ok, "fresh", _generation}}
     refute_received {:provider_challenge, _, _}
     assert client_state.transport_state.auth_provider_state.generation == 1
   end

@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- HTTP credentials and their requests now carry monotonic generations, with
+  a fixed-size rejection high-water mark to prevent stale auth results from
+  restoring retired credentials. Auth refusals retain their retry marker until
+  public error formatting, including with explicit retry predicates. A refused
+  subscription reopen emits its documented closed event and cancels reconnect
+  timers after the subscription has previously acknowledged.
 - A 401 joining an inline OAuth step-up immediately retires the rejected shared
   token. A narrower replacement grant updates its token and scopes, while a
   delayed 401 cannot invalidate newer credentials. Definitive HTTP auth and

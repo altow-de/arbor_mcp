@@ -547,7 +547,10 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     assert {:ok, _} = HTTP.send_async(request, transport)
     assert_receive {:async_post_task, monitor, task, 7}, 2_000
     assert_receive {:http_post_auth_challenge, ^task, ref, %{token: nil}}, 2_000
-    assert_receive {:async_post_result, {:error, :timeout}, %{request_id: 7}}, 2_000
+
+    assert_receive {:async_post_result, {:error, {:auth_refused, :timeout}}, %{request_id: 7}},
+                   2_000
+
     assert_receive {:DOWN, ^monitor, :process, ^task, :normal}, 2_000
 
     send(task, {:http_post_auth_result, ref, {:ok, "too-late"}})
@@ -728,7 +731,8 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     rotate = Jason.encode!(%{"jsonrpc" => "2.0", "id" => 8, "method" => "ping"})
     assert {:ok, current, _} = HTTP.send_message(rotate, transport)
     assert current.session_id == "rotated"
-    current = %{current | access_token: "fresh", headers: [{"X-Current", "fresh"}]}
+    current = HTTP.put_oauth_token(current, %{access_token: "fresh"}, [])
+    current = %{current | headers: [{"X-Current", "fresh"}]}
 
     state = %Client{
       transport_mod: HTTP,

@@ -28,20 +28,29 @@ defmodule Arbor.MCP.Client.ModernSubscriptionTest do
     def handle_call({:open_subscription, subscription, filter}, _from, state) do
       id = state.next_id
 
-      send(
-        subscription,
-        {:client_subscription_acknowledged, id,
-         %{
-           "_meta" => %{"io.modelcontextprotocol/subscriptionId" => id},
-           "notifications" => filter
-         }}
-      )
+      case Map.get(state, :refusal) do
+        nil ->
+          send(
+            subscription,
+            {:client_subscription_acknowledged, id,
+             %{
+               "_meta" => %{"io.modelcontextprotocol/subscriptionId" => id},
+               "notifications" => filter
+             }}
+          )
+
+        error ->
+          send(subscription, {:client_subscription_error, id, error})
+      end
 
       send(state.owner, {:subscription_opened, id})
 
       {:reply, {:ok, id},
        Map.merge(state, %{next_id: id + 1, subscription: subscription, request_id: id})}
     end
+
+    def handle_call({:refuse_reopen, error}, _from, state),
+      do: {:reply, :ok, Map.put(state, :refusal, error)}
 
     def handle_call({:request, "resources/read", %{"uri" => uri}, _meta}, _from, state) do
       send(
@@ -347,6 +356,32 @@ defmodule Arbor.MCP.Client.ModernSubscriptionTest do
     assert_receive {:subscription_cancelled, ^second_id}
   end
 
+  @tag :reauth_round6
+  test "a refused reopen closes an acknowledged subscription exactly once" do
+    {:ok, client} = ReconnectClient.start_link(self())
+    assert {:ok, subscription} = Subscription.open(client, %{"toolsListChanged" => true})
+    assert_receive {:subscription_opened, first_id}
+    error = {:stream_error, {:auth_refused, {:oauth_failed, :insufficient_scope}}}
+    assert :ok = GenServer.call(client, {:refuse_reopen, error})
+    monitor = Process.monitor(subscription.pid)
+    send(subscription.pid, {:client_subscription_disconnected, :closed})
+    assert_receive {:ex_mcp_subscription_resync, _, :started}
+    timer = :sys.get_state(subscription.pid).reconnect_timer
+    assert is_reference(timer)
+    send(subscription.pid, :client_subscription_reconnect)
+    assert_receive {:subscription_opened, second_id}
+    refute second_id == first_id
+
+    assert_receive {:ex_mcp_subscription_closed, closed, {:error, ^error}}
+    assert closed.pid == subscription.pid
+    assert closed.request_id == second_id
+    assert closed.acknowledged_filter == subscription.acknowledged_filter
+    assert_receive {:DOWN, ^monitor, :process, _, :normal}
+    assert Process.read_timer(timer) == false
+    refute_received {:ex_mcp_subscription_closed, _, _}
+    refute_received {:subscription_opened, _}
+  end
+
   @tag :reauth_round5
   test "definitive auth disconnects terminate the subscription without reopening or resync" do
     {:ok, client} = ReconnectClient.start_link(self())
@@ -389,7 +424,7 @@ defmodule Arbor.MCP.Client.ModernSubscriptionTest do
 
       assert pending == %{}
       assert_receive {^ref, {:error, %{type: :transport_error, reason: error}}}
-      assert error == if(elem(reason, 0) == :auth_refused, do: elem(reason, 1), else: reason)
+      assert error == reason
     end
   end
 

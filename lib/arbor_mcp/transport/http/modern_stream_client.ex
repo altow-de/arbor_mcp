@@ -63,6 +63,7 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
     # {ref, timer} while the client process answers an auth challenge.
     :auth_wait,
     :auth_response,
+    credential_generation: 0,
     auth_attempts: 0,
     buffer: "",
     completed?: false,
@@ -114,6 +115,7 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
       parent_monitor: Process.monitor(parent),
       request_id: Keyword.fetch!(opts, :request_id),
       deadline: Keyword.get(opts, :deadline),
+      credential_generation: Keyword.get(opts, :credential_generation, 0),
       stream_kind: Keyword.fetch!(opts, :stream_kind),
       url: Keyword.fetch!(opts, :url),
       headers: Keyword.fetch!(opts, :headers),
@@ -446,6 +448,7 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
       www_authenticate: www_auth,
       scopes: extract_scopes(www_auth),
       token: bearer_token(state.headers),
+      credential_generation: state.credential_generation,
       deadline: state.deadline
     }
 
@@ -464,6 +467,10 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
   end
 
   defp maybe_retry_with_auth(_status, _response_headers, _state), do: :no_retry
+
+  defp retry_with_auth({:ok, token, generation}, state) when is_binary(token) do
+    retry_with_auth({:ok, token}, %{state | credential_generation: generation})
+  end
 
   defp retry_with_auth({:ok, token}, state) when is_binary(token) do
     if Deadline.expired?(state.deadline),

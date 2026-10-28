@@ -1,10 +1,11 @@
 defmodule Arbor.MCP.Client.Internal.Request do
   @moduledoc false
-  alias Arbor.MCP.Client.{HTTPAuth, MRTR}
+  alias Arbor.MCP.Client.{HTTPAuth, MRTR, RequestHandler}
   alias Arbor.MCP.Error
   alias Arbor.MCP.Protocol.ErrorCodes
   alias Arbor.MCP.Reliability.Retry
   alias Arbor.MCP.Response
+  alias Arbor.MCP.Transport.HTTP
   @default_max_mrtr_rounds 8
   # The longest finite timeout Erlang accepts: no limit, in practice.
   @max_timeout 4_294_967_295
@@ -617,6 +618,24 @@ defmodule Arbor.MCP.Client.Internal.Request do
       :map -> {:ok, response}
       format -> format_response(response, format, opts)
     end
+  end
+
+  # Keep the refusal marker until all retry decisions have completed. Only
+  # the public result drops it, preserving the ordinary HTTP error shape.
+  defp handle_request_result(
+         {:error, %{type: :transport_error, reason: {:auth_refused, :timeout}}},
+         _opts
+       ),
+       do: {:error, :timeout}
+
+  defp handle_request_result(
+         {:error, %{type: :transport_error, reason: {:auth_refused, reason}}},
+         opts
+       ) do
+    handle_request_result(
+      {:error, RequestHandler.send_error(reason, %{transport_mod: HTTP})},
+      opts
+    )
   end
 
   defp handle_request_result({:error, %{__struct__: mod}} = error, _opts)

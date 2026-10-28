@@ -962,10 +962,8 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
   def close_request_stream(_request_id, state), do: state
 
-  defp request_stream_error({:auth_refused, :timeout}), do: :timeout
-
-  defp request_stream_error({:auth_refused, reason}),
-    do: send_error(reason, %{transport_mod: HTTP})
+  defp request_stream_error({:auth_refused, _reason} = refusal),
+    do: send_error(refusal, %{transport_mod: HTTP})
 
   defp request_stream_error({:oauth_failed, _reason} = reason),
     do: send_error(reason, %{transport_mod: HTTP})

@@ -140,6 +140,9 @@ defmodule Arbor.MCP.Transport.HTTP do
     modern_streams: %{},
     sse_deferred_attempted: false,
     auth_completed: false,
+    # Credential acquisitions use the VM's monotonic counter. Applying an
+    # existing credential preserves its generation, even when results are late.
+    credential_generation: 0,
     # The scopes granted to the token the transport's own OAuth flow
     # obtained, when there is no auth provider (see put_oauth_token/3).
     granted_scopes: []
@@ -273,6 +276,11 @@ defmodule Arbor.MCP.Transport.HTTP do
     state = %__MODULE__{
       base_url: base_url,
       headers: all_headers,
+      credential_generation:
+        if(Headers.get(all_headers, "authorization"),
+          do: System.unique_integer([:positive, :monotonic]),
+          else: 0
+        ),
       http_client: http_client,
       endpoint: endpoint,
       security: security,
@@ -480,6 +488,7 @@ defmodule Arbor.MCP.Transport.HTTP do
        state
        | auth_provider_state: request_state.auth_provider_state,
          access_token: request_state.access_token,
+         credential_generation: request_state.credential_generation,
          headers: request_state.headers
      }}
   end
@@ -510,7 +519,11 @@ defmodule Arbor.MCP.Transport.HTTP do
             case await_authentication(parent, kind, www_auth, state) do
               {:ok, token, context} ->
                 state = %{state | session_id: context.session_id, headers: context.headers}
-                perform_async(message, apply_token_to_state(state, token), parent, attempts + 1)
+
+                authenticated =
+                  apply_token_to_state(state, token, Map.get(context, :credential_generation))
+
+                perform_async(message, authenticated, parent, attempts + 1)
 
               {:ok, token} ->
                 perform_async(message, apply_token_to_state(state, token), parent, attempts + 1)
@@ -519,8 +532,8 @@ defmodule Arbor.MCP.Transport.HTTP do
                 {authentication_failure(reason, response, state, message), state}
             end
 
-          _challenge ->
-            {handle_http_response(response, state, message), state}
+          {kind, _www_auth} when kind in [:unauthorized, :forbidden] ->
+            {mark_auth_refusal(handle_http_response(response, state, message)), state}
         end
 
       {:error, reason} ->
@@ -530,15 +543,19 @@ defmodule Arbor.MCP.Transport.HTTP do
 
   defp authentication_failure(reason, _response, %{auth_provider: provider}, _message)
        when not is_nil(provider),
-       do: {:error, {:authentication_failed, reason}}
+       do: {:error, {:auth_refused, {:authentication_failed, reason}}}
 
   # Without a provider the caller sees what a synchronous send reported: the
   # server's own response to a challenge OAuth can't answer, or the failed
   # OAuth flow.
   defp authentication_failure(:no_credentials, response, state, message),
-    do: handle_http_response(response, state, message)
+    do: mark_auth_refusal(handle_http_response(response, state, message))
 
-  defp authentication_failure(reason, _response, _state, _message), do: {:error, reason}
+  defp authentication_failure(reason, _response, _state, _message),
+    do: {:error, {:auth_refused, reason}}
+
+  defp mark_auth_refusal({:error, reason}), do: {:error, {:auth_refused, reason}}
+  defp mark_auth_refusal(result), do: result
 
   @auth_wait_ms 600_000
 
@@ -551,6 +568,7 @@ defmodule Arbor.MCP.Transport.HTTP do
       www_authenticate: www_auth,
       scopes: extract_scope_from_www_auth(www_auth),
       token: state.access_token,
+      credential_generation: state.credential_generation,
       deadline: state.deadline
     }
 
@@ -641,7 +659,11 @@ defmodule Arbor.MCP.Transport.HTTP do
 
     case apply(provider, callback, [www_auth, scopes, state.auth_provider_state]) do
       {:ok, token, new_ps} ->
-        new_state = state |> Map.put(:auth_provider_state, new_ps) |> apply_token_to_state(token)
+        new_state =
+          state
+          |> Map.put(:auth_provider_state, new_ps)
+          |> apply_token_to_state(token, System.unique_integer([:positive, :monotonic]))
+
         provider_retry_request(body, new_state)
 
       # The provider's state records what it tried (its loop guards), so it
@@ -694,8 +716,20 @@ defmodule Arbor.MCP.Transport.HTTP do
 
   defp apply_provider_token(state), do: state
 
-  defp apply_token_to_state(state, token) do
-    %{state | access_token: token, headers: put_bearer_header(state.headers, token)}
+  defp apply_token_to_state(state, token, generation \\ nil) do
+    generation =
+      generation ||
+        if(token == state.access_token and state.credential_generation > 0,
+          do: state.credential_generation,
+          else: System.unique_integer([:positive, :monotonic])
+        )
+
+    %{
+      state
+      | access_token: token,
+        credential_generation: generation,
+        headers: put_bearer_header(state.headers, token)
+    }
   end
 
   defp init_auth_provider({mod, provider_config}, _auth_config, _base_url, _endpoint, _version) do
@@ -857,13 +891,20 @@ defmodule Arbor.MCP.Transport.HTTP do
   # the OAuth provider. The client checks a later 403 against them, so a
   # step-up another request already obtained isn't run again.
   @spec put_oauth_token(t(), map(), [String.t()]) :: t()
-  def put_oauth_token(%__MODULE__{} = state, token_result, requested_scopes)
+  @spec put_oauth_token(t(), map(), [String.t()], pos_integer()) :: t()
+  def put_oauth_token(
+        %__MODULE__{} = state,
+        token_result,
+        requested_scopes,
+        generation \\ System.unique_integer([:positive, :monotonic])
+      )
       when is_map(token_result) do
     access_token = token_result[:access_token] || token_result["access_token"]
 
     %{
       state
       | access_token: access_token,
+        credential_generation: generation,
         auth_completed: true,
         headers: put_bearer_header(state.headers, access_token),
         granted_scopes: token_scopes(token_result, requested_scopes)
@@ -1011,6 +1052,7 @@ defmodule Arbor.MCP.Transport.HTTP do
   @async_merge_fields [
     :session_id,
     :access_token,
+    :credential_generation,
     :auth_completed,
     :auth_provider_state,
     :headers,
@@ -1544,6 +1586,7 @@ defmodule Arbor.MCP.Transport.HTTP do
              parent: parent,
              request_id: request_id,
              deadline: state.deadline,
+             credential_generation: state.credential_generation,
              url: url,
              headers: headers,
              body: message,

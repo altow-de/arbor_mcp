@@ -5,8 +5,8 @@ defmodule Arbor.MCP.Client.HTTPAuth do
   alias Arbor.MCP.Transport.HTTP
 
   @auth_wait_ms 600_000
-  @derive {Inspect, except: [:waiters, :rejected_tokens]}
-  defstruct worker: nil, waiters: %{}, monitors: %{}, rejected_tokens: MapSet.new()
+  @derive {Inspect, except: [:waiters]}
+  defstruct worker: nil, waiters: %{}, monitors: %{}, rejected_generation: 0
 
   # The client owns one inline flow. Its challengers retain separate deadlines
   # and monitors; the OAuth worker itself never sends an application request.
@@ -59,20 +59,33 @@ defmodule Arbor.MCP.Client.HTTPAuth do
     end
   end
 
-  # Rejection belongs to a token, not to the flow's initial status. In
-  # particular a 401 can join a 403 flow, or arrive after another flow won.
+  # A late rejection advances the high-water mark, but only the current
+  # generation can retire shared credentials. No token history is retained.
   def reject_token(
-        %{transport_state: %HTTP{auth_provider: nil, access_token: token} = transport} = state,
-        %{status: 401, token: token}
+        %{transport_state: %HTTP{auth_provider: nil} = transport} = state,
+        %{status: 401, credential_generation: generation}
       )
-      when is_binary(token) do
+      when is_integer(generation) and generation > 0 do
     auth = state.http_auth
-    auth = %{auth | rejected_tokens: MapSet.put(auth.rejected_tokens, token_key(token))}
+    auth = %{auth | rejected_generation: max(auth.rejected_generation, generation)}
 
-    headers =
-      Enum.reject(transport.headers, fn {key, _} -> String.downcase(key) == "authorization" end)
+    transport =
+      if generation == transport.credential_generation do
+        headers =
+          Enum.reject(transport.headers, fn {key, _} ->
+            String.downcase(key) == "authorization"
+          end)
 
-    transport = %{transport | access_token: nil, granted_scopes: [], headers: headers}
+        %{
+          transport
+          | access_token: nil,
+            granted_scopes: [],
+            headers: headers,
+            auth_completed: false
+        }
+      else
+        transport
+      end
 
     %{state | http_auth: auth, transport_state: transport}
   end
@@ -89,18 +102,25 @@ defmodule Arbor.MCP.Client.HTTPAuth do
   def refused?(%{details: details}), do: refused?(details)
   def refused?(_reason), do: false
 
-  defp token_key(token), do: :crypto.hash(:sha256, token)
-
   def cached_token(%HTTP{access_token: current} = transport, challenge)
-      when is_binary(current) and current != :erlang.map_get(:token, challenge) do
-    if challenge.status == 401 or scopes_granted?(granted_scopes(transport), challenge.scopes),
-      do: current
+      when is_binary(current) do
+    if transport.credential_generation != Map.get(challenge, :credential_generation, 0) and
+         (challenge.status == 401 or scopes_granted?(granted_scopes(transport), challenge.scopes)),
+       do: current
   end
 
   def cached_token(_transport, _challenge), do: nil
 
-  def reply(%{kind: :post, pid: pid, ref: ref}, {:ok, token}, transport) do
-    context = %{session_id: transport.session_id, headers: transport.headers}
+  def reply(waiter, {:ok, token}, transport),
+    do: reply(waiter, {:ok, token, transport.credential_generation}, transport)
+
+  def reply(%{kind: :post, pid: pid, ref: ref}, {:ok, token, generation}, transport) do
+    context = %{
+      session_id: transport.session_id,
+      headers: transport.headers,
+      credential_generation: generation
+    }
+
     send(pid, {:http_post_auth_result, ref, {:ok, token, context}})
   end
 
@@ -115,9 +135,9 @@ defmodule Arbor.MCP.Client.HTTPAuth do
 
     result =
       case result do
-        {:ok, token, _scopes} ->
-          if MapSet.member?(state.http_auth.rejected_tokens, token_key(token)),
-            do: {:error, {:oauth_failed, :rejected_token}},
+        {:ok, _token, _scopes, generation} ->
+          if generation <= state.http_auth.rejected_generation,
+            do: {:error, {:oauth_failed, :stale_credential}},
             else: result
 
         {:error, _reason} ->
@@ -126,13 +146,15 @@ defmodule Arbor.MCP.Client.HTTPAuth do
 
     transport =
       case result do
-        {:ok, token, scopes} ->
-          if covers?(scopes, state.transport_state.granted_scopes) and
+        {:ok, token, scopes, generation} ->
+          if generation > state.transport_state.credential_generation and
+               covers?(scopes, state.transport_state.granted_scopes) and
                Enum.any?(state.http_auth.waiters, fn {_ref, waiter} -> live?(waiter, state) end) do
             HTTP.put_oauth_token(
               state.transport_state,
               %{access_token: token, scope: Enum.join(scopes, " ")},
-              scopes
+              scopes,
+              generation
             )
           else
             state.transport_state
@@ -212,8 +234,11 @@ defmodule Arbor.MCP.Client.HTTPAuth do
       ConnectionScope.spawn_monitor(fn ->
         result =
           case HTTP.answer_challenge_inline(transport, challenge) do
-            {{:ok, token}, authenticated} -> {:ok, token, authenticated.granted_scopes}
-            {{:error, reason}, _transport} -> {:error, reason}
+            {{:ok, token}, authenticated} ->
+              {:ok, token, authenticated.granted_scopes, authenticated.credential_generation}
+
+            {{:error, reason}, _transport} ->
+              {:error, reason}
           end
 
         Lifetime.deliver(parent, {:http_inline_auth_result, self(), id, result})
@@ -225,7 +250,8 @@ defmodule Arbor.MCP.Client.HTTPAuth do
       id: id,
       timer: nil,
       deadline: nil,
-      scopes: challenge.scopes
+      scopes: challenge.scopes,
+      rejected_generation: state.http_auth.rejected_generation
     }
 
     %{state | http_auth: %{state.http_auth | worker: worker}} |> join_flow()
@@ -344,9 +370,9 @@ defmodule Arbor.MCP.Client.HTTPAuth do
     end)
   end
 
-  defp flow_outcome({:ok, token, granted}, waiter, id) do
+  defp flow_outcome({:ok, token, granted, generation}, waiter, id) do
     cond do
-      covers?(granted, waiter.scopes) -> {:ok, token}
+      covers?(granted, waiter.scopes) -> {:ok, token, generation}
       waiter.flow == id -> {:error, {:oauth_failed, :insufficient_scope}}
       true -> :queued
     end

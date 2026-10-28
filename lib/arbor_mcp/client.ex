@@ -2720,7 +2720,12 @@ defmodule Arbor.MCP.Client do
 
     case apply(provider, callback, args) do
       {:ok, token, provider_state} when is_binary(token) ->
-        changes = %{access_token: token, auth_provider_state: provider_state}
+        changes = %{
+          access_token: token,
+          credential_generation: System.unique_integer([:positive, :monotonic]),
+          auth_provider_state: provider_state
+        }
+
         {{:ok, token}, merge_modern_stream_auth_state(transport_state, changes)}
 
       {:error, reason, provider_state} ->
@@ -2744,6 +2749,7 @@ defmodule Arbor.MCP.Client do
         %{
           transport_state
           | access_token: token,
+            credential_generation: Map.fetch!(changes, :credential_generation),
             auth_provider_state: provider_state,
             headers: headers
         }
