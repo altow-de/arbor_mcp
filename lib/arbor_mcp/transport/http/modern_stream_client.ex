@@ -347,6 +347,7 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
       connect_timeout: Keyword.get(state.http_options, :connect_timeout, state.handshake_timeout),
       transport_opts: Keyword.get(state.http_options, :ssl, []),
       max_response_bytes: state.max_response_bytes,
+      auth_headers_only: true,
       delivery_timeout: state.consumer_ack_timeout + 1_000,
       dns_timeout_ms: Keyword.get(state.http_options, :dns_timeout_ms, 1_000),
       dns_resolver:

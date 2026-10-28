@@ -127,11 +127,13 @@ defmodule Arbor.MCP.Authorization.ProviderOAuthRefreshTest do
         second.credential_generation
       )
 
-    assert {:ok, after_rejection, _} = HTTP.send_authenticated(request, retired)
-    assert after_rejection.credential_generation > retired.rejected_generation
-    assert after_rejection.auth_provider_state.token_acquisitions == 3
-    assert_receive :rejected_cache_omitted
-    assert_receive :identical_refresh
+    assert {:error, {:auth_refused, {:authentication_failed, :rejected_credential}},
+            after_rejection} =
+             HTTP.send_authenticated(request, retired)
+
+    assert after_rejection.credential_generation == retired.credential_generation
+    assert after_rejection.auth_provider_state.token_acquisitions == 2
+    refute_received :rejected_cache_omitted
     refute_received :identical_refresh
   end
 

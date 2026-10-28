@@ -342,30 +342,17 @@ defmodule Arbor.MCP.Transport.HTTP do
             new_state2 = maybe_start_deferred_sse(new_state2, message)
             {:ok, new_state2}
 
-          error ->
-            error
+          {:error, reason} ->
+            {:error, reason, new_state}
         end
 
-      {:error, reason, _state} ->
-        {:error, reason}
-
-      {:error, reason} ->
-        {:error, reason}
+      {:error, reason, new_state} ->
+        {:error, reason, new_state}
     end
   end
 
   def send_message(message, %__MODULE__{use_sse: false} = state) do
-    # For non-SSE mode, we handle the request-response synchronously
-    case perform_and_maybe_auth(message, state) do
-      {:ok, response, new_state} ->
-        handle_http_response(response, new_state, message)
-
-      {:error, reason, _state} ->
-        {:error, reason}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
+    send_authenticated(message, state)
   end
 
   def send_message(message, %__MODULE__{use_sse: true, sse_pid: sse_pid} = state)
@@ -374,10 +361,7 @@ defmodule Arbor.MCP.Transport.HTTP do
 
   # SSE mode without active connection (pre-initialization) or fallback
   def send_message(message, %__MODULE__{} = state) do
-    case send_authenticated(message, state) do
-      {:error, reason, _state} -> {:error, reason}
-      result -> result
-    end
+    send_authenticated(message, state)
   end
 
   @doc false
@@ -400,9 +384,6 @@ defmodule Arbor.MCP.Transport.HTTP do
 
       {:error, reason, new_state} ->
         {:error, reason, new_state}
-
-      {:error, reason} ->
-        {:error, reason}
     end
   end
 
@@ -413,17 +394,23 @@ defmodule Arbor.MCP.Transport.HTTP do
   # where meta carries the request id and the deadline the POST ran under.
   # Used for every request sent after establishment, and for all messages
   # once a legacy SSE stream is open.
-  @spec send_async(binary(), t()) :: {:ok, t()}
+  @spec send_async(binary(), t()) :: {:ok, t()} | {:error, term(), t()}
   def send_async(message, %__MODULE__{} = state) when is_binary(message),
     do: state |> maybe_start_deferred_sse(message) |> then(&async_post(message, &1))
 
   defp async_post(message, state) do
+    case apply_provider_token(state) do
+      {:ok, request_state} -> start_async_post(message, state, request_state)
+      {:error, _reason, _state} = refusal -> refusal
+    end
+  end
+
+  defp start_async_post(message, state, request_state) do
     parent = self()
     request_id = extract_request_id(message)
     nonce = make_ref()
     # Resolved here, in the client process, so tasks never refresh (and
     # possibly rotate) a provider's token concurrently.
-    request_state = apply_provider_token(state)
 
     # spawn_monitor rather than Task.start: the parent (the Arbor.MCP.Client
     # GenServer) owns the monitor, so a crashed POST task produces a
@@ -590,15 +577,15 @@ defmodule Arbor.MCP.Transport.HTTP do
   # Perform HTTP request with automatic OAuth retry via auth provider.
   defp perform_and_maybe_auth(body, %{auth_provider: provider} = state)
        when not is_nil(provider) do
-    state = apply_provider_token(state)
+    with {:ok, state} <- apply_provider_token(state) do
+      case perform_http_request(body, state) do
+        {:ok, response} ->
+          state = retire_response_credential(state, response)
+          handle_provider_auth_challenge(response, body, state)
 
-    case perform_http_request(body, state) do
-      {:ok, response} ->
-        state = retire_response_credential(state, response)
-        handle_provider_auth_challenge(response, body, state)
-
-      {:error, reason} ->
-        {:error, reason}
+        {:error, reason} ->
+          {:error, reason, state}
+      end
     end
   end
 
@@ -633,14 +620,20 @@ defmodule Arbor.MCP.Transport.HTTP do
 
               {:error, reason} ->
                 {:error, reason, retry_retired}
+
+              {:error, reason, latest} ->
+                {:error, reason, retire_credential(latest, retry_retired.rejected_generation)}
             end
 
           {:error, reason} ->
             {:error, reason, retired}
+
+          {:error, reason, latest} ->
+            {:error, reason, retire_credential(latest, retired.rejected_generation)}
         end
 
       {:error, reason} ->
-        {:error, reason}
+        {:error, reason, state}
     end
   end
 
@@ -694,7 +687,7 @@ defmodule Arbor.MCP.Transport.HTTP do
         end
 
       {:error, reason} ->
-        {:error, reason}
+        {:error, reason, state}
     end
   end
 
@@ -710,34 +703,28 @@ defmodule Arbor.MCP.Transport.HTTP do
        when not is_nil(provider) do
     case provider.get_token(ps) do
       {:ok, nil, new_ps} ->
-        %{state | auth_provider_state: new_ps}
-
-      {:ok, _token, %OAuth{} = new_ps}
-      when new_ps == ps and state.credential_generation > 0 and
-             state.credential_generation <= state.rejected_generation ->
-        # The built-in provider exposes acquisitions. An unchanged state is
-        # positively a cached, rejected credential; wait for the next challenge
-        # to refresh it rather than restoring it as a new acquisition.
-        %{state | auth_provider_state: new_ps}
+        {:ok, %{state | auth_provider_state: new_ps}}
 
       {:ok, token, new_ps} ->
-        # A changed provider state records an acquisition/refresh, even if
-        # the bearer bytes repeat. An opaque successful fetch after rejection
-        # is fresh too; an unchanged cached fetch keeps the held generation.
         generation =
-          if new_ps != ps or is_nil(state.access_token) or
-               state.credential_generation <= state.rejected_generation,
-             do: System.unique_integer([:positive, :monotonic]),
-             else: state.credential_generation
+          if new_ps != ps or state.credential_generation == 0,
+            do: System.unique_integer([:positive, :monotonic]),
+            else: state.credential_generation
 
-        %{apply_token_to_state(state, token, generation) | auth_provider_state: new_ps}
+        state = %{state | auth_provider_state: new_ps}
+
+        if generation <= state.rejected_generation do
+          {:error, {:auth_refused, {:authentication_failed, :rejected_credential}}, state}
+        else
+          {:ok, apply_token_to_state(state, token, generation)}
+        end
 
       {:error, _} ->
-        state
+        {:ok, state}
     end
   end
 
-  defp apply_provider_token(state), do: state
+  defp apply_provider_token(state), do: {:ok, state}
 
   defp apply_token_to_state(state, token, generation \\ nil) do
     generation = generation || System.unique_integer([:positive, :monotonic])
@@ -792,7 +779,7 @@ defmodule Arbor.MCP.Transport.HTTP do
       {:ok, new_state} ->
         case perform_http_request(original_body, new_state) do
           {:ok, response} -> {:ok, response, new_state}
-          {:error, reason} -> {:error, reason}
+          {:error, reason} -> {:error, reason, new_state}
         end
 
       no_retry ->
@@ -1033,6 +1020,7 @@ defmodule Arbor.MCP.Transport.HTTP do
   defp make_http_request(url, headers, body, state, opts) do
     with {:ok, transport_opts} <- https_transport_opts(url, state) do
       BoundedClient.request(:post, url, headers, "application/json", body,
+        auth_headers_only: true,
         event_stream: Keyword.get(opts, :event_stream),
         deadline: state.deadline,
         connect_timeout: state.timeouts.connect,
@@ -1601,7 +1589,8 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   @doc false
-  @spec open_stream(binary(), t(), pid(), keyword()) :: {:ok, t()} | {:error, term()}
+  @spec open_stream(binary(), t(), pid(), keyword()) ::
+          {:ok, t()} | {:error, term()} | {:error, term(), t()}
   def open_stream(message, state, parent, opts \\ [])
 
   def open_stream(message, %__MODULE__{protocol_era: :modern} = state, parent, opts)
@@ -1611,42 +1600,43 @@ defmodule Arbor.MCP.Transport.HTTP do
     # dedicated process, so it cannot call perform_and_maybe_auth/2. Passing
     # the provider snapshot lets that process handle a later 401/403 and send
     # the refreshed durable auth state back to the client.
-    state = apply_provider_token(state)
-    request_id = extract_request_id(message)
-    url = build_url(state, "")
-    headers = RequestHeaders.build(message, state)
-    stream_kind = Keyword.get(opts, :stream_kind, :request)
+    with {:ok, state} <- apply_provider_token(state) do
+      request_id = extract_request_id(message)
+      url = build_url(state, "")
+      headers = RequestHeaders.build(message, state)
+      stream_kind = Keyword.get(opts, :stream_kind, :request)
 
-    with :ok <- request_within_limit(message, state.max_request_bytes),
-         :ok <- validate_stream_kind(stream_kind),
-         :ok <- validate_stream_request_id(request_id, state),
-         {:ok, headers} <- sanitize_http_request("POST", url, headers, state),
-         {:ok, http_options} <- modern_stream_http_options(url, state),
-         {:ok, pid} <-
-           ModernStreamClient.start(
-             _connection_scope: ConnectionScope.current(),
-             parent: parent,
-             request_id: request_id,
-             deadline: state.deadline,
-             credential_generation: state.credential_generation,
-             url: url,
-             headers: headers,
-             body: message,
-             stream_kind: stream_kind,
-             http_options: http_options,
-             handshake_timeout: state.timeouts.stream_handshake,
-             idle_timeout: state.timeouts.stream_idle,
-             max_response_bytes: state.max_response_bytes,
-             max_buffer_bytes: state.max_stream_buffer_bytes,
-             auth_provider: state.auth_provider,
-             auth_provider_state: state.auth_provider_state,
-             header_sanitizer: fn retry_headers ->
-               sanitize_http_request("POST", url, retry_headers, state)
-             end
-           ) do
-      {:ok, %{state | modern_streams: Map.put(state.modern_streams, request_id, pid)}}
-    else
-      {:error, reason} -> {:error, reason}
+      with :ok <- request_within_limit(message, state.max_request_bytes),
+           :ok <- validate_stream_kind(stream_kind),
+           :ok <- validate_stream_request_id(request_id, state),
+           {:ok, headers} <- sanitize_http_request("POST", url, headers, state),
+           {:ok, http_options} <- modern_stream_http_options(url, state),
+           {:ok, pid} <-
+             ModernStreamClient.start(
+               _connection_scope: ConnectionScope.current(),
+               parent: parent,
+               request_id: request_id,
+               deadline: state.deadline,
+               credential_generation: state.credential_generation,
+               url: url,
+               headers: headers,
+               body: message,
+               stream_kind: stream_kind,
+               http_options: http_options,
+               handshake_timeout: state.timeouts.stream_handshake,
+               idle_timeout: state.timeouts.stream_idle,
+               max_response_bytes: state.max_response_bytes,
+               max_buffer_bytes: state.max_stream_buffer_bytes,
+               auth_provider: state.auth_provider,
+               auth_provider_state: state.auth_provider_state,
+               header_sanitizer: fn retry_headers ->
+                 sanitize_http_request("POST", url, retry_headers, state)
+               end
+             ) do
+        {:ok, %{state | modern_streams: Map.put(state.modern_streams, request_id, pid)}}
+      else
+        {:error, reason} -> {:error, reason, state}
+      end
     end
   end
 

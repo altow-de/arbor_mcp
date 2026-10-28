@@ -290,6 +290,9 @@ defmodule Arbor.MCP.Client.ConnectionManager do
         {:error, reason} ->
           {:error, reason, settled_state}
 
+        {:error, reason, latest_state} ->
+          {:error, reason, latest_state}
+
         other ->
           {:error, other, settled_state}
       end
@@ -1051,23 +1054,31 @@ defmodule Arbor.MCP.Client.ConnectionManager do
       # other id is someone else's answer (a stale proxy's, say): both stay
       # the transport error they were.
       {:error, {:http_error, 400, body}} = error ->
-        initialize_id = request["id"]
+        initialize_response_error(error, body, request, transport_state, deadline)
 
-        case Protocol.parse_message(body) do
-          {:error, details, ^initialize_id} when is_map(details) ->
-            body
-            |> parse_handshake_response(transport_state)
-            |> with_state(transport_state)
+      {:error, {:http_error, 400, body} = reason, latest_state} ->
+        initialize_response_error({:error, reason}, body, request, latest_state, deadline)
 
-          _other ->
-            {:error, initialize_send_error(error, deadline), transport_state}
-        end
+      {:error, reason, latest_state} ->
+        {:error, initialize_send_error({:error, reason}, deadline), latest_state}
 
       {:error, _reason} = error ->
         {:error, initialize_send_error(error, deadline), transport_state}
 
       other ->
         {:error, other, transport_state}
+    end
+  end
+
+  defp initialize_response_error(error, body, request, transport_state, deadline) do
+    initialize_id = request["id"]
+
+    case Protocol.parse_message(body) do
+      {:error, details, ^initialize_id} when is_map(details) ->
+        body |> parse_handshake_response(transport_state) |> with_state(transport_state)
+
+      _other ->
+        {:error, initialize_send_error(error, deadline), transport_state}
     end
   end
 

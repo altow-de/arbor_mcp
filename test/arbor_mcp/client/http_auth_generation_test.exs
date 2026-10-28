@@ -7,6 +7,46 @@ defmodule Arbor.MCP.Client.HTTPAuthGenerationTest do
 
   @moduletag :reauth_round6
 
+  for kind <- [:post, :request, :subscription] do
+    @tag :reauth_round8
+    test "a rejected cached static credential is refused before another #{kind} POST" do
+      bypass = Bypass.open()
+      owner = self()
+
+      Bypass.stub(bypass, "POST", "/mcp", fn conn ->
+        send(owner, :static_token_posted)
+        assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer A"]
+        conn |> Plug.Conn.put_resp_header("www-authenticate", "Basic") |> Plug.Conn.resp(401, "")
+      end)
+
+      {:ok, transport} =
+        HTTP.connect(
+          url: "http://127.0.0.1:#{bypass.port}/mcp",
+          use_sse: false,
+          auth_provider: {Arbor.MCP.Authorization.Provider.Static, token: "A"}
+        )
+
+      transport = HTTP.settle_protocol_era(transport, :modern, "2026-07-28")
+      request = Jason.encode!(%{"jsonrpc" => "2.0", "id" => 1, "method" => "tools/call"})
+      assert {:error, :unauthorized, retired} = HTTP.send_authenticated(request, transport)
+      assert_receive :static_token_posted
+      assert retired.access_token == nil
+
+      result =
+        if unquote(kind) == :post,
+          do: HTTP.send_async(request, retired),
+          else: HTTP.open_stream(request, retired, self(), stream_kind: unquote(kind))
+
+      assert {:error, {:auth_refused, {:authentication_failed, :rejected_credential}},
+              after_refusal} = result
+
+      assert after_refusal.credential_generation == retired.credential_generation
+      assert after_refusal.rejected_generation == retired.rejected_generation
+      assert after_refusal.access_token == nil
+      refute_received :static_token_posted
+    end
+  end
+
   for kind <- [:post, :stream] do
     @tag :reauth_round7
     test "#{kind} rejection notices require ownership and retire only the matching generation" do

@@ -3625,6 +3625,13 @@ defmodule Arbor.MCP.Client do
       {:ok, request_id, new_state} ->
         %{new_state | health_check_id: request_id}
 
+      {:error, reason, new_state} ->
+        Logger.debug("MCP health check ping could not be sent",
+          reason: LogSummary.describe(reason)
+        )
+
+        %{new_state | health_check_id: nil}
+
       {:error, reason} ->
         Logger.debug("MCP health check ping could not be sent",
           reason: LogSummary.describe(reason)

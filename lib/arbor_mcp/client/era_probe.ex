@@ -114,6 +114,15 @@ defmodule Arbor.MCP.Client.EraProbe do
            bounded_send_and_receive(transport_mod, outbound, transport_state, opts) do
       parse_response(response, request_id, mode, updated_state)
     else
+      {:error, {:http_error, status, body}, latest_state} when status in [400, 404, 405] ->
+        parse_http_probe_error(status, body, latest_state)
+
+      {:error, {:probe_timeout, reason}, latest_state} ->
+        {:error, {:probe_timeout, reason}, latest_state}
+
+      {:error, reason, latest_state} ->
+        {:error, {:transport_error, reason}, latest_state}
+
       {:error, {:probe_timeout, reason}} ->
         {:error, {:probe_timeout, reason}, transport_state}
 
@@ -242,6 +251,10 @@ defmodule Arbor.MCP.Client.EraProbe do
 
       {:error, _reason} = error ->
         error
+
+      {:error, reason, updated_state} ->
+        {:error, reason,
+         Deadline.put_on_transport(transport_mod, updated_state, establish_deadline)}
     end
   end
 
@@ -252,6 +265,10 @@ defmodule Arbor.MCP.Client.EraProbe do
 
       {:ok, updated_state} ->
         await_response(transport_mod, updated_state, deadline)
+
+      {:error, reason, updated_state} ->
+        error = if Deadline.expired?(deadline), do: {:probe_timeout, reason}, else: reason
+        {:error, error, updated_state}
 
       {:error, reason} ->
         if Deadline.expired?(deadline),

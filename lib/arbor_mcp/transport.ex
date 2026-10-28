@@ -113,9 +113,15 @@ defmodule Arbor.MCP.Transport do
   both the 2-tuple and 3-tuple success shapes; transports that deliver
   responses asynchronously (via `receive_message/1` or `subscribe/2`)
   should return the 2-tuple.
+
+  A failed send may return `{:error, reason, new_state}` to preserve state
+  changed during authentication or retirement. Callers must retain that state.
   """
   @callback send_message(message(), state()) ::
-              {:ok, state()} | {:ok, state(), response :: binary() | map()} | {:error, any()}
+              {:ok, state()}
+              | {:ok, state(), response :: binary() | map()}
+              | {:error, any()}
+              | {:error, any(), state()}
 
   @doc """
   Receives a message from the transport.

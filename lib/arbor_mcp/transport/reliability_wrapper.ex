@@ -373,8 +373,14 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
       {:ok, new_wrapped_state} ->
         {:ok, %{state | wrapped_state: new_wrapped_state}}
 
+      {:ok, new_wrapped_state, response} when function == :send_message ->
+        {:ok, %{state | wrapped_state: new_wrapped_state}, response}
+
       {:ok, result, new_wrapped_state} ->
         {:ok, result, %{state | wrapped_state: new_wrapped_state}}
+
+      {:error, reason, new_wrapped_state} ->
+        {:error, reason, %{state | wrapped_state: new_wrapped_state}}
 
       {:error, reason} = error ->
         Logger.debug("Transport operation failed",

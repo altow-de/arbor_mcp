@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Synchronous HTTP failures now retain updated credentials and rejection state
+  through notifications, server-request replies, batches, and establishment.
+  Cached provider tokens cannot gain a fresh generation without acquisition
+  evidence or be reused after rejection. HTTP 401/403 responses are handled
+  from their headers even when their bodies exceed response limits; non-auth
+  responses retain their existing byte limits.
 - HTTP authentication retires rejected credential generations on every 401,
   including the response that exhausts POST or stream retries and synchronous
   authenticated sends. Provider refreshes receive a new generation even when

@@ -50,6 +50,137 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     def handle_forbidden(www, scopes, state), do: handle_unauthorized(www, scopes, state)
   end
 
+  for kind <- [:notification, :reply] do
+    @tag :reauth_round8
+    test "a synchronous #{kind} retains credential retirement before the next request" do
+      kind = unquote(kind)
+      {client, counter} = start_client(&finish/2, era: :modern, synchronous_refusal: kind)
+      assert {:ok, _} = Task.await(call(client))
+      before = :sys.get_state(client).transport_state
+
+      if kind == :notification do
+        assert :ok = Client.notify(client, "notifications/protected", %{})
+      else
+        request = Jason.encode!(%{"jsonrpc" => "2.0", "id" => "server-ping", "method" => "ping"})
+        send(client, {:transport_message, request})
+      end
+
+      assert_receive {:synchronous_refusal, ^kind}, 2_000
+      after_refusal = :sys.get_state(client).transport_state
+      assert after_refusal.access_token == nil
+      assert after_refusal.rejected_generation == before.credential_generation
+      assert {:ok, _} = Task.await(call(client))
+      assert Agent.get(counter, & &1.tokens) == 2
+      assert :sys.get_state(client).transport_state.access_token == "token-2"
+    end
+  end
+
+  @tag :reauth_round8
+  test "cached static credentials fail definitively through client retries and subscription opening" do
+    {client, counter} =
+      start_client(&finish/2,
+        era: :modern,
+        auth_provider: {Arbor.MCP.Authorization.Provider.Static, token: "token-1"},
+        reject_static: true
+      )
+
+    assert {:error, %{reason: {:authentication_failed, :unauthorized}}} =
+             Client.call_tool(client, "protected", %{"reject_static" => true}, format: :map)
+
+    retired = :sys.get_state(client).transport_state
+    assert retired.access_token == nil
+
+    assert {:error, %{reason: {:authentication_failed, :rejected_credential}}} =
+             Client.call_tool(client, "protected", %{},
+               format: :map,
+               retry_policy: [max_attempts: 3, initial_delay: 0, should_retry?: fn _ -> true end]
+             )
+
+    assert {:error,
+            {:stream_error, {:auth_refused, {:authentication_failed, :rejected_credential}}}} =
+             Client.listen(client, %{"toolsListChanged" => true})
+
+    assert :sys.get_state(client).transport_state.credential_generation ==
+             retired.credential_generation
+
+    assert [[[_bearer]]] = Agent.get(counter, &Map.values(&1.posts))
+    assert Agent.get(counter, & &1.tokens) == 0
+  end
+
+  for kind <- [:post, :request] do
+    @tag :reauth_round8
+    test "an oversized 403 still performs the required scope step-up for #{kind}" do
+      {client, counter} =
+        start_client(&finish/2, era: :modern, oversized_auth: :length, oversized_status: 403)
+
+      assert {:ok, _} = Task.await(call(client))
+
+      :sys.replace_state(client, fn state ->
+        %{state | transport_state: %{state.transport_state | max_response_bytes: 512}}
+      end)
+
+      opts = if unquote(kind) == :request, do: [progress_token: "oversized-403"], else: []
+      assert {:ok, _} = Client.call_tool(client, "protected", %{"oversized" => true}, opts)
+      assert Agent.get(counter, & &1.tokens) == 2
+      assert :sys.get_state(client).transport_state.access_token == "token-2"
+    end
+  end
+
+  for {era, kind} <- [
+        {:legacy, :post},
+        {:modern, :post},
+        {:modern, :request},
+        {:modern, :subscription}
+      ],
+      framing <- [:length, :chunked] do
+    @tag :reauth_round8
+    test "oversized 401 retires credentials on #{era} #{kind} with #{framing} framing" do
+      {client, counter} =
+        start_client(&finish/2, era: unquote(era), oversized_auth: unquote(framing))
+
+      assert {:ok, _} = Task.await(call(client))
+      before = :sys.get_state(client).transport_state
+
+      :sys.replace_state(client, fn state ->
+        %{state | transport_state: %{state.transport_state | max_response_bytes: 512}}
+      end)
+
+      result =
+        case unquote(kind) do
+          :subscription ->
+            Client.listen(client, %{"toolsListChanged" => true}, timeout: 2_000)
+
+          kind ->
+            opts = if kind == :request, do: [progress_token: "oversized-auth"], else: []
+
+            Client.call_tool(
+              client,
+              "protected",
+              %{"oversized" => true},
+              Keyword.merge([format: :map, timeout: 2_000], opts)
+            )
+        end
+
+      if unquote(kind) == :subscription do
+        assert {:error, {:stream_error, {:auth_refused, {:unauthorized, 401, _, "Basic"}}}} =
+                 result
+      else
+        assert {:error, %{reason: {:unauthorized, 401, _, "Basic"}}} = result
+      end
+
+      after_refusal = :sys.get_state(client).transport_state
+      assert after_refusal.access_token == nil
+      assert after_refusal.rejected_generation == before.credential_generation
+      state = Agent.get(counter, & &1)
+      assert state.tokens == 1
+
+      assert Enum.sort(Map.values(state.posts)) ==
+               Enum.sort([[[], ["Bearer token-1"]], [["Bearer token-1"]]])
+
+      refute_received {:ex_mcp_subscription_resync, _, :started}
+    end
+  end
+
   for {era, stream?} <- [{:legacy, false}, {:modern, false}, {:modern, true}] do
     @tag :reauth_round7
     test "the exhausted 401 retires B before a new #{era} request (stream: #{stream?})" do
@@ -928,10 +1059,10 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
 
         %{"id" => id} = reply when not is_map_key(reply, "method") ->
           send(owner, {:client_answered, id, reply})
-          Plug.Conn.resp(conn, 202, "")
+          synchronous_response(conn, :reply, owner, opts)
 
         _notification ->
-          Plug.Conn.resp(conn, 202, "")
+          synchronous_response(conn, :notification, owner, opts)
       end
     end)
 
@@ -982,6 +1113,15 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     {client, counter}
   end
 
+  defp synchronous_response(conn, kind, owner, opts) do
+    if opts[:synchronous_refusal] == kind do
+      send(owner, {:synchronous_refusal, kind})
+      challenge(conn, 401, "Basic")
+    else
+      Plug.Conn.resp(conn, 202, "")
+    end
+  end
+
   defp protected_call(conn, %{"id" => id} = request, counter, origin, owner, answer, opts) do
     authorization = Plug.Conn.get_req_header(conn, "authorization")
 
@@ -1017,6 +1157,12 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
 
   defp authenticated_call(conn, request, token, counter, origin, owner, answer, opts) do
     cond do
+      static_refusal?(request, opts) ->
+        challenge(conn, 401, "Basic")
+
+      oversized_request?(request, token, opts) ->
+        oversized_auth_response(conn, origin, opts)
+
       opts[:reject_final] && token == "token-2" ->
         send(owner, {:terminal_401, self(), request["id"]})
         receive do: (:reject -> :ok)
@@ -1040,6 +1186,39 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
 
       true ->
         ordinary_authenticated_call(conn, request, token, origin, answer, opts)
+    end
+  end
+
+  defp static_refusal?(request, opts),
+    do: opts[:reject_static] && request["params"]["arguments"]["reject_static"]
+
+  defp oversized_request?(request, token, opts),
+    do:
+      opts[:oversized_auth] && token == "token-1" &&
+        (request["method"] == "subscriptions/listen" ||
+           request["params"]["arguments"]["oversized"])
+
+  defp oversized_auth_response(conn, origin, opts) do
+    status = Keyword.get(opts, :oversized_status, 401)
+
+    www =
+      if status == 403,
+        do:
+          ~s(Bearer error="insufficient_scope", resource_metadata="#{origin}/prm", scope="tools.call admin"),
+        else: "Basic"
+
+    conn = Plug.Conn.put_resp_header(conn, "www-authenticate", www)
+    body = String.duplicate("refused", 1_000)
+
+    if opts[:oversized_auth] == :chunked do
+      conn = Plug.Conn.send_chunked(conn, status)
+
+      case Plug.Conn.chunk(conn, body) do
+        {:ok, conn} -> conn
+        {:error, :closed} -> conn
+      end
+    else
+      Plug.Conn.resp(conn, status, body)
     end
   end
 
