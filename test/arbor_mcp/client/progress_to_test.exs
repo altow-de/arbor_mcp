@@ -439,6 +439,122 @@ defmodule Arbor.MCP.Client.ProgressToTest do
       refute_received {:arbor_mcp_progress, _client, _token, _params}
     end
 
+    test "a settled request's late progress never reaches a newer request that reuses its token" do
+      client = scripted()
+      test_pid = self()
+      a_target = spawn_link(fn -> forward_to(test_pid, "a") end)
+      b_target = spawn_link(fn -> forward_to(test_pid, "b") end)
+
+      a = start_call(client, progress_to: a_target, progress_token: "shared")
+      assert_receive {:wire, %{"id" => a_id}}
+      respond(client, a_id)
+      assert {:ok, _result} = Task.await(a)
+
+      b = start_call(client, progress_to: b_target, progress_token: "shared")
+      assert_receive {:wire, %{"id" => b_id}}
+
+      # A's late notification, as legacy HTTP can send on the GET stream after
+      # the POST's response.
+      progress(client, "shared", 2)
+      _state = :sys.get_state(client)
+      refute_received {:forwarded, _target, _message}
+
+      # Once A's token has gone the cleanup grace, B's own progress reaches B.
+      :sys.replace_state(client, &%{&1 | progress_tombstones: %{}})
+      progress(client, "shared", 1)
+
+      assert_receive {:forwarded, "b",
+                      {:arbor_mcp_progress, ^client, "shared", %{"progress" => 1}}}
+
+      respond(client, b_id)
+      assert {:ok, _result} = Task.await(b)
+    end
+
+    test "a request stream's progress naming another request's token reaches no target" do
+      client = scripted()
+      test_pid = self()
+
+      ids =
+        for name <- ["a", "b"] do
+          target = spawn_link(fn -> forward_to(test_pid, name) end)
+          start_call(client, progress_to: target, progress_token: name)
+
+          assert_receive {:wire,
+                          %{"id" => id, "params" => %{"_meta" => %{"progressToken" => ^name}}}}
+
+          id
+        end
+
+      [a_id, _b_id] = ids
+      state = :sys.get_state(client)
+
+      RequestHandler.handle_request_stream_message(a_id, progress_message("b", 1), state)
+      refute_received {:forwarded, _target, _message}
+
+      RequestHandler.handle_request_stream_message(a_id, progress_message("a", 1), state)
+      assert_receive {:forwarded, "a", {:arbor_mcp_progress, _client, "a", %{"progress" => 1}}}
+      refute_received {:forwarded, _target, _message}
+
+      for id <- ids, do: respond(client, id)
+    end
+
+    test "progress stops once the caller's own timeout has answered it, on either route" do
+      client = scripted()
+
+      assert {:error, :timeout} =
+               Client.call_tool(client, "steps", %{},
+                 progress_to: self(),
+                 progress_token: "slow",
+                 timeout: 50
+               )
+
+      assert_receive {:wire, %{"id" => id}}
+
+      # The client keeps the request through its cleanup grace, but the
+      # caller already has its answer.
+      state = :sys.get_state(client)
+      assert Map.has_key?(state.pending_requests, id)
+
+      progress(client, "slow", 1)
+      _state = :sys.get_state(client)
+      RequestHandler.handle_request_stream_message(id, progress_message("slow", 1), state)
+      refute_received {:arbor_mcp_progress, _client, _token, _params}
+    end
+
+    test "no targets remain once a burst of requests settles, however it ends" do
+      client = scripted()
+      :sys.replace_state(client, &%{&1 | default_timeout: 50})
+
+      settle = [
+        complete: fn id -> respond(client, id) end,
+        error: fn id -> respond_error(client, id) end,
+        cancel: fn id -> :ok = Client.send_cancelled(client, id, "stop") end,
+        # The client's own timer answers a call without a timeout.
+        client_timeout: fn _id -> :ok end
+      ]
+
+      calls =
+        for {{how, settle}, n} <- Enum.with_index(settle) do
+          call = start_call(client, progress_to: self(), progress_token: "#{how}-#{n}")
+          assert_receive {:wire, %{"id" => id, "method" => "tools/call"}}
+          settle.(id)
+          call
+        end
+
+      # A caller's own timeout leaves the request to the cleanup grace.
+      timed_out = start_call(client, progress_to: self(), progress_token: "caller", timeout: 50)
+      assert_receive {:wire, %{"id" => _id, "method" => "tools/call"}}
+
+      assert [{:ok, _}, {:error, _}, {:error, :cancelled}, {:error, :timeout}, {:error, :timeout}] =
+               Task.await_many(calls ++ [timed_out], 5_000)
+
+      assert :ok =
+               Arbor.MCP.TestHelpers.wait_until(
+                 fn -> :sys.get_state(client).progress_targets == %{} end,
+                 timeout: 5_000
+               )
+    end
+
     test "each request's progress goes only to its own target" do
       client = scripted()
       test_pid = self()
@@ -607,6 +723,26 @@ defmodule Arbor.MCP.Client.ProgressToTest do
     }
 
     send(client, {:transport_message, Jason.encode!(message)})
+  end
+
+  defp start_call(client, opts) do
+    Task.async(fn -> Client.call_tool(client, "steps", %{}, opts) end)
+  end
+
+  defp progress_message(token, progress) do
+    %{
+      "method" => "notifications/progress",
+      "params" => %{"progressToken" => token, "progress" => progress}
+    }
+  end
+
+  defp respond_error(client, id) do
+    error = %{"code" => -32_603, "message" => "failed"}
+
+    send(
+      client,
+      {:transport_message, Jason.encode!(%{"jsonrpc" => "2.0", "id" => id, "error" => error})}
+    )
   end
 
   defp respond(client, id) do

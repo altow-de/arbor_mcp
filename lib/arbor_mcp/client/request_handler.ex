@@ -310,7 +310,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
   end
 
   defp send_unique_request(request, method, id, from, state, meta) do
-    state = state |> mark_tool_listing(method, id, request) |> remember_progress_target(id, meta)
+    state = mark_tool_listing(state, method, id, request)
     {deadline, meta} = request_send_context(from, state, meta)
 
     result =
@@ -333,6 +333,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
         maybe_schedule_request_timeout(id, meta, updated_state)
         updated_state = track_cacheable(updated_state, id, request, meta)
         updated_state = start_progress_timeout(id, meta, updated_state)
+        updated_state = remember_progress_target(updated_state, id, request, from, deadline, meta)
         pending_requests = Map.put(updated_state.pending_requests, id, {from, :single, method})
         new_state = %{updated_state | pending_requests: pending_requests}
         {:noreply, remember_progress_token(request, id, new_state)}
@@ -883,6 +884,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
       )
       when is_map(params) do
     state = reset_progress_timeout(request_id, state)
+    deliver_progress(:stream, request_id, params, state)
     dispatch_request_notification(:handle_progress, request_id, params, state)
   end
 
@@ -913,7 +915,10 @@ defmodule Arbor.MCP.Client.RequestHandler do
             GenServer.reply(from, {:error, error})
 
             {:noreply,
-             %{state | pending_requests: Map.delete(state.pending_requests, request_id)}}
+             settle_progress(
+               %{state | pending_requests: Map.delete(state.pending_requests, request_id)},
+               request_id
+             )}
 
           {from, :single} ->
             error = request_stream_error(reason)
@@ -921,7 +926,10 @@ defmodule Arbor.MCP.Client.RequestHandler do
             GenServer.reply(from, {:error, error})
 
             {:noreply,
-             %{state | pending_requests: Map.delete(state.pending_requests, request_id)}}
+             settle_progress(
+               %{state | pending_requests: Map.delete(state.pending_requests, request_id)},
+               request_id
+             )}
 
           _not_pending ->
             {:noreply, state}
@@ -1188,6 +1196,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
           |> remember_tool_schemas(method, response_id, response_data)
           |> cache_result(response_id, response_data)
           |> cancel_progress_timeout(response_id)
+          |> settle_progress(response_id)
 
         {:ok, {from, :single}} ->
           :telemetry.execute(
@@ -1198,7 +1207,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
           GenServer.reply(from, response_data)
           new_pending_requests = Map.delete(pending_requests, response_id)
-          %{state | pending_requests: new_pending_requests}
+          settle_progress(%{state | pending_requests: new_pending_requests}, response_id)
 
         {:ok, {:batch, batch_id}} ->
           handle_batch_response_item(response_data, response_id, batch_id, state)
@@ -1262,6 +1271,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
       request_id ->
         if Map.has_key?(state.pending_requests, request_id) do
           state = reset_progress_timeout(request_id, state)
+          deliver_progress(:connection, request_id, params, state)
           dispatch_request_notification(:handle_progress, request_id, params, state)
         else
           {:noreply, forget_progress_token(state, params["progressToken"])}
@@ -1362,8 +1372,6 @@ defmodule Arbor.MCP.Client.RequestHandler do
       %{request_id: request_id, method: callback}
     )
 
-    if callback == :handle_progress, do: deliver_progress(request_id, params, state)
-
     {handler, handler_state, state} = ensure_client_handler(state)
 
     if handler != :none and function_exported?(handler, callback, 3) do
@@ -1398,30 +1406,120 @@ defmodule Arbor.MCP.Client.RequestHandler do
   end
 
   # progress_to: a request's progress also goes to a process the caller
-  # chose, alongside the client handler. The target is recorded before the
-  # send and kept only while some request is pending: delivery checks that
-  # this one still is, so progress stops at its response, and recording the
-  # next target drops the settled ones.
-  defp remember_progress_target(state, id, %{progress_to: pid}) when is_pid(pid) do
+  # chose, alongside the client handler, but only while that request is
+  # pending for its caller, and never to another request's target.
+  #
+  # - `progress_targets` maps a pending request's id to its target, its own
+  #   progress token, its caller and the caller's deadline. The entry is made
+  #   once the request is pending, and dropped by settle_progress/2 when the
+  #   caller has its answer (a result, an error, a timeout or a
+  #   cancellation), or with every other when the connection goes (the
+  #   client's disconnect and teardown clear the map).
+  # - `progress_tombstones` holds the tokens of requests settled within the
+  #   cleanup grace, with when each expires. Connection-level progress names
+  #   its request only by token, and a settled request's late notification
+  #   (legacy HTTP can send one on the GET stream after the POST's response)
+  #   would otherwise reach a newer request that reuses the token. While a
+  #   token is tombstoned, connection-level progress naming it reaches no
+  #   target. Client-generated tokens are unique and never meet one.
+  defp remember_progress_target(state, id, request, {caller, _tag}, deadline, %{progress_to: pid})
+       when is_pid(pid) and is_pid(caller) do
+    target = %{
+      pid: pid,
+      token: get_in(request, ["params", "_meta", "progressToken"]),
+      caller: caller,
+      deadline: deadline
+    }
+
+    # Settling drops each entry; a request settled on a path that doesn't
+    # is dropped here, so the map never outgrows the pending requests.
     live =
-      Map.filter(progress_targets(state), fn {request_id, _pid} ->
+      Map.filter(progress_targets(state), fn {request_id, _target} ->
         Map.has_key?(state.pending_requests, request_id)
       end)
 
-    Map.put(state, :progress_targets, Map.put(live, id, pid))
+    Map.put(state, :progress_targets, Map.put(live, id, target))
   end
 
-  defp remember_progress_target(state, _id, _meta), do: state
+  defp remember_progress_target(state, _id, _request, _from, _deadline, _meta), do: state
 
-  # A dead target misses the update, and the request goes on.
-  defp deliver_progress(request_id, params, state) do
-    with pid when is_pid(pid) <- Map.get(progress_targets(state), request_id),
-         true <- Map.has_key?(state.pending_requests, request_id) do
-      send(pid, {:arbor_mcp_progress, self(), Map.get(params, "progressToken"), params})
+  @doc false
+  # The caller of request `id` has its answer: its progress reaches no
+  # target from now on, and its token is tombstoned for the cleanup grace.
+  @spec settle_progress(map(), term()) :: map()
+  def settle_progress(state, id) do
+    {target, targets} = Map.pop(progress_targets(state), id)
+    state = Map.put(state, :progress_targets, targets)
+
+    case (target && target.token) || request_token(state, id) do
+      nil -> state
+      token -> tombstone_token(state, token, id)
+    end
+  end
+
+  defp request_token(state, id) do
+    Enum.find_value(Map.get(state, :progress_requests) || %{}, fn
+      {token, ^id} -> token
+      _other -> nil
+    end)
+  end
+
+  defp tombstone_token(state, token, id) do
+    now = now()
+
+    tombstones =
+      (Map.get(state, :progress_tombstones) || %{})
+      |> Map.filter(fn {_token, expires_at} -> expires_at > now end)
+      |> Map.put(token, now + @caller_timeout_grace)
+
+    requests =
+      case Map.get(state, :progress_requests) || %{} do
+        %{^token => ^id} = requests -> Map.delete(requests, token)
+        requests -> requests
+      end
+
+    state
+    |> Map.put(:progress_tombstones, tombstones)
+    |> Map.put(:progress_requests, requests)
+  end
+
+  defp tombstoned?(state, token) do
+    case Map.get(Map.get(state, :progress_tombstones) || %{}, token) do
+      expires_at when is_integer(expires_at) -> expires_at > now()
+      nil -> false
+    end
+  end
+
+  # `route` is :stream for a modern request stream, which carries only its
+  # own request's messages, or :connection for progress routed by token.
+  defp deliver_progress(route, request_id, params, state) do
+    token = Map.get(params, "progressToken")
+
+    case Map.get(progress_targets(state), request_id) do
+      %{token: ^token} = target ->
+        if deliverable?(route, target, request_id, state),
+          do: send(target.pid, {:arbor_mcp_progress, self(), token, params})
+
+      %{} ->
+        Logger.debug("Request stream progress named another request's token")
+
+      nil ->
+        :ok
     end
 
     :ok
   end
+
+  defp deliverable?(route, target, request_id, state) do
+    Map.has_key?(state.pending_requests, request_id) and
+      not Deadline.expired?(target.deadline) and
+      caller_alive?(target.caller) and
+      not (route == :connection and tombstoned?(state, target.token))
+  end
+
+  # Liveness can only be asked on the caller's own node.
+  defp caller_alive?(caller) when node(caller) == node(), do: Process.alive?(caller)
+  defp caller_alive?(_remote), do: true
 
   defp progress_targets(state), do: Map.get(state, :progress_targets) || %{}
 
@@ -2036,13 +2134,17 @@ defmodule Arbor.MCP.Client.RequestHandler do
           # Reply with cancelled error and remove from pending
           GenServer.reply(from, {:error, :cancelled})
           new_pending = Map.delete(state.pending_requests, request_id)
-          {:noreply, %{updated_state | pending_requests: new_pending}}
+
+          {:noreply,
+           settle_progress(%{updated_state | pending_requests: new_pending}, request_id)}
 
         {from, :single} ->
           # Reply with cancelled error and remove from pending
           GenServer.reply(from, {:error, :cancelled})
           new_pending = Map.delete(state.pending_requests, request_id)
-          {:noreply, %{updated_state | pending_requests: new_pending}}
+
+          {:noreply,
+           settle_progress(%{updated_state | pending_requests: new_pending}, request_id)}
 
         _ ->
           # Other types of requests (batch, etc.)

@@ -78,8 +78,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     rounds share it. With `mrtr: :manual`, the caller must pass
     `:progress_token` and repeat it on every round, or the call returns a
     `ValidationError`.
-  - Delivery stops at the response. A dead target misses the updates without
-    failing the request.
+  - Delivery stops once the call returns, with a result, an error, a timeout
+    or a cancellation. A request's target gets only that request's progress.
+    The token of a request that settled less than a second ago reaches no
+    target, so a late notification can't reach a newer request that reuses
+    it. Use connection-unique tokens.
+  - A dead target misses the updates without failing the request.
 
   See "Progress to another process" in `docs/PROTOCOL_GUIDE.md`.
 

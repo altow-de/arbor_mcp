@@ -1335,8 +1335,10 @@ can't combine with either.
 
 `progress_to: pid` sends the request's progress to `pid` as
 `{:arbor_mcp_progress, client, progress_token, params}`, alongside the client
-handler, until the response arrives. A dead `pid` misses the updates without
-failing the request. See "Progress to another process" in the
+handler, until the call returns. A dead `pid` misses the updates without
+failing the request. Use connection-unique upstream tokens, as the example
+does: a token a recently settled request carried reaches no target for a
+second. See "Progress to another process" in the
 [Protocol Guide](PROTOCOL_GUIDE.md#progress-to-another-process).
 
 `input_responses:` and `request_state:` without `mrtr: :manual`,

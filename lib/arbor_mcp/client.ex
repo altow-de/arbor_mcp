@@ -120,8 +120,10 @@ defmodule Arbor.MCP.Client do
     # connection-level notifications/progress reaches the request it reports on.
     progress_requests: %{},
     # Requests made with progress_to:, mapped to the process that also gets
-    # their progress (see RequestHandler).
+    # their progress, and the tokens of recently settled requests that no
+    # target may receive progress for yet (see RequestHandler).
     progress_targets: %{},
+    progress_tombstones: %{},
     # Requests made with reset_timeout_on_progress, mapped to the timer that
     # runs out if they go that long without progress: {timer, tag, ms}.
     progress_timeouts: %{},
@@ -651,9 +653,9 @@ defmodule Arbor.MCP.Client do
     without `mrtr: :manual`
   - `:progress_to` - A pid that also gets this request's progress, alongside
     the handler, as `{:arbor_mcp_progress, client, progress_token, params}`,
-    until the response arrives. A progress token is added if the request has
-    none; with `mrtr: :manual`, pass `:progress_token`. See "Progress to
-    another process" in the Protocol Guide.
+    until the call returns. A progress token is added if the request has
+    none; with `mrtr: :manual`, pass `:progress_token`, unique on the
+    connection. See "Progress to another process" in the Protocol Guide.
 
   `Arbor.MCP.Client.Operations.Tools.call_tool/4` lists the other request
   options. `nil` leaves `:mrtr`, `:input_responses`, `:request_state`,
@@ -1884,6 +1886,8 @@ defmodule Arbor.MCP.Client do
         pending_requests: %{},
         pending_batches: %{},
         cancelled_requests: MapSet.new(),
+        progress_targets: %{},
+        progress_tombstones: %{},
         receiver_task: nil,
         health_check_ref: nil,
         health_check_id: nil,
@@ -1967,13 +1971,27 @@ defmodule Arbor.MCP.Client do
         # Reply with cancelled error and remove from pending
         GenServer.reply(from, {:error, :cancelled})
         new_pending = Map.delete(state.pending_requests, request_id)
-        {:reply, :ok, prune_legacy_posts(%{updated_state | pending_requests: new_pending})}
+
+        state =
+          RequestHandler.settle_progress(
+            %{updated_state | pending_requests: new_pending},
+            request_id
+          )
+
+        {:reply, :ok, prune_legacy_posts(state)}
 
       {from, :single} ->
         # Reply with cancelled error and remove from pending
         GenServer.reply(from, {:error, :cancelled})
         new_pending = Map.delete(state.pending_requests, request_id)
-        {:reply, :ok, prune_legacy_posts(%{updated_state | pending_requests: new_pending})}
+
+        state =
+          RequestHandler.settle_progress(
+            %{updated_state | pending_requests: new_pending},
+            request_id
+          )
+
+        {:reply, :ok, prune_legacy_posts(state)}
 
       _ ->
         # Other types of requests (batch, etc.) - just track as cancelled
@@ -2457,7 +2475,8 @@ defmodule Arbor.MCP.Client do
       {from, :single, _method} ->
         GenServer.reply(from, {:error, :timeout})
 
-        state = cancel_timed_out(request_id, state)
+        state =
+          request_id |> cancel_timed_out(state) |> RequestHandler.settle_progress(request_id)
 
         {:noreply,
          prune_legacy_posts(%{
@@ -2468,7 +2487,8 @@ defmodule Arbor.MCP.Client do
       {from, :single} ->
         GenServer.reply(from, {:error, :timeout})
 
-        state = cancel_timed_out(request_id, state)
+        state =
+          request_id |> cancel_timed_out(state) |> RequestHandler.settle_progress(request_id)
 
         {:noreply,
          prune_legacy_posts(%{
@@ -2641,11 +2661,11 @@ defmodule Arbor.MCP.Client do
       case Map.get(state.pending_requests, id) do
         {from, :single, _method} ->
           GenServer.reply(from, {:error, error})
-          %{state | pending_requests: Map.delete(state.pending_requests, id)}
+          settled(state, id)
 
         {from, :single} ->
           GenServer.reply(from, {:error, error})
-          %{state | pending_requests: Map.delete(state.pending_requests, id)}
+          settled(state, id)
 
         {from, :batch, ordered_ids, received} when is_map(received) ->
           # Preserve responses already delivered for this exact envelope. Its
@@ -2920,7 +2940,15 @@ defmodule Arbor.MCP.Client do
       _other -> :ok
     end
 
-    %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+    settled(state, request_id)
+  end
+
+  # A single request whose caller has its answer.
+  defp settled(state, request_id) do
+    RequestHandler.settle_progress(
+      %{state | pending_requests: Map.delete(state.pending_requests, request_id)},
+      request_id
+    )
   end
 
   defp fail_async_post_request(state, request_id, reason, deadline \\ nil) do
@@ -2932,12 +2960,12 @@ defmodule Arbor.MCP.Client do
     case request_id && Map.get(state.pending_requests, request_id) do
       {from, :single, _method} ->
         GenServer.reply(from, {:error, error})
-        state = %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+        state = settled(state, request_id)
         if timed_out?, do: cancel_timed_out(request_id, state), else: state
 
       {from, :single} ->
         GenServer.reply(from, {:error, error})
-        state = %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+        state = settled(state, request_id)
         if timed_out?, do: cancel_timed_out(request_id, state), else: state
 
       _ ->
@@ -3152,6 +3180,8 @@ defmodule Arbor.MCP.Client do
         pending_requests: %{},
         pending_batches: %{},
         cancelled_requests: MapSet.new(),
+        progress_targets: %{},
+        progress_tombstones: %{},
         health_check_ref: nil,
         health_check_id: nil,
         async_post_tasks: %{},

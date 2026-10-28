@@ -432,8 +432,22 @@ end
   generated token would differ between rounds. Under automatic MRTR every
   round already shares the request's token, so each round's progress
   arrives.
-- **Delivery stops at the response.** Progress that arrives after it, as
-  late notifications on stdio or legacy HTTP can, isn't sent.
+- **Delivery stops once the call returns,** with a result, an error, a
+  timeout or a cancellation, even while the client is still cleaning up
+  after a caller's own `:timeout`. Progress that arrives later, as late
+  notifications on stdio or legacy HTTP can, isn't sent.
+- **A request's target gets only that request's progress.** A message on a
+  modern request stream that names another request's token is dropped. After
+  a request settles, its token is held back for a second, the client's
+  cleanup grace: progress naming it on the connection reaches no target, so
+  a late notification can't reach a newer request that reuses the token.
+  Such a newer request gets its progress at its target only once that
+  second has passed.
+- **Use tokens that are unique on the connection.** The client's generated
+  tokens are. A gateway that forwards downstream requests shouldn't reuse
+  downstream tokens upstream, since different downstream clients may pick
+  the same ones: generate a token per downstream request and map back to the
+  downstream token when relaying.
 - **A dead target misses the updates.** The request goes on, and the handler
   still gets them.
 - **Every transport that carries progress delivers it:** modern Streamable
