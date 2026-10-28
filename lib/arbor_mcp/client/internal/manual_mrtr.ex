@@ -27,6 +27,7 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
   # error leaves out input responses and request state, which may hold the
   # user's answers or a resumable token.
 
+  alias Arbor.MCP.Client.Internal.InputResultSchema
   alias Arbor.MCP.Client.MRTR
   alias Arbor.MCP.Error
   alias Arbor.MCP.Protocol.ErrorCodes
@@ -191,14 +192,17 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
 
   defp validate_input_responses(nil, _opts), do: :ok
 
-  # The same byte limit that automatic MRTR puts on the handler's responses.
+  # A cheap first pass rejects anything that isn't a map of ids to plain maps,
+  # structs included. The same byte limit that automatic MRTR puts on the
+  # handler's responses follows, and then each response, as it will go out
+  # on the wire, is checked against the schema.
   defp validate_input_responses(responses, opts) when is_plain_map(responses) do
     maximum = MRTR.max_bytes(opts)
 
     if Enum.all?(responses, &response_entry?/1) do
       case Jason.encode(responses) do
         {:ok, encoded} when byte_size(encoded) <= maximum ->
-          :ok
+          validate_input_results(Jason.decode!(encoded))
 
         {:ok, _encoded} ->
           invalid_responses("exceed the MRTR byte limit of #{maximum} (:max_mrtr_bytes)")
@@ -214,61 +218,26 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
   defp validate_input_responses(_responses, _opts), do: invalid_responses(@responses_shape)
 
   defp response_entry?({id, response}),
-    do: is_binary(id) and byte_size(id) > 0 and input_result?(response)
+    do: is_binary(id) and byte_size(id) > 0 and is_plain_map(response)
 
   # The client keeps nothing between rounds, so it can't tell which input
-  # request an id answered: a response is valid if it is one of the results
-  # the 2026-07-28 schema defines for an input request.
-  defp input_result?(response) when is_plain_map(response),
-    do: elicit_result?(response) or create_message_result?(response) or roots_result?(response)
+  # request an id answered: a response is valid if it is any of the results
+  # the 2026-07-28 schema defines for an input request. The error names the
+  # id but never the response.
+  defp validate_input_results(responses) do
+    responses
+    |> Enum.sort()
+    |> Enum.find(fn {_id, response} -> not InputResultSchema.valid?(response) end)
+    |> case do
+      nil ->
+        :ok
 
-  defp input_result?(_response), do: false
-
-  # ElicitResult: an action, and for accept optional content of primitives.
-  defp elicit_result?(response) do
-    field(response, "action", :action) in ["accept", "decline", "cancel"] and
-      case fetch_field(response, "content", :content) do
-        :error -> true
-        {:ok, content} when is_plain_map(content) -> Enum.all?(content, &elicit_value?/1)
-        {:ok, _content} -> false
-      end
-  end
-
-  defp elicit_value?({_name, value})
-       when is_binary(value) or is_number(value) or is_boolean(value),
-       do: true
-
-  defp elicit_value?({_name, values}) when is_list(values), do: Enum.all?(values, &is_binary/1)
-  defp elicit_value?(_entry), do: false
-
-  # CreateMessageResult: a role, a model, and a content block or blocks.
-  defp create_message_result?(response) do
-    field(response, "role", :role) in ["user", "assistant"] and
-      is_binary(field(response, "model", :model)) and
-      sampling_content?(field(response, "content", :content))
-  end
-
-  defp sampling_content?(blocks) when is_list(blocks), do: Enum.all?(blocks, &content_block?/1)
-  defp sampling_content?(block), do: content_block?(block)
-
-  defp content_block?(block) when is_plain_map(block), do: is_binary(field(block, "type", :type))
-  defp content_block?(_block), do: false
-
-  # ListRootsResult: a list of roots, each with a URI.
-  defp roots_result?(response) do
-    case field(response, "roots", :roots) do
-      roots when is_list(roots) -> Enum.all?(roots, &root?/1)
-      _other -> false
+      {id, _response} ->
+        invalid_responses(
+          "#{inspect(id, printable_limit: 64)} is not an elicitation, sampling or roots " <>
+            "result of the MCP 2026-07-28 schema"
+        )
     end
-  end
-
-  defp root?(root) when is_plain_map(root), do: is_binary(field(root, "uri", :uri))
-  defp root?(_root), do: false
-
-  defp field(map, key, atom), do: Map.get(map, key, Map.get(map, atom))
-
-  defp fetch_field(map, key, atom) do
-    with :error <- Map.fetch(map, key), do: Map.fetch(map, atom)
   end
 
   defp invalid_responses(reason),

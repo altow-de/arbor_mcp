@@ -12,6 +12,7 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
   use ExUnit.Case, async: true
 
   alias Arbor.MCP.Client
+  alias Arbor.MCP.Client.Internal.InputResultSchema
   alias Arbor.MCP.Error.{ProtocolError, ValidationError}
   alias Arbor.MCP.Server.{Context, HandlerServer, Runtime}
 
@@ -970,6 +971,8 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
         assert_received {:wire, %{"params" => %{"inputResponses" => %{"id" => _response}}}}
       end
 
+      sampled = %{"role" => "assistant", "model" => "m", "content" => text}
+
       invalid = [
         # A response wrapped in a JSON-RPC result, as a reviewer found.
         %{"result" => %{"action" => "accept"}},
@@ -982,18 +985,49 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
         %{"role" => "assistant", "model" => "m", "content" => %{"text" => "Short."}},
         %{"role" => "assistant", "model" => "m", "content" => [text, "Short."]},
         %{"roots" => "file:///work"},
-        %{"roots" => [%{"name" => "work"}]}
+        %{"roots" => [%{"name" => "work"}]},
+        # The second review's cases, which a check of names and types alone
+        # let through: the schema's required members, its block types,
+        # nested tool results, typed optional fields and integer content.
+        %{sampled | "content" => %{"type" => "text"}},
+        %{sampled | "content" => %{"type" => "video", "uri" => "x"}},
+        %{
+          sampled
+          | "content" => [%{"type" => "tool_result", "toolUseId" => "t", "content" => "x"}]
+        },
+        Map.put(sampled, "stopReason", 123),
+        Map.put(sampled, "_meta", false),
+        %{"roots" => [%{"uri" => "file:///work", "name" => 123}]},
+        %{"action" => "accept", "content" => %{"age" => 1.5}}
       ]
 
       for response <- invalid do
-        assert {:error, %ValidationError{field: :input_responses, reason: @responses_shape}} =
+        assert {:error, %ValidationError{field: :input_responses, value: nil, reason: reason}} =
                  Client.call_tool(client, "ask", %{},
                    mrtr: :manual,
                    input_responses: %{"id" => response}
                  )
+
+        assert reason ==
+                 ~s("id" is not an elicitation, sampling or roots result of the MCP 2026-07-28 schema)
       end
 
       refute_received {:wire, _request}
+    end
+
+    test "the input-result schema is the one in docs/mcp-specs/2026-07-28" do
+      definitions =
+        "../../../docs/mcp-specs/2026-07-28/schema.json"
+        |> Path.expand(__DIR__)
+        |> File.read!()
+        |> Jason.decode!()
+        |> Map.fetch!("$defs")
+
+      embedded = InputResultSchema.definitions()
+      assert InputResultSchema.results() -- Map.keys(embedded) == []
+
+      assert embedded ==
+               Map.take(definitions, referenced(InputResultSchema.results(), definitions))
     end
 
     # A forwarding handler must never crash on what it was given: a struct is
@@ -1091,6 +1125,26 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
       refute_received {:wire, _request}
     end
   end
+
+  # Every definition the named ones reach through `$ref`, themselves included.
+  defp referenced(names, definitions, seen \\ MapSet.new())
+  defp referenced([], _definitions, seen), do: MapSet.to_list(seen)
+
+  defp referenced([name | rest], definitions, seen) do
+    if MapSet.member?(seen, name) do
+      referenced(rest, definitions, seen)
+    else
+      refs = definitions |> Map.fetch!(name) |> refs()
+      referenced(refs ++ rest, definitions, MapSet.put(seen, name))
+    end
+  end
+
+  defp refs(%{"$ref" => "#/$defs/" <> name} = schema),
+    do: [name | refs(Map.delete(schema, "$ref"))]
+
+  defp refs(schema) when is_map(schema), do: Enum.flat_map(Map.values(schema), &refs/1)
+  defp refs(schemas) when is_list(schemas), do: Enum.flat_map(schemas, &refs/1)
+  defp refs(_value), do: []
 
   def forward_mrtr_telemetry(event, measurements, metadata, test_pid) do
     # The events run in the calling process; other tests' calls aren't ours.
