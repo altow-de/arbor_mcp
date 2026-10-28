@@ -278,6 +278,29 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
     end
   end
 
+  describe "a legacy Streamable HTTP request whose caller exits" do
+    test "is cancelled with notifications/cancelled only when the call asks" do
+      client = start_legacy_http_client()
+
+      {caller, caller_ref} =
+        start_caller(fn ->
+          Client.call_tool(client, "hang", %{}, timeout: 5_000, cancel_on_caller_exit: true)
+        end)
+
+      assert_receive {:hang_started, request_id}, 3_000
+      kill(caller, caller_ref)
+      assert_receive {:cancelled, %{"requestId" => ^request_id}}, 3_000
+
+      {quiet, quiet_ref} =
+        start_caller(fn -> Client.call_tool(client, "hang", %{}, timeout: 5_000) end)
+
+      assert_receive {:hang_started, quiet_id}, 3_000
+      refute watched_by?(quiet, client)
+      kill(quiet, quiet_ref)
+      refute_received {:cancelled, %{"requestId" => ^quiet_id}}
+    end
+  end
+
   test "an invalid cancel_on_caller_exit is refused" do
     client = start_beam_client(:modern_only)
 
@@ -405,6 +428,72 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
 
     on_exit(fn -> stop(client) end)
     client
+  end
+
+  # A scripted legacy-era server: "hang" runs until its connection closes.
+  defp start_legacy_http_client do
+    bypass = Bypass.open()
+    test_pid = self()
+
+    Bypass.stub(bypass, "POST", "/mcp", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      legacy_respond(conn, Jason.decode!(body), test_pid)
+    end)
+
+    {:ok, client} =
+      Client.start_link(
+        transport: :http,
+        url: "http://127.0.0.1:#{bypass.port}/mcp",
+        use_sse: false,
+        protocol_mode: :legacy_only,
+        health_check_interval: nil,
+        reconnect: false
+      )
+
+    on_exit(fn -> stop(client) end)
+    client
+  end
+
+  defp legacy_respond(conn, %{"method" => "initialize", "id" => id}, _test_pid) do
+    json(conn, %{
+      "jsonrpc" => "2.0",
+      "id" => id,
+      "result" => %{
+        "protocolVersion" => "2025-06-18",
+        "capabilities" => %{"tools" => %{}},
+        "serverInfo" => %{"name" => "legacy-cancel", "version" => "1"}
+      }
+    })
+  end
+
+  defp legacy_respond(conn, %{"method" => "tools/call", "id" => id}, test_pid) do
+    send(test_pid, {:hang_started, id})
+    Process.flag(:trap_exit, true)
+
+    receive do
+      {:EXIT, _from, _reason} -> :ok
+    after
+      5_000 -> :ok
+    end
+
+    json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => %{"content" => []}})
+  end
+
+  defp legacy_respond(
+         conn,
+         %{"method" => "notifications/cancelled", "params" => params},
+         test_pid
+       ) do
+    send(test_pid, {:cancelled, params})
+    Plug.Conn.resp(conn, 202, "")
+  end
+
+  defp legacy_respond(conn, _notification, _test_pid), do: Plug.Conn.resp(conn, 202, "")
+
+  defp json(conn, body) do
+    conn
+    |> Plug.Conn.put_resp_content_type("application/json")
+    |> Plug.Conn.resp(200, Jason.encode!(body))
   end
 
   defp stop(client) do
