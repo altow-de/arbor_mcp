@@ -1246,18 +1246,14 @@ limit counts the round's `_meta`, which must be an object if present.
 `:max_mrtr_rounds` doesn't apply, because the caller runs the rounds and
 should bound them itself.
 
-`input_responses:` must map input request ids to the results the 2026-07-28
-schema defines for input requests:
-
-- an elicitation result: `action` of `accept`, `decline` or `cancel`, and
-  optional `content` of strings, numbers, booleans or lists of strings;
-- a `CreateMessageResult`: `role`, `model`, and a content block or a list of
-  them;
-- a `ListRootsResult`: `roots`, each with a `uri`.
-
-The client keeps nothing between rounds, so it can't tell which input
-request an id answered: a response that is any one of these passes. The
-responses are held to `:max_mrtr_bytes` too.
+`input_responses:` must map input request ids to objects, and each object is
+validated, as it will go out on the wire, against the MCP 2026-07-28 schema's
+results for input requests: `ElicitResult`, `CreateMessageResult` or
+`ListRootsResult`, with everything they reference (content blocks, roots and
+so on). The client keeps nothing between rounds, so it can't tell which input
+request an id answered: a response that validates against any one of the
+three passes. A response that matches none returns a `ValidationError` naming
+its id, never its content. The responses are held to `:max_mrtr_bytes` too.
 
 A gateway built on `Arbor.MCP.Server.Handler` can hand the upstream round to
 its downstream client as its own `input_required`, keeping the upstream
