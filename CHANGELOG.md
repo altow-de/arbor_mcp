@@ -51,6 +51,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A client that stopped because the process that started it exited could
+  skip closing its transport, log a Task crash
+  (`** (stop) :client_generation_retired`) and report
+  `{:error, :client_cleanup_timeout}` as its cleanup result. Its lifetime
+  observer sees the parent's exit too and retires the client's work, and it
+  also cleared the reservation of the worker the client closes its
+  transport from, or killed that worker while it ran. The client's own
+  cleanup worker now survives that, and the client still bounds it by its
+  cleanup deadline, so the transport closes (a stdio server is stopped, an
+  HTTP stream ended) before the client goes, in the same order as before.
 - An unsupported-version error (`-32022`) lists `supported` as exactly the
   revisions the mount or server accepts, from the same source its request
   validation uses (`Arbor.MCP.Server.RequestContext.accepted_versions/1`), in
