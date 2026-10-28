@@ -555,6 +555,34 @@ defmodule Arbor.MCP.Client.ProgressToTest do
                )
     end
 
+    # The caller-exit cancellation (cancel_on_caller_exit, on by default for a
+    # modern request) settles the request through drop_pending/2, which drops
+    # its target with it.
+    test "a caller that exits leaves no target, and its target gets no more progress" do
+      client = scripted()
+      test_pid = self()
+      target = spawn_link(fn -> forward_to(test_pid, "gone") end)
+
+      call = start_call(client, progress_to: target, progress_token: "gone")
+      assert_receive {:wire, %{"id" => id, "method" => "tools/call"}}
+
+      progress(client, "gone", 1)
+      assert_receive {:forwarded, "gone", {:arbor_mcp_progress, ^client, "gone", _params}}
+
+      Task.shutdown(call, :brutal_kill)
+
+      assert_receive {:wire,
+                      %{"method" => "notifications/cancelled", "params" => %{"requestId" => ^id}}}
+
+      state = :sys.get_state(client)
+      refute Map.has_key?(state.pending_requests, id)
+      assert state.progress_targets == %{}
+
+      progress(client, "gone", 2)
+      _state = :sys.get_state(client)
+      refute_received {:forwarded, _target, _message}
+    end
+
     test "each request's progress goes only to its own target" do
       client = scripted()
       test_pid = self()

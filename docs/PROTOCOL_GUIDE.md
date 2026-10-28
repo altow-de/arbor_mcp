@@ -501,6 +501,45 @@ A server can emit the same notification toward a client request:
 You cannot cancel `initialize`. `send_cancelled/3` returns
 `{:error, :cannot_cancel_initialize}` in that case.
 
+### When the caller exits
+
+A request is also cancelled when the process waiting for it exits while it
+is in flight, for example a `Task` that is shut down or a process that
+crashes mid-call. Nobody will read the result, so the client cancels it as
+it would at a timeout: over modern Streamable HTTP it closes the request's
+POST or request stream, and elsewhere it sends `notifications/cancelled`.
+If the caller exits during an MRTR round, while the client handler is still
+answering the round's input requests, that handler is stopped too.
+
+This is on by default for modern (2026-07-28) requests. On a legacy
+connection it happens only when the call asks for it, since there it sends a
+`notifications/cancelled` that legacy peers did not get before. The
+`:cancel_on_caller_exit` option decides per call:
+
+- absent or `nil`: the era's default, as above (`nil` leaves an option
+  unset, so a gateway can pass options through unfiltered);
+- `true` or `false`: on or off, on either era;
+- anything else raises `ArgumentError`.
+
+Every request function takes it, the `all_*` list helpers included, which
+pass it to each page request, and so does the `tools/list` refresh a
+`tools/call` makes after a header mismatch on its caller's behalf. Batches
+(`batch_request/3`, `send_batch/3`) are the exception: they take only a
+timeout and aren't cancelled when their caller exits. JSON-RPC batching is a
+legacy feature, removed from MCP in 2025-06-18.
+
+```elixir
+# A modern request that should finish even if its caller goes away.
+Arbor.MCP.Client.call_tool(client, "publish", %{}, cancel_on_caller_exit: false)
+
+# A legacy request that should be cancelled with its caller.
+Arbor.MCP.Client.call_tool(client, "slow_import", %{}, cancel_on_caller_exit: true)
+```
+
+Each such cancellation emits `[:arbor_mcp, :client, :request, :caller_exited]`
+with the request's `method` and `request_id`. A request that completed before
+its caller exited is left alone.
+
 This is request cancellation, not the experimental Tasks extension
 (`Arbor.MCP.Client.cancel_task/3`).
 
