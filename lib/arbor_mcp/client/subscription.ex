@@ -10,11 +10,15 @@ defmodule Arbor.MCP.Client.Subscription do
 
   If a transport reconnects, the process re-opens the desired filter with a
   fresh JSON-RPC request ID and emits a resynchronization notification.
+  A definitive authentication refusal is returned as
+  `{:error, {:stream_error, {:auth_refused, reason}}}` during opening, or
+  delivered in `{:ex_mcp_subscription_closed, subscription, {:error, error}}`
+  after acknowledgment. It does not reopen the subscription.
   """
 
   use GenServer
 
-  alias Arbor.MCP.Client.{ConnectionScope, Deadline, Diagnostics, Lifetime}
+  alias Arbor.MCP.Client.{ConnectionScope, Deadline, Diagnostics, HTTPAuth, Lifetime}
   alias Arbor.MCP.SubscriptionFilter
 
   @subscription_id_key "io.modelcontextprotocol/subscriptionId"
@@ -237,32 +241,12 @@ defmodule Arbor.MCP.Client.Subscription do
     end
   end
 
-  def handle_info({:client_subscription_disconnected, _reason}, state) do
-    send(state.owner, {:ex_mcp_subscription_resync, self(), :started})
-    reconnect_attempts = state.reconnect_attempts + 1
-
-    :telemetry.execute(
-      [:arbor_mcp, :client, :subscription, :reconnect],
-      %{attempt: reconnect_attempts},
-      %{phase: :scheduled}
-    )
-
-    Process.send_after(
-      self(),
-      :client_subscription_reconnect,
-      reconnect_delay(reconnect_attempts)
-    )
-
-    {:noreply,
-     %{
-       state
-       | status: :reconnecting,
-         request_id: nil,
-         acknowledged_filter: nil,
-         reconnect_attempts: reconnect_attempts,
-         resync?: true,
-         pending_events: []
-     }}
+  def handle_info({:client_subscription_disconnected, reason}, state) do
+    if HTTPAuth.refused?(reason) do
+      handle_info({:client_subscription_error, state.request_id, {:stream_error, reason}}, state)
+    else
+      reconnect(state)
+    end
   end
 
   def handle_info(:client_subscription_reconnect, %{status: :reconnecting} = state) do
@@ -312,6 +296,34 @@ defmodule Arbor.MCP.Client.Subscription do
   end
 
   def terminate(_reason, _state), do: :ok
+
+  defp reconnect(state) do
+    send(state.owner, {:ex_mcp_subscription_resync, self(), :started})
+    reconnect_attempts = state.reconnect_attempts + 1
+
+    :telemetry.execute(
+      [:arbor_mcp, :client, :subscription, :reconnect],
+      %{attempt: reconnect_attempts},
+      %{phase: :scheduled}
+    )
+
+    Process.send_after(
+      self(),
+      :client_subscription_reconnect,
+      reconnect_delay(reconnect_attempts)
+    )
+
+    {:noreply,
+     %{
+       state
+       | status: :reconnecting,
+         request_id: nil,
+         acknowledged_filter: nil,
+         reconnect_attempts: reconnect_attempts,
+         resync?: true,
+         pending_events: []
+     }}
+  end
 
   defp activate_acknowledged(state, acknowledged) do
     state = %{

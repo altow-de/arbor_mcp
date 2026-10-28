@@ -50,6 +50,111 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     def handle_forbidden(www, scopes, state), do: handle_unauthorized(www, scopes, state)
   end
 
+  @tag :reauth_round5
+  test "a 401 joining a step-up retires the shared token before the partial grant arrives" do
+    {client, counter} =
+      start_client(&finish/2,
+        scoped_step_up: true,
+        base_scopes: ["read", "write"],
+        partial_grant: ["read"],
+        reject_read_token: true,
+        hold_step_up_metadata: true
+      )
+
+    assert {:ok, _} = Client.call_tool(client, "protected", %{"need" => "write"})
+
+    admin = scoped_call(client, "admin")
+    assert_receive {:scope_challenge, "admin", server, _id}, 2_000
+    send(server, :challenge)
+    assert_receive {:metadata_stalled, metadata}, 2_000
+    on_exit(fn -> send(metadata, :release) end)
+
+    read = scoped_call(client, "read")
+    TestHelpers.wait_until(fn -> map_size(:sys.get_state(client).http_auth.waiters) == 2 end)
+    rejected_transport = :sys.get_state(client).transport_state
+    later = scoped_call(client, "read")
+    TestHelpers.wait_until(fn -> map_size(:sys.get_state(client).http_auth.waiters) == 3 end)
+    send(metadata, :release)
+
+    assert {:error, %{reason: {:oauth_failed, :insufficient_scope}}} = Task.await(admin)
+    assert {:ok, _} = Task.await(read)
+    assert {:ok, _} = Task.await(later)
+    assert rejected_transport.access_token == nil
+
+    refute Enum.any?(rejected_transport.headers, fn {key, _} ->
+             String.downcase(key) == "authorization"
+           end)
+
+    transport = :sys.get_state(client).transport_state
+    assert transport.access_token == "token-2"
+    assert transport.granted_scopes == ["read"]
+    assert {:ok, _} = Client.call_tool(client, "protected", %{"need" => "read"})
+    state = Agent.get(counter, & &1)
+    assert state.tokens == 2
+    assert Enum.count(Map.values(state.posts), &(&1 == [[], ["Bearer token-2"]])) == 1
+    assert Enum.count(Map.values(state.posts), &(&1 == [["Bearer token-2"]])) == 1
+    refute_received {:metadata_stalled, _}
+  end
+
+  @tag :reauth_round5
+  test "a delayed 401 for an already replaced token keeps the newer shared credentials" do
+    {client, counter} =
+      start_client(&finish/2,
+        scoped_step_up: true,
+        base_scopes: ["read", "write"],
+        reject_read_token: true,
+        hold_read_401: true
+      )
+
+    assert {:ok, _} = Client.call_tool(client, "protected", %{"need" => "write"})
+    read = scoped_call(client, "read")
+    assert_receive {:read_401_held, server}, 2_000
+    on_exit(fn -> send(server, :challenge) end)
+    assert {:ok, _} = Client.call_tool(client, "protected", %{"need" => "admin"})
+    assert :sys.get_state(client).transport_state.access_token == "token-2"
+    send(server, :challenge)
+    assert {:ok, _} = Task.await(read)
+    transport = :sys.get_state(client).transport_state
+    assert transport.access_token == "token-2"
+    assert Enum.sort(transport.granted_scopes) == ["admin", "read", "write"]
+    assert Agent.get(counter, & &1.tokens) == 2
+  end
+
+  @tag :reauth_round5
+  test "a provider-less subscription reports a Basic refusal after one POST" do
+    {client, counter} =
+      start_client(&finish/2, era: :modern, seed: false, challenge: ~s(Basic realm="closed"))
+
+    assert {:error,
+            {:stream_error, {:auth_refused, {:unauthorized, 401, "", ~s(Basic realm="closed")}}}} =
+             Client.listen(client, %{"toolsListChanged" => true}, timeout: 1_000)
+
+    assert [posts] = Agent.get(counter, &Map.values(&1.posts))
+    assert posts == [[]]
+    assert :sys.get_state(client).subscriptions == %{}
+    refute_received {:ex_mcp_subscription_resync, _, :started}
+  end
+
+  @tag :reauth_round5
+  test "an insufficient subscription grant reports refusal without reopening or another flow" do
+    {client, counter} =
+      start_client(&finish/2,
+        era: :modern,
+        scoped_step_up: true,
+        narrow_step_up: true,
+        subscription_scope: "admin"
+      )
+
+    assert {:error, {:stream_error, {:auth_refused, {:oauth_failed, :insufficient_scope}}}} =
+             Client.listen(client, %{"toolsListChanged" => true}, timeout: 1_000)
+
+    assert [posts] = Agent.get(counter, &Map.values(&1.posts))
+    assert posts == [[], ["Bearer token-1"]]
+    assert Agent.get(counter, & &1.tokens) == 2
+    assert :sys.get_state(client).subscriptions == %{}
+    refute_received {:ex_mcp_subscription_resync, _, :started}
+  end
+
   @tag :reauth_round3
   test "overlapping 403 step-ups each get their own scope before their last POST retry" do
     {client, counter} =
@@ -700,6 +805,12 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     end)
   end
 
+  defp scoped_call(client, scope) do
+    Task.async(fn ->
+      Client.call_tool(client, "protected", %{"need" => scope}, timeout: 5_000, format: :map)
+    end)
+  end
+
   defp start_client(answer_call, opts \\ []) do
     bypass = Bypass.open()
     origin = "http://127.0.0.1:#{bypass.port}"
@@ -765,7 +876,7 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
             opts
           )
 
-        %{"method" => "tools/call"} = request ->
+        %{"method" => method} = request when method in ["tools/call", "subscriptions/listen"] ->
           protected_call(conn, request, counter, origin, owner, answer_call, opts)
 
         %{"id" => id} = reply when not is_map_key(reply, "method") ->
@@ -861,6 +972,11 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     cond do
       opts[:reject_read_token] && token == "token-1" &&
           request["params"]["arguments"]["need"] == "read" ->
+        if opts[:hold_read_401] do
+          send(owner, {:read_401_held, self()})
+          receive do: (:challenge -> :ok)
+        end
+
         challenge(
           conn,
           401,
@@ -885,7 +1001,7 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
   end
 
   defp scoped_step_up(conn, request, token, counter, origin, owner, answer, opts) do
-    scope = request["params"]["arguments"]["need"]
+    scope = opts[:subscription_scope] || request["params"]["arguments"]["need"]
 
     if scope in Agent.get(counter, &Map.get(&1.grants, token, [])) do
       answer.(request, conn)

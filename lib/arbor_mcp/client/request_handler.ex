@@ -7,7 +7,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
   """
 
   require Logger
-  alias Arbor.MCP.Client.{ConnectionScope, Lifetime}
+  alias Arbor.MCP.Client.{ConnectionScope, HTTPAuth, Lifetime}
   alias Arbor.MCP.Client.{Deadline, InputDispatcher, MRTR, NotificationListener, ResponseCache}
   alias Arbor.MCP.Error
   alias Arbor.MCP.Internal.{Maps, Protocol, RequestParams, VersionRegistry}
@@ -220,7 +220,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
   defp retryable_subscription_stream_close?(:invalid_stream_message), do: false
   defp retryable_subscription_stream_close?(:response_id_mismatch), do: false
   defp retryable_subscription_stream_close?(:final_response_required), do: false
-  defp retryable_subscription_stream_close?(_reason), do: true
+  defp retryable_subscription_stream_close?(reason), do: not HTTPAuth.refused?(reason)
 
   defp send_built_request(method, params, id, from, state, timeout_meta) do
     case build_request(method, params, id, state) do
@@ -967,6 +967,9 @@ defmodule Arbor.MCP.Client.RequestHandler do
   defp request_stream_error({:auth_refused, reason}),
     do: send_error(reason, %{transport_mod: HTTP})
 
+  defp request_stream_error({:oauth_failed, _reason} = reason),
+    do: send_error(reason, %{transport_mod: HTTP})
+
   defp request_stream_error(reason) do
     if ambiguous_stream_break?(reason) do
       %Error.TransportError{
@@ -994,7 +997,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
             ],
        do: false
 
-  defp ambiguous_stream_break?(_reason), do: true
+  defp ambiguous_stream_break?(reason), do: not HTTPAuth.refused?(reason)
 
   @doc """
   Handles a batch of responses from the transport.

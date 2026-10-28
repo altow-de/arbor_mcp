@@ -1,6 +1,6 @@
 defmodule Arbor.MCP.Client.Internal.Request do
   @moduledoc false
-  alias Arbor.MCP.Client.MRTR
+  alias Arbor.MCP.Client.{HTTPAuth, MRTR}
   alias Arbor.MCP.Error
   alias Arbor.MCP.Protocol.ErrorCodes
   alias Arbor.MCP.Reliability.Retry
@@ -407,7 +407,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
         operation.()
 
       policy when is_list(policy) ->
-        Retry.with_retry(operation, Retry.mcp_defaults(policy))
+        Retry.with_retry(operation, auth_bounded_retry_options(policy))
     end
   end
 
@@ -440,31 +440,36 @@ defmodule Arbor.MCP.Client.Internal.Request do
          stream_retry_mode,
          deadline_fun
        ) do
-    if stream_retry_allowed?(stream_retry_mode, method, opts) do
-      delay = http_stream_retry_delay(opts)
-      deadline = deadline_fun.()
+    cond do
+      HTTPAuth.refused?(error) ->
+        {:error, error}
 
-      case wait_for_stream_retry(delay, deadline) do
-        :ok ->
-          :telemetry.execute(
-            [:arbor_mcp, :client, :http, :request, :retry],
-            %{attempt: 2},
-            %{method: method, mode: stream_retry_mode, delivery: :at_least_once}
-          )
+      stream_retry_allowed?(stream_retry_mode, method, opts) ->
+        delay = http_stream_retry_delay(opts)
+        deadline = deadline_fun.()
 
-          case retry_operation.() do
-            {:error, %Error.TransportError{reason: :response_stream_broken} = second_error} ->
-              outcome_unknown(method, stream_retry_mode, 2, second_error)
+        case wait_for_stream_retry(delay, deadline) do
+          :ok ->
+            :telemetry.execute(
+              [:arbor_mcp, :client, :http, :request, :retry],
+              %{attempt: 2},
+              %{method: method, mode: stream_retry_mode, delivery: :at_least_once}
+            )
 
-            result ->
-              result
-          end
+            case retry_operation.() do
+              {:error, %Error.TransportError{reason: :response_stream_broken} = second_error} ->
+                outcome_unknown(method, stream_retry_mode, 2, second_error)
 
-        {:error, :timeout} ->
-          {:error, :timeout}
-      end
-    else
-      outcome_unknown(method, stream_retry_mode, 1, error)
+              result ->
+                result
+            end
+
+          {:error, :timeout} ->
+            {:error, :timeout}
+        end
+
+      true ->
+        outcome_unknown(method, stream_retry_mode, 1, error)
     end
   end
 
@@ -568,7 +573,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
         original_error
 
       policy ->
-        retry_opts = Retry.mcp_defaults(policy)
+        retry_opts = auth_bounded_retry_options(policy)
         should_retry? = Keyword.fetch!(retry_opts, :should_retry?)
         max_attempts = Keyword.get(retry_opts, :max_attempts, 0)
 
@@ -590,6 +595,12 @@ defmodule Arbor.MCP.Client.Internal.Request do
     end
   catch
     :exit, _ -> []
+  end
+
+  defp auth_bounded_retry_options(policy) do
+    options = Retry.mcp_defaults(policy)
+    should_retry? = Keyword.fetch!(options, :should_retry?)
+    Keyword.put(options, :should_retry?, &(not HTTPAuth.refused?(&1) and should_retry?.(&1)))
   end
 
   defp fetch_default_timeout(client, fallback \\ 5_000) do

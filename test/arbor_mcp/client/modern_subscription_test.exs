@@ -2,6 +2,7 @@ defmodule Arbor.MCP.Client.ModernSubscriptionTest do
   use ExUnit.Case, async: true
 
   alias Arbor.MCP.Client
+  alias Arbor.MCP.Client.RequestHandler
   alias Arbor.MCP.Client.Subscription
   alias Arbor.MCP.Server
   alias Arbor.MCP.Server.{HandlerServer, Runtime, Subscriptions}
@@ -344,6 +345,52 @@ defmodule Arbor.MCP.Client.ModernSubscriptionTest do
     assert task_event["taskId"] == "task-resync"
     assert :ok = Subscription.cancel(reconnected)
     assert_receive {:subscription_cancelled, ^second_id}
+  end
+
+  @tag :reauth_round5
+  test "definitive auth disconnects terminate the subscription without reopening or resync" do
+    {:ok, client} = ReconnectClient.start_link(self())
+
+    for reason <- [
+          {:auth_refused, {:unauthorized, 401, "", "Basic"}},
+          {:oauth_failed, :insufficient_scope}
+        ] do
+      assert {:ok, subscription} = Subscription.open(client, %{"toolsListChanged" => true})
+      assert_receive {:subscription_opened, _id}
+      monitor = Process.monitor(subscription.pid)
+      send(subscription.pid, {:client_subscription_disconnected, reason})
+
+      assert_receive {:ex_mcp_subscription_closed, ^subscription,
+                      {:error, {:stream_error, ^reason}}}
+
+      assert_receive {:DOWN, ^monitor, :process, _pid, :normal}
+      refute_received {:ex_mcp_subscription_resync, _, :started}
+      refute_received {:subscription_opened, _}
+    end
+  end
+
+  @tag :reauth_round5
+  test "stream close classification preserves definitive auth refusals for requests and subscriptions" do
+    for reason <- [{:auth_refused, :denied}, {:oauth_failed, :insufficient_scope}] do
+      state = %Client{subscriptions: %{1 => self()}}
+
+      assert {:noreply, %{subscriptions: subscriptions}} =
+               RequestHandler.handle_subscription_stream_closed(1, reason, state)
+
+      assert subscriptions == %{}
+      assert_receive {:client_subscription_error, 1, {:stream_error, ^reason}}
+      refute_received {:client_subscription_disconnected, _}
+
+      ref = make_ref()
+      state = %Client{pending_requests: %{1 => {{self(), ref}, :single, "tools/call"}}}
+
+      assert {:noreply, %{pending_requests: pending}} =
+               RequestHandler.handle_modern_stream_closed(1, reason, state)
+
+      assert pending == %{}
+      assert_receive {^ref, {:error, %{type: :transport_error, reason: error}}}
+      assert error == if(elem(reason, 0) == :auth_refused, do: elem(reason, 1), else: reason)
+    end
   end
 
   defp start_stack do

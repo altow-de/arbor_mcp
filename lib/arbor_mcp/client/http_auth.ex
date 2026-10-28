@@ -5,12 +5,13 @@ defmodule Arbor.MCP.Client.HTTPAuth do
   alias Arbor.MCP.Transport.HTTP
 
   @auth_wait_ms 600_000
-  @derive {Inspect, except: [:waiters]}
-  defstruct worker: nil, waiters: %{}, monitors: %{}
+  @derive {Inspect, except: [:waiters, :rejected_tokens]}
+  defstruct worker: nil, waiters: %{}, monitors: %{}, rejected_tokens: MapSet.new()
 
   # The client owns one inline flow. Its challengers retain separate deadlines
   # and monitors; the OAuth worker itself never sends an application request.
   def challenge(state, kind, pid, request_id, ref, challenge) do
+    state = reject_token(state, challenge)
     deadline = Deadline.earliest(Map.get(challenge, :deadline), Deadline.after_ms(@auth_wait_ms))
 
     waiter = %{
@@ -58,6 +59,38 @@ defmodule Arbor.MCP.Client.HTTPAuth do
     end
   end
 
+  # Rejection belongs to a token, not to the flow's initial status. In
+  # particular a 401 can join a 403 flow, or arrive after another flow won.
+  def reject_token(
+        %{transport_state: %HTTP{auth_provider: nil, access_token: token} = transport} = state,
+        %{status: 401, token: token}
+      )
+      when is_binary(token) do
+    auth = state.http_auth
+    auth = %{auth | rejected_tokens: MapSet.put(auth.rejected_tokens, token_key(token))}
+
+    headers =
+      Enum.reject(transport.headers, fn {key, _} -> String.downcase(key) == "authorization" end)
+
+    transport = %{transport | access_token: nil, granted_scopes: [], headers: headers}
+
+    %{state | http_auth: auth, transport_state: transport}
+  end
+
+  def reject_token(state, _challenge), do: state
+
+  def refused?({:auth_refused, _reason}), do: true
+  def refused?({:oauth_failed, _reason}), do: true
+  def refused?({:stream_error, reason}), do: refused?(reason)
+  def refused?({:transport_error, reason}), do: refused?(reason)
+  def refused?(%{reason: reason, details: details}), do: refused?(reason) or refused?(details)
+  def refused?(%{reason: reason}), do: refused?(reason)
+  def refused?(%{cause: reason}), do: refused?(reason)
+  def refused?(%{details: details}), do: refused?(details)
+  def refused?(_reason), do: false
+
+  defp token_key(token), do: :crypto.hash(:sha256, token)
+
   def cached_token(%HTTP{access_token: current} = transport, challenge)
       when is_binary(current) and current != :erlang.map_get(:token, challenge) do
     if challenge.status == 401 or scopes_granted?(granted_scopes(transport), challenge.scopes),
@@ -78,13 +111,23 @@ defmodule Arbor.MCP.Client.HTTPAuth do
     do: send(pid, {:modern_http_stream_auth_result, ref, result})
 
   def result(%{http_auth: %{worker: %{pid: pid, id: id}}} = state, pid, id, result) do
-    worker = state.http_auth.worker
     state = stop_worker(state)
+
+    result =
+      case result do
+        {:ok, token, _scopes} ->
+          if MapSet.member?(state.http_auth.rejected_tokens, token_key(token)),
+            do: {:error, {:oauth_failed, :rejected_token}},
+            else: result
+
+        {:error, _reason} ->
+          result
+      end
 
     transport =
       case result do
         {:ok, token, scopes} ->
-          if store_token?(worker, state.transport_state, scopes) and
+          if covers?(scopes, state.transport_state.granted_scopes) and
                Enum.any?(state.http_auth.waiters, fn {_ref, waiter} -> live?(waiter, state) end) do
             HTTP.put_oauth_token(
               state.transport_state,
@@ -105,11 +148,6 @@ defmodule Arbor.MCP.Client.HTTPAuth do
   end
 
   def result(state, _pid, _id, _result), do: state
-
-  # A 401 invalidates the previous credentials. A step-up must preserve the
-  # shared token's scopes; narrower grants may still serve individual waiters.
-  defp store_token?(%{status: 401}, _transport, _scopes), do: true
-  defp store_token?(_worker, transport, scopes), do: covers?(scopes, transport.granted_scopes)
 
   def waiter_timeout(state, ref) do
     case Map.get(state.http_auth.waiters, ref) do
@@ -156,13 +194,19 @@ defmodule Arbor.MCP.Client.HTTPAuth do
   end
 
   def retire(state) do
-    state |> stop_worker() |> finish_waiters({:error, :client_disconnected})
+    state = state |> stop_worker() |> finish_waiters({:error, :client_disconnected})
+    %{state | http_auth: %__MODULE__{}}
   end
 
   defp start_worker(state, challenge) do
     parent = self()
     id = make_ref()
-    transport = state.transport_state
+    # Preserve the existing inline auth loop protection for a rejected token.
+    # This private snapshot only answers the challenge; it cannot send a POST.
+    transport =
+      if challenge.status == 401 and is_binary(challenge.token),
+        do: %{state.transport_state | access_token: challenge.token},
+        else: state.transport_state
 
     {pid, monitor} =
       ConnectionScope.spawn_monitor(fn ->
@@ -181,8 +225,7 @@ defmodule Arbor.MCP.Client.HTTPAuth do
       id: id,
       timer: nil,
       deadline: nil,
-      scopes: challenge.scopes,
-      status: challenge.status
+      scopes: challenge.scopes
     }
 
     %{state | http_auth: %{state.http_auth | worker: worker}} |> join_flow()

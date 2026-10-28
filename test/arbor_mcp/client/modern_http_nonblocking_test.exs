@@ -294,6 +294,24 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
       refute_received {:posted, "tools/call"}
     end
 
+    @tag :reauth_round5
+    test "a still-owned cancelled POST retires its rejected token without starting auth" do
+      transport = HTTP.put_oauth_token(modern_transport(), %{access_token: "rejected"}, ["read"])
+      state = %{client_state(transport) | pending_requests: %{}}
+      ref = make_ref()
+      challenge = %{status: 401, www_authenticate: "Basic", scopes: [], token: "rejected"}
+
+      assert {:noreply, state} =
+               Client.handle_info({:http_post_auth_challenge, self(), ref, challenge}, state)
+
+      assert_receive {:http_post_auth_result, ^ref, {:error, :stream_retired}}
+      assert state.transport_state.access_token == nil
+      assert state.transport_state.granted_scopes == []
+      refute List.keymember?(state.transport_state.headers, "Authorization", 0)
+      assert state.http_auth.worker == nil
+      assert state.http_auth.waiters == %{}
+    end
+
     test "without a provider, a challenge another request already answered gets its token" do
       ref = make_ref()
       state = client_state(%{modern_transport() | access_token: "obtained"})

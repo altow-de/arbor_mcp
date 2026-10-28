@@ -1978,17 +1978,28 @@ defmodule Arbor.MCP.Client do
         %{transport_mod: HTTP, transport_state: %HTTP{}} = state
       )
       when is_pid(task) and is_map(challenge) do
-    if own_post_task?(state, task) do
-      request_id =
-        Enum.find_value(state.async_post_tasks, fn
-          {_monitor, {^task, id}} -> id
-          _other -> nil
-        end)
+    owned =
+      Enum.find_value(state.async_post_tasks, fn
+        {_monitor, {^task, id}} -> {:owned, id}
+        _other -> nil
+      end)
 
-      {:noreply, handle_auth_challenge(state, :post, task, request_id, ref, challenge)}
-    else
-      send(task, {:http_post_auth_result, ref, {:error, :stream_retired}})
-      {:noreply, state}
+    case owned do
+      {:owned, request_id} ->
+        # Even a cancelled POST can report that the shared token was rejected.
+        # It must not start auth, but future requests must stop using that token.
+        state = HTTPAuth.reject_token(state, challenge)
+
+        if HTTPAuth.request_alive?(state, request_id) do
+          {:noreply, handle_auth_challenge(state, :post, task, request_id, ref, challenge)}
+        else
+          send(task, {:http_post_auth_result, ref, {:error, :stream_retired}})
+          {:noreply, state}
+        end
+
+      nil ->
+        send(task, {:http_post_auth_result, ref, {:error, :stream_retired}})
+        {:noreply, state}
     end
   end
 
@@ -2675,19 +2686,6 @@ defmodule Arbor.MCP.Client do
     else
       state
     end
-  end
-
-  defp own_post_task?(state, task) do
-    Enum.any?(state.async_post_tasks || %{}, fn
-      {_ref, {pid, request_id}} ->
-        # A legacy POST can still be in flight after its caller cancelled.
-        # A health ping has its own tracked id; cancelled or settled work is retired.
-        pid == task and
-          HTTPAuth.request_alive?(state, request_id)
-
-      _other ->
-        false
-    end)
   end
 
   defp handle_auth_challenge(

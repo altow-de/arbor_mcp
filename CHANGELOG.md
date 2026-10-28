@@ -51,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A 401 joining an inline OAuth step-up immediately retires the rejected shared
+  token. A narrower replacement grant updates its token and scopes, while a
+  delayed 401 cannot invalidate newer credentials. Definitive HTTP auth and
+  OAuth refusals now terminate subscriptions and request retries without
+  reopening streams or starting further auth flows.
 - A partial inline OAuth step-up grant no longer replaces shared credentials
   with fewer scopes. Only compatible waiters receive that grant; a waiter
   whose own flow omits required scopes fails definitively with
