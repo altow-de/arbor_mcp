@@ -957,6 +957,11 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
   def close_request_stream(_request_id, state), do: state
 
+  defp request_stream_error({:auth_refused, :timeout}), do: :timeout
+
+  defp request_stream_error({:auth_refused, reason}),
+    do: send_error(reason, %{transport_mod: HTTP})
+
   defp request_stream_error(reason) do
     if ambiguous_stream_break?(reason) do
       %Error.TransportError{

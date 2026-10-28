@@ -508,6 +508,10 @@ defmodule Arbor.MCP.Transport.HTTP do
           # At most an initial 401 and a 403 step-up.
           {kind, www_auth} when attempts < 2 ->
             case await_authentication(parent, kind, www_auth, state) do
+              {:ok, token, context} ->
+                state = %{state | session_id: context.session_id, headers: context.headers}
+                perform_async(message, apply_token_to_state(state, token), parent, attempts + 1)
+
               {:ok, token} ->
                 perform_async(message, apply_token_to_state(state, token), parent, attempts + 1)
 
@@ -546,7 +550,8 @@ defmodule Arbor.MCP.Transport.HTTP do
       status: if(kind == :unauthorized, do: 401, else: 403),
       www_authenticate: www_auth,
       scopes: extract_scope_from_www_auth(www_auth),
-      token: state.access_token
+      token: state.access_token,
+      deadline: state.deadline
     }
 
     Lifetime.deliver(parent, {:http_post_auth_challenge, self(), ref, challenge})
@@ -744,11 +749,11 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   @doc false
-  # Answers, from the client process, the 401 or 403 that a POST task or
-  # request stream without an auth provider handed back: runs the
+  # Answers, from the client's dedicated auth worker, the 401 or 403 that a
+  # POST task or request stream without an auth provider handed back: runs the
   # OAuth flow a synchronous send would run, and returns the token for the
-  # task to send its request again with. Only the authentication runs here,
-  # one challenge at a time; the request itself is re-sent by its task.
+  # task to send its request again with. Only authentication runs here;
+  # the client applies its credentials before each request's own task retries.
   # `{:error, :no_credentials}` means the challenge is not one OAuth can
   # answer, so the task delivers the server's response as it came.
   @spec answer_challenge_inline(t(), map()) :: {{:ok, String.t()} | {:error, term()}, t()}
@@ -1535,6 +1540,7 @@ defmodule Arbor.MCP.Transport.HTTP do
              _connection_scope: ConnectionScope.current(),
              parent: parent,
              request_id: request_id,
+             deadline: state.deadline,
              url: url,
              headers: headers,
              body: message,

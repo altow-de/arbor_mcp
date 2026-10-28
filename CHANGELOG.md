@@ -51,6 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Inline HTTP OAuth now runs in one monitored worker per client, so stalled
+  discovery or authorization leaves the client responsive. Concurrent
+  challenges share the flow with independent request deadlines; cancellation
+  and reconnect retire the worker and its waiters. Legacy authenticated
+  retries use the current session id and connection headers. A request stream
+  definitively refused by HTTP auth or a failed OAuth flow reports the same
+  error as an ordinary POST without replaying the operation.
 - Provider-less legacy Streamable HTTP POSTs now authenticate through the
   client and retry from their own task with the stream consumer intact. Server
   requests (such as `ping`), progress and log notifications on the retried SSE

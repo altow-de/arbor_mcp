@@ -302,7 +302,7 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
       assert {:noreply, ^state} =
                Client.handle_info({:http_post_auth_challenge, self(), ref, challenge}, state)
 
-      assert_received {:http_post_auth_result, ^ref, {:ok, "obtained"}}
+      assert_received {:http_post_auth_result, ^ref, {:ok, "obtained", _context}}
     end
 
     # Two requests sent with the "stale" token both get a 403 step-up. The
@@ -336,15 +336,17 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
       assert {:noreply, ^state} =
                Client.handle_info({:http_post_auth_challenge, self(), ref, challenge}, state)
 
-      assert_received {:http_post_auth_result, ^ref, {:ok, "stepped-up"}}
+      assert_received {:http_post_auth_result, ^ref, {:ok, "stepped-up", _context}}
       refute_received {:oauth_flow_started, ^flows}
 
       # A scope the first flow didn't get still needs a flow of its own.
       admin = %{challenge | www_authenticate: ~s(Bearer scope="admin"), scopes: ["admin"]}
 
-      assert {:noreply, _state} =
+      assert {:noreply, state} =
                Client.handle_info({:http_post_auth_challenge, self(), ref, admin}, state)
 
+      assert_receive {:http_inline_auth_result, _worker, _id, _result} = completed, 2_000
+      assert {:noreply, _state} = Client.handle_info(completed, state)
       assert_received {:http_post_auth_result, ^ref, {:error, {:oauth_failed, _reason}}}
       assert_received {:oauth_flow_started, ^flows}
     end

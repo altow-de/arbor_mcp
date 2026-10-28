@@ -4,6 +4,7 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
   @moduletag :capture_log
 
   alias Arbor.MCP.Client
+  alias Arbor.MCP.TestHelpers
   alias Arbor.MCP.Transport.HTTP
 
   defmodule Handler do
@@ -38,7 +39,7 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
 
     task = call(client)
     assert_receive {:holding, server}, 2_000
-    assert_receive {:oauth_started, ^client}, 2_000
+    assert_oauth_worker(client)
     assert_receive {:client_answered, "server-ping", %{"result" => %{}}}, 2_000
     send(server, :release)
 
@@ -75,7 +76,7 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     Enum.each(servers, &send(&1, :challenge))
 
     assert [{:ok, _}, {:ok, _}] = Task.await_many(tasks)
-    assert_receive {:oauth_started, ^client}, 2_000
+    assert_oauth_worker(client)
     refute_received {:oauth_started, _}
     assert_one_flow(counter, client)
 
@@ -125,7 +126,7 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
       {client, counter} = start_client(hold_after([message]), era: :modern)
       task = call(client, @stream_opt)
 
-      assert_receive {:oauth_started, ^client}, 2_000
+      assert_oauth_worker(client)
       assert_receive {:holding, server}, 2_000
 
       if @stream_opt[:progress_token] do
@@ -184,6 +185,227 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     send(task, {:http_post_auth_result, ref, {:ok, "too-late"}})
   end
 
+  for stream_opts <- [
+        [],
+        [progress_token: "stalled"],
+        [meta: %{"io.modelcontextprotocol/logLevel" => "info"}]
+      ] do
+    @stalled_opts stream_opts
+    @tag :reauth_round2
+    test "stalled inline metadata leaves the client responsive with #{inspect(stream_opts)}" do
+      {client, counter} = start_client(&finish/2, era: :modern, hold_metadata: true)
+      task = call(client, Keyword.merge(@stalled_opts, timeout: 1_000))
+      assert_receive {:metadata_stalled, metadata}, 2_000
+      on_exit(fn -> send(metadata, :release) end)
+      assert_receive {:oauth_started, worker}, 2_000
+      assert worker != client
+      monitor = Process.monitor(worker)
+
+      status = Task.async(fn -> Client.get_status(client) end)
+      assert {:ok, %{connection_status: :ready}} = Task.await(status, 500)
+      assert {:ok, _} = Client.ping(client, timeout: 500)
+      assert {:error, :timeout} = Task.await(task, 2_000)
+      assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}, 2_000
+      assert {:ok, %{connection_status: :ready}} = Client.get_status(client)
+      assert Agent.get(counter, & &1.tokens) == 0
+    end
+  end
+
+  @tag :reauth_round2
+  test "concurrent challenges share a stalled worker but retain their own deadlines" do
+    {client, counter} = start_client(&finish/2, era: :modern, hold_metadata: true, barrier: true)
+    short = call(client, timeout: 1_500)
+    long = call(client, timeout: 4_000, progress_token: "long")
+    servers = for _ <- 1..2, do: receive_challenge()
+    Enum.each(servers, &send(&1, :challenge))
+    assert_receive {:metadata_stalled, metadata}, 2_000
+    on_exit(fn -> send(metadata, :release) end)
+    assert_receive {:oauth_started, worker}, 2_000
+
+    TestHelpers.wait_until(fn -> map_size(:sys.get_state(client).http_auth.waiters) == 2 end)
+
+    short_waiter =
+      :sys.get_state(client).http_auth.waiters |> Map.values() |> Enum.find(&(&1.kind == :post))
+
+    short_monitor = Process.monitor(short_waiter.pid)
+    assert {:ok, _} = Client.ping(client, timeout: 500)
+    assert {:error, :timeout} = Task.await(short, 2_000)
+    assert_receive {:DOWN, ^short_monitor, :process, _post, _reason}, 2_000
+    assert Process.alive?(worker)
+    assert {:ok, %{pending_requests: 1}} = Client.get_status(client)
+    send(metadata, :release)
+
+    assert {:ok, _} = Task.await(long, 3_000)
+    assert Agent.get(counter, & &1.tokens) == 1
+    refute_received {:oauth_started, _}
+
+    assert Agent.get(counter, &Map.values(&1.posts)) |> Enum.sort() ==
+             Enum.sort([[[]], [[], ["Bearer token-1"]]])
+  end
+
+  @tag :reauth_round2
+  test "a failed shared inline flow fails every queued challenger without replay" do
+    {client, counter} =
+      start_client(&finish/2, era: :modern, hold_metadata: true, barrier: true, token_error: true)
+
+    tasks = [
+      call(client, format: :struct),
+      call(client, progress_token: "failed", format: :struct)
+    ]
+
+    servers = for _ <- 1..2, do: receive_challenge()
+    Enum.each(servers, &send(&1, :challenge))
+    assert_receive {:metadata_stalled, metadata}, 2_000
+    on_exit(fn -> send(metadata, :release) end)
+    assert_oauth_worker(client)
+    TestHelpers.wait_until(fn -> map_size(:sys.get_state(client).http_auth.waiters) == 2 end)
+    send(metadata, :release)
+
+    for result <- Task.await_many(tasks) do
+      assert {:error, %Arbor.MCP.Error.TransportError{reason: {:oauth_failed, _}}} = result
+    end
+
+    assert Agent.get(counter, & &1.tokens) == 1
+    assert Agent.get(counter, &Map.values(&1.posts)) == [[[]], [[]]]
+    assert :sys.get_state(client).http_auth.waiters == %{}
+    refute_received {:oauth_started, _}
+  end
+
+  @tag :reauth_round2
+  test "cancelling the last challenged request kills the stalled inline worker" do
+    {client, counter} = start_client(&finish/2, era: :modern, hold_metadata: true)
+    task = call(client, progress_token: "cancel-flow")
+    assert_receive {:metadata_stalled, metadata}, 2_000
+    on_exit(fn -> send(metadata, :release) end)
+    assert_receive {:oauth_started, worker}, 2_000
+    monitor = Process.monitor(worker)
+    [id] = Client.get_pending_requests(client)
+    assert :ok = Client.send_cancelled(client, id, "cancel stalled authorization")
+    assert {:error, :cancelled} = Task.await(task)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}, 2_000
+    assert Agent.get(counter, & &1.tokens) == 0
+    assert :sys.get_state(client).http_auth.worker == nil
+    assert :sys.get_state(client).http_auth.waiters == %{}
+  end
+
+  @tag :reauth_round2
+  test "reconnecting kills the inline worker and retires its waiters and results" do
+    {client, counter} =
+      start_client(&finish/2, era: :modern, hold_metadata: true, reconnect: true)
+
+    task = call(client, progress_token: "reconnect")
+    assert_receive {:metadata_stalled, metadata}, 2_000
+    on_exit(fn -> send(metadata, :release) end)
+    assert_receive {:oauth_started, worker}, 2_000
+    monitor = Process.monitor(worker)
+    auth_worker = :sys.get_state(client).http_auth.worker
+    send(client, {:transport_closed, :test_reconnect})
+
+    assert {:error, _} = Task.await(task, 2_000)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}, 2_000
+
+    TestHelpers.wait_until(fn ->
+      match?({:ok, %{connection_status: :ready}}, Client.get_status(client))
+    end)
+
+    send(metadata, :release)
+
+    send(
+      client,
+      {:http_inline_auth_result, worker, auth_worker.id, {:ok, "stale-token", ["admin"]}}
+    )
+
+    assert {:ok, _} = Client.ping(client, timeout: 500)
+    state = :sys.get_state(client)
+    assert state.transport_state.access_token == nil
+    assert state.http_auth.worker == nil
+    assert state.http_auth.waiters == %{}
+    assert Agent.get(counter, & &1.tokens) == 0
+  end
+
+  @tag :reauth_round2
+  test "a legacy challenge retries with the current session and connection headers" do
+    bypass = Bypass.open()
+    owner = self()
+
+    Bypass.stub(bypass, "POST", "/mcp", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      request = Jason.decode!(body)
+
+      cond do
+        request["method"] == "ping" ->
+          conn |> Plug.Conn.put_resp_header("mcp-session-id", "rotated") |> json(response(8, %{}))
+
+        Plug.Conn.get_req_header(conn, "authorization") == [] ->
+          challenge(conn, 401, "Bearer")
+
+        true ->
+          send(
+            owner,
+            {:retried_headers, Plug.Conn.get_req_header(conn, "mcp-session-id"),
+             Plug.Conn.get_req_header(conn, "x-current")}
+          )
+
+          json(conn, response(7, %{"content" => []}))
+      end
+    end)
+
+    {:ok, transport} = HTTP.connect(url: "http://127.0.0.1:#{bypass.port}/mcp", use_sse: false)
+    transport = HTTP.settle_protocol_era(transport, :legacy, "2025-11-25")
+    transport = %{transport | session_id: "original"}
+    request = Jason.encode!(%{"jsonrpc" => "2.0", "id" => 7, "method" => "tools/call"})
+    assert {:ok, _} = HTTP.send_async(request, transport)
+    assert_receive {:async_post_task, monitor, task, 7}, 2_000
+    assert_receive {:http_post_auth_challenge, ^task, _ref, _challenge} = message, 2_000
+    rotate = Jason.encode!(%{"jsonrpc" => "2.0", "id" => 8, "method" => "ping"})
+    assert {:ok, current, _} = HTTP.send_message(rotate, transport)
+    assert current.session_id == "rotated"
+    current = %{current | access_token: "fresh", headers: [{"X-Current", "fresh"}]}
+
+    state = %Client{
+      transport_mod: HTTP,
+      transport_state: current,
+      pending_requests: %{7 => {{self(), make_ref()}, :single, "tools/call"}},
+      async_post_tasks: %{monitor => {task, 7}}
+    }
+
+    assert {:noreply, _} = Client.handle_info(message, state)
+    assert_receive {:async_post_result, {:ok, _, _}, %{request_id: 7}}, 2_000
+    assert_received {:retried_headers, ["rotated"], ["fresh"]}
+  end
+
+  for {www_auth, status, reason} <- [
+        {~s(Basic realm="mcp"), 401, :unauthorized},
+        {~s(Basic realm="mcp"), 403, :http_error},
+        {"Bearer", 401, :oauth_failed}
+      ] do
+    @refusal_header www_auth
+    @refusal_status status
+    @refusal_reason reason
+    @tag :reauth_round2
+    test "a no-config request stream treats #{@refusal_reason} as a definitive refusal" do
+      {client, counter} =
+        start_client(&finish/2,
+          era: :modern,
+          seed: false,
+          challenge: @refusal_header,
+          challenge_status: @refusal_status
+        )
+
+      assert {:error, %Arbor.MCP.Error.TransportError{reason: reason}} =
+               Task.await(call(client, progress_token: "refused", format: :struct))
+
+      case @refusal_reason do
+        :unauthorized -> assert reason == {:unauthorized, 401, "", @refusal_header}
+        :http_error -> assert reason == {:http_error, 403, ""}
+        :oauth_failed -> assert {:oauth_failed, _} = reason
+      end
+
+      assert [headers] = Agent.get(counter, &Map.values(&1.posts))
+      assert headers == [[]]
+    end
+  end
+
   defp receive_challenge do
     assert_receive {:unauthenticated, server}, 2_000
     server
@@ -194,11 +416,24 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     transport = :sys.get_state(client).transport_state
     assert transport.auth_provider == nil
     assert transport.access_token == "token-1"
+    assert :sys.get_state(client).http_auth.worker == nil
+    assert :sys.get_state(client).http_auth.waiters == %{}
+  end
+
+  defp assert_oauth_worker(client) do
+    assert_receive {:oauth_started, worker}, 2_000
+    assert is_pid(worker)
+    assert worker != client
   end
 
   defp call(client, opts \\ []) do
     Task.async(fn ->
-      Client.call_tool(client, "protected", %{}, [timeout: 5_000, format: :map] ++ opts)
+      Client.call_tool(
+        client,
+        "protected",
+        %{},
+        Keyword.merge([timeout: 5_000, format: :map], opts)
+      )
     end)
   end
 
@@ -209,7 +444,7 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     version = if era == :legacy, do: "2025-11-25", else: "2026-07-28"
     owner = self()
     counter = start_supervised!({Agent, fn -> %{posts: %{}, codes: %{}, tokens: 0} end})
-    oauth_server(bypass, origin, counter)
+    oauth_server(bypass, origin, counter, opts)
 
     Bypass.stub(bypass, "GET", "/mcp", &Plug.Conn.resp(&1, 405, ""))
     Bypass.stub(bypass, "DELETE", "/mcp", &Plug.Conn.resp(&1, 200, ""))
@@ -243,23 +478,26 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
          handler: {Handler, owner: owner},
          use_sse: false,
          health_check_interval: nil,
-         reconnect: false}
+         reconnect: Keyword.get(opts, :reconnect, false),
+         reconnect_backoff: [initial: 10, max: 10, multiplier: 1]}
       )
 
     # An :auth map auto-creates a provider. Seed only the inline flow's config
     # after establishment to exercise real authorization-code OAuth without one.
     # The no-config handoff itself is covered separately above: registration
     # requires explicit configuration and must not acquire insecure defaults.
-    :sys.replace_state(client, fn state ->
-      config = %{
-        client_id: "inline-client",
-        client_secret: "inline-secret",
-        credential_issuer: origin,
-        metadata_fetch: [allow_insecure_loopback: true]
-      }
+    if Keyword.get(opts, :seed, true),
+      do:
+        :sys.replace_state(client, fn state ->
+          config = %{
+            client_id: "inline-client",
+            client_secret: "inline-secret",
+            credential_issuer: origin,
+            metadata_fetch: [allow_insecure_loopback: true]
+          }
 
-      %{state | transport_state: %{state.transport_state | auth_config: config}}
-    end)
+          %{state | transport_state: %{state.transport_state | auth_config: config}}
+        end)
 
     handler = {__MODULE__, make_ref()}
 
@@ -297,7 +535,11 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
           end
         end
 
-        challenge(conn, 401, ~s(Bearer resource_metadata="#{origin}/prm", scope="tools.call"))
+        challenge(
+          conn,
+          Keyword.get(opts, :challenge_status, 401),
+          opts[:challenge] || ~s(Bearer resource_metadata="#{origin}/prm", scope="tools.call")
+        )
 
       ["Bearer " <> token] ->
         if opts[:reject_retries] || (opts[:step_up] && token == "token-1") do
@@ -313,8 +555,24 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     end
   end
 
-  defp oauth_server(bypass, origin, counter) do
+  defp oauth_server(bypass, origin, counter, opts) do
+    owner = self()
+
     Bypass.stub(bypass, "GET", "/prm", fn conn ->
+      if opts[:hold_metadata] do
+        send(owner, {:metadata_stalled, self()})
+        monitor = Process.monitor(owner)
+
+        receive do
+          :release -> :ok
+          {:DOWN, ^monitor, :process, ^owner, _} -> :ok
+        after
+          10_000 -> flunk("metadata was not released")
+        end
+
+        Process.demonitor(monitor, [:flush])
+      end
+
       json(conn, %{"resource" => origin <> "/mcp", "authorization_servers" => [origin]})
     end)
 
@@ -361,11 +619,17 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
       assert params["resource"] == origin <> "/mcp"
       n = Agent.get_and_update(counter, &{&1.tokens + 1, %{&1 | tokens: &1.tokens + 1}})
 
-      json(conn, %{
-        "access_token" => "token-#{n}",
-        "token_type" => "Bearer",
-        "scope" => authorization["scope"]
-      })
+      if opts[:token_error] do
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(400, Jason.encode!(%{"error" => "invalid_grant"}))
+      else
+        json(conn, %{
+          "access_token" => "token-#{n}",
+          "token_type" => "Bearer",
+          "scope" => authorization["scope"]
+        })
+      end
     end)
   end
 
@@ -415,7 +679,8 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     end
   end
 
-  defp finish(request, conn), do: json(conn, response(request["id"], %{"content" => []}))
+  defp finish(request, conn),
+    do: json(conn, response(request["id"], %{"resultType" => "complete", "content" => []}))
 
   defp notification(method, params),
     do: %{"jsonrpc" => "2.0", "method" => method, "params" => params}

@@ -36,11 +36,13 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
   # so this only bounds a lost answer.
   @auth_wait_ms 600_000
 
-  @derive {Inspect, except: [:headers, :body, :http_options, :auth_provider_state]}
+  @derive {Inspect,
+           except: [:headers, :body, :http_options, :auth_provider_state, :auth_response]}
   defstruct [
     :parent,
     :parent_monitor,
     :request_id,
+    :deadline,
     :stream_kind,
     :url,
     :headers,
@@ -60,6 +62,7 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
     :consumer_ack_timeout,
     # {ref, timer} while the client process answers an auth challenge.
     :auth_wait,
+    :auth_response,
     auth_attempts: 0,
     buffer: "",
     completed?: false,
@@ -110,6 +113,7 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
       parent: parent,
       parent_monitor: Process.monitor(parent),
       request_id: Keyword.fetch!(opts, :request_id),
+      deadline: Keyword.get(opts, :deadline),
       stream_kind: Keyword.fetch!(opts, :stream_kind),
       url: Keyword.fetch!(opts, :url),
       headers: Keyword.fetch!(opts, :headers),
@@ -265,9 +269,7 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
     do: {:noreply, state}
 
   def handle_info({:auth_timeout, ref}, %{auth_wait: {ref, _timer}} = state),
-    do:
-      {:stop, :normal,
-       notify_closed(%{state | auth_wait: nil}, {:authentication_failed, :timeout})}
+    do: {:stop, :normal, notify_closed(%{state | auth_wait: nil}, {:auth_refused, :timeout})}
 
   def handle_info({:auth_timeout, _ref}, state), do: {:noreply, state}
 
@@ -303,6 +305,8 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
   end
 
   defp handle_complete_http_response(status, headers, body, state) do
+    state = %{state | auth_response: {status, headers, body}}
+
     case maybe_retry_with_auth(status, headers, state) do
       {:await_auth, state} ->
         {:noreply, state}
@@ -418,7 +422,9 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
   end
 
   defp handle_complete_response(status, _body, state) do
-    notify_closed(state, {:http_error, status})
+    if status in [401, 403],
+      do: notify_closed(state, {:auth_refused, auth_response_error(state)}),
+      else: notify_closed(state, {:http_error, status})
   end
 
   # A POST-owned stream gets non-2xx responses as complete httpc responses,
@@ -439,7 +445,8 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
       status: status,
       www_authenticate: www_auth,
       scopes: extract_scopes(www_auth),
-      token: bearer_token(state.headers)
+      token: bearer_token(state.headers),
+      deadline: state.deadline
     }
 
     Lifetime.deliver(
@@ -447,13 +454,36 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
       {:modern_http_stream_auth_challenge, self(), state.request_id, ref, challenge}
     )
 
-    timer = Process.send_after(self(), {:auth_timeout, ref}, @auth_wait_ms)
+    wait =
+      if state.deadline,
+        do: min(Deadline.remaining(state.deadline), @auth_wait_ms),
+        else: @auth_wait_ms
+
+    timer = Process.send_after(self(), {:auth_timeout, ref}, wait)
     {:await_auth, %{state | request_ref: nil, auth_wait: {ref, timer}}}
   end
 
   defp maybe_retry_with_auth(_status, _response_headers, _state), do: :no_retry
 
   defp retry_with_auth({:ok, token}, state) when is_binary(token) do
+    if Deadline.expired?(state.deadline),
+      do: retry_with_auth({:error, :timeout}, state),
+      else: retry_authenticated(token, state)
+  end
+
+  defp retry_with_auth({:error, reason}, state),
+    do:
+      {:stop, :normal, notify_closed(state, {:auth_refused, authentication_error(reason, state)})}
+
+  defp retry_with_auth(other, state),
+    do:
+      {:stop, :normal,
+       notify_closed(
+         state,
+         {:auth_refused, {:authentication_failed, {:invalid_provider_response, other}}}
+       )}
+
+  defp retry_authenticated(token, state) do
     case sanitize_retry_headers(put_bearer_header(state.headers, token), state) do
       {:ok, headers} ->
         state = %{
@@ -480,13 +510,19 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
     end
   end
 
-  defp retry_with_auth({:error, reason}, state),
-    do: {:stop, :normal, notify_closed(state, {:authentication_failed, reason})}
+  defp authentication_error(:timeout, _state), do: :timeout
 
-  defp retry_with_auth(other, state),
-    do:
-      {:stop, :normal,
-       notify_closed(state, {:authentication_failed, {:invalid_provider_response, other}})}
+  defp authentication_error(:no_credentials, %{auth_provider: nil} = state),
+    do: auth_response_error(state)
+
+  defp authentication_error(reason, %{auth_provider: nil}), do: reason
+  defp authentication_error(reason, _state), do: {:authentication_failed, reason}
+
+  defp auth_response_error(%{auth_response: {401, headers, body}}),
+    do: {:unauthorized, 401, body, Headers.get(headers, "www-authenticate")}
+
+  defp auth_response_error(%{auth_response: {status, _headers, body}}),
+    do: {:http_error, status, body}
 
   defp bearer_token(headers) do
     case Headers.get(headers, "authorization") do
