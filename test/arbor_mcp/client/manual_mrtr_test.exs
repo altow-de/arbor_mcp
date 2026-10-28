@@ -220,6 +220,13 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
   end
 
   @tom %{"name" => %{"action" => "accept", "content" => %{"name" => "Tom"}}}
+  @responses_shape "must map input request ids to elicitation, sampling or roots results"
+  @cached_tools %{
+    "resultType" => "complete",
+    "tools" => [],
+    "ttlMs" => 60_000,
+    "cacheScope" => "private"
+  }
 
   for transport <- [:http, :test] do
     describe "mrtr: :manual against an arbor_mcp server (#{transport})" do
@@ -632,6 +639,60 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
     end
   end
 
+  # A forwarding request answers for one downstream client; the cache is the
+  # client's own callers'.
+  describe "the response cache" do
+    test "a result fetched with client_capabilities never answers a default caller" do
+      client = scripted([@cached_tools, @cached_tools])
+
+      assert {:ok, _tools} = Client.list_tools(client, client_capabilities: %{"sampling" => %{}})
+      assert_received {:wire, %{"method" => "tools/list"}}
+
+      assert {:ok, _tools} = Client.list_tools(client)
+      assert_received {:wire, %{"method" => "tools/list", "params" => %{"_meta" => meta}}}
+      assert meta[@caps_key] == @form
+    end
+
+    test "a cached default result never answers a request with client_capabilities" do
+      client = scripted([@cached_tools, @cached_tools])
+
+      assert {:ok, _tools} = Client.list_tools(client)
+      assert_received {:wire, %{"method" => "tools/list"}}
+
+      # The default caller is answered from the cache.
+      assert {:ok, _tools} = Client.list_tools(client)
+      refute_received {:wire, _request}
+
+      assert {:ok, _tools} = Client.list_tools(client, client_capabilities: %{"sampling" => %{}})
+      assert_received {:wire, %{"method" => "tools/list", "params" => %{"_meta" => meta}}}
+      assert meta[@caps_key] == %{"sampling" => %{}}
+    end
+
+    test "mrtr: :manual bypasses it as well, whatever :cache_mode says" do
+      note = %{
+        "resultType" => "complete",
+        "contents" => [%{"uri" => "memo://note", "text" => "note"}],
+        "ttlMs" => 60_000,
+        "cacheScope" => "private"
+      }
+
+      client = scripted([note, note, note])
+
+      assert {:ok, _note} =
+               Client.read_resource(client, "memo://note", mrtr: :manual, cache_mode: :use)
+
+      assert_received {:wire, %{"method" => "resources/read"}}
+
+      # The manual read didn't fill the cache...
+      assert {:ok, _note} = Client.read_resource(client, "memo://note")
+      assert_received {:wire, %{"method" => "resources/read"}}
+
+      # ...and the default read's cached result doesn't answer a manual one.
+      assert {:ok, _note} = Client.read_resource(client, "memo://note", mrtr: :manual)
+      assert_received {:wire, %{"method" => "resources/read"}}
+    end
+  end
+
   describe "telemetry" do
     setup do
       id = {__MODULE__, make_ref()}
@@ -857,12 +918,12 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
       client = scripted([])
 
       for {key, value, reason} <- [
-            {:input_responses, [], "must map input request ids to response objects"},
-            {:input_responses, %{"name" => "accept"},
-             "must map input request ids to response objects"},
-            {:input_responses, %{"" => %{}}, "must map input request ids to response objects"},
-            {:input_responses, %{name: %{}}, "must map input request ids to response objects"},
-            {:input_responses, %{"name" => %{"pid" => self()}}, "must be JSON encodable"},
+            {:input_responses, [], @responses_shape},
+            {:input_responses, %{"name" => "accept"}, @responses_shape},
+            {:input_responses, %{"" => %{"action" => "decline"}}, @responses_shape},
+            {:input_responses, %{name: %{"action" => "decline"}}, @responses_shape},
+            {:input_responses, %{"name" => %{"action" => "accept", "_meta" => %{"p" => self()}}},
+             "must be JSON encodable"},
             {:request_state, 1, "must be a string"},
             {:client_capabilities, [], "must be a capabilities object"},
             {:client_capabilities, %{"elicitation" => true},
@@ -874,6 +935,86 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
             {:client_capabilities, %{"custom" => self()}, "must be JSON encodable"}
           ] do
         assert {:error, %ValidationError{field: ^key, reason: ^reason}} =
+                 Client.call_tool(client, "ask", %{}, [{:mrtr, :manual}, {key, value}])
+      end
+
+      refute_received {:wire, _request}
+    end
+
+    test "each input response must be an elicitation, sampling or roots result" do
+      client = scripted([])
+
+      text = %{"type" => "text", "text" => "Short."}
+
+      valid = [
+        %{"action" => "decline"},
+        %{action: "cancel"},
+        %{
+          "action" => "accept",
+          "content" => %{"n" => "Tom", "age" => 3, "ok" => true, "t" => ["a"]}
+        },
+        %{"role" => "assistant", "model" => "m", "content" => text},
+        %{"role" => "assistant", "model" => "m", "content" => [text], "stopReason" => "endTurn"},
+        %{"roots" => [%{"uri" => "file:///work", "name" => "work"}]},
+        %{"roots" => []}
+      ]
+
+      for response <- valid do
+        assert {:ok, _result} =
+                 Client.call_tool(client, "ask", %{},
+                   mrtr: :manual,
+                   input_responses: %{"id" => response},
+                   format: :map
+                 )
+
+        assert_received {:wire, %{"params" => %{"inputResponses" => %{"id" => _response}}}}
+      end
+
+      invalid = [
+        # A response wrapped in a JSON-RPC result, as a reviewer found.
+        %{"result" => %{"action" => "accept"}},
+        %{},
+        %{"action" => "maybe"},
+        %{"action" => "accept", "content" => "Tom"},
+        %{"action" => "accept", "content" => %{"name" => %{"first" => "Tom"}}},
+        %{"role" => "robot", "model" => "m", "content" => text},
+        %{"role" => "assistant", "content" => text},
+        %{"role" => "assistant", "model" => "m", "content" => %{"text" => "Short."}},
+        %{"role" => "assistant", "model" => "m", "content" => [text, "Short."]},
+        %{"roots" => "file:///work"},
+        %{"roots" => [%{"name" => "work"}]}
+      ]
+
+      for response <- invalid do
+        assert {:error, %ValidationError{field: :input_responses, reason: @responses_shape}} =
+                 Client.call_tool(client, "ask", %{},
+                   mrtr: :manual,
+                   input_responses: %{"id" => response}
+                 )
+      end
+
+      refute_received {:wire, _request}
+    end
+
+    # A forwarding handler must never crash on what it was given: a struct is
+    # a map but not a JSON object, and most aren't Enumerable.
+    test "structs are refused at every level, never enumerated" do
+      client = scripted([])
+
+      for {key, value} <- [
+            input_responses: %URI{},
+            input_responses: %{"id" => %URI{}},
+            input_responses: %{"id" => %{"action" => "accept", "content" => %URI{}}},
+            input_responses: %{"id" => %{"roots" => [%URI{}]}},
+            input_responses: %{"id" => %{"role" => "user", "model" => "m", "content" => %URI{}}},
+            client_capabilities: %URI{},
+            client_capabilities: %{"elicitation" => %URI{}},
+            client_capabilities: %{"extensions" => %URI{}},
+            client_capabilities: %{"elicitation" => %{"form" => %URI{}}},
+            client_capabilities: %{"extensions" => %{"x/y" => %URI{}}},
+            client_capabilities: %{"custom" => %URI{}}
+          ] do
+        assert {:error, %ValidationError{field: ^key}} =
                  Client.call_tool(client, "ask", %{}, [{:mrtr, :manual}, {key, value}])
       end
 

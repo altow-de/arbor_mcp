@@ -113,7 +113,8 @@ defmodule Arbor.MCP.Client.Internal.Request do
     scope_ref = make_ref()
     # What the client process reads from each round's request besides its
     # timeout (see RequestHandler.handle_request/5).
-    request_meta = Map.put(request_meta, :cache_mode, Keyword.get(opts, :cache_mode, :use))
+    # A forwarding request bypasses the cache whatever :cache_mode says.
+    request_meta = Map.put_new(request_meta, :cache_mode, Keyword.get(opts, :cache_mode, :use))
 
     progress_timeout = progress_timeout(client, opts, default_timeout)
     params = if progress_timeout, do: ensure_progress_token(params), else: params

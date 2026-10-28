@@ -33,6 +33,12 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
 
   @mrtr_methods ["tools/call", "resources/read", "prompts/get"]
 
+  @responses_shape "must map input request ids to elicitation, sampling or roots results"
+
+  # A struct passes is_map/1 but isn't a JSON object, and may not be
+  # Enumerable, so every map this module enumerates must be a plain one.
+  defguardp is_plain_map(value) when is_map(value) and not is_struct(value)
+
   # Capabilities whose value the 2026-07-28 schema defines as an object, with
   # the members (or, for :all, every member) that must be objects too.
   @capability_objects %{
@@ -70,7 +76,7 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
         |> put_present("inputResponses", Keyword.get(set, :input_responses))
         |> put_present("requestState", Keyword.get(set, :request_state))
 
-      {:ok, params, request_meta(set)}
+      {:ok, params, request_meta(set, opts)}
     end
   end
 
@@ -99,7 +105,7 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
       nil ->
         {:ok, nil}
 
-      meta when is_map(meta) ->
+      meta when is_plain_map(meta) ->
         {:ok, meta}
 
       _invalid ->
@@ -186,7 +192,7 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
   defp validate_input_responses(nil, _opts), do: :ok
 
   # The same byte limit that automatic MRTR puts on the handler's responses.
-  defp validate_input_responses(responses, opts) when is_map(responses) do
+  defp validate_input_responses(responses, opts) when is_plain_map(responses) do
     maximum = MRTR.max_bytes(opts)
 
     if Enum.all?(responses, &response_entry?/1) do
@@ -201,15 +207,69 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
           invalid_responses("must be JSON encodable")
       end
     else
-      invalid_responses("must map input request ids to response objects")
+      invalid_responses(@responses_shape)
     end
   end
 
-  defp validate_input_responses(_responses, _opts),
-    do: invalid_responses("must map input request ids to response objects")
+  defp validate_input_responses(_responses, _opts), do: invalid_responses(@responses_shape)
 
   defp response_entry?({id, response}),
-    do: is_binary(id) and byte_size(id) > 0 and is_map(response)
+    do: is_binary(id) and byte_size(id) > 0 and input_result?(response)
+
+  # The client keeps nothing between rounds, so it can't tell which input
+  # request an id answered: a response is valid if it is one of the results
+  # the 2026-07-28 schema defines for an input request.
+  defp input_result?(response) when is_plain_map(response),
+    do: elicit_result?(response) or create_message_result?(response) or roots_result?(response)
+
+  defp input_result?(_response), do: false
+
+  # ElicitResult: an action, and for accept optional content of primitives.
+  defp elicit_result?(response) do
+    field(response, "action", :action) in ["accept", "decline", "cancel"] and
+      case fetch_field(response, "content", :content) do
+        :error -> true
+        {:ok, content} when is_plain_map(content) -> Enum.all?(content, &elicit_value?/1)
+        {:ok, _content} -> false
+      end
+  end
+
+  defp elicit_value?({_name, value})
+       when is_binary(value) or is_number(value) or is_boolean(value),
+       do: true
+
+  defp elicit_value?({_name, values}) when is_list(values), do: Enum.all?(values, &is_binary/1)
+  defp elicit_value?(_entry), do: false
+
+  # CreateMessageResult: a role, a model, and a content block or blocks.
+  defp create_message_result?(response) do
+    field(response, "role", :role) in ["user", "assistant"] and
+      is_binary(field(response, "model", :model)) and
+      sampling_content?(field(response, "content", :content))
+  end
+
+  defp sampling_content?(blocks) when is_list(blocks), do: Enum.all?(blocks, &content_block?/1)
+  defp sampling_content?(block), do: content_block?(block)
+
+  defp content_block?(block) when is_plain_map(block), do: is_binary(field(block, "type", :type))
+  defp content_block?(_block), do: false
+
+  # ListRootsResult: a list of roots, each with a URI.
+  defp roots_result?(response) do
+    case field(response, "roots", :roots) do
+      roots when is_list(roots) -> Enum.all?(roots, &root?/1)
+      _other -> false
+    end
+  end
+
+  defp root?(root) when is_plain_map(root), do: is_binary(field(root, "uri", :uri))
+  defp root?(_root), do: false
+
+  defp field(map, key, atom), do: Map.get(map, key, Map.get(map, atom))
+
+  defp fetch_field(map, key, atom) do
+    with :error <- Map.fetch(map, key), do: Map.fetch(map, atom)
+  end
 
   defp invalid_responses(reason),
     do: {:error, Error.validation_error(:input_responses, nil, reason)}
@@ -222,7 +282,7 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
 
   defp validate_capabilities(nil), do: :ok
 
-  defp validate_capabilities(capabilities) when is_map(capabilities) do
+  defp validate_capabilities(capabilities) when is_plain_map(capabilities) do
     cond do
       not Enum.all?(capabilities, &capability_entry?/1) ->
         invalid_capabilities(
@@ -247,8 +307,8 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
   defp capability_entry?({key, value}) when is_binary(key) and byte_size(key) > 0 do
     case Map.fetch(@capability_objects, key) do
       :error -> true
-      {:ok, _members} when not is_map(value) -> false
-      {:ok, :all} -> Enum.all?(value, fn {_member, setting} -> is_map(setting) end)
+      {:ok, _members} when not is_plain_map(value) -> false
+      {:ok, :all} -> Enum.all?(value, fn {_member, setting} -> is_plain_map(setting) end)
       {:ok, members} -> Enum.all?(members, &object_member?(value, &1))
     end
   end
@@ -258,7 +318,7 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
   defp object_member?(value, member) do
     case member_value(value, member) do
       :error -> true
-      {:ok, setting} -> is_map(setting)
+      {:ok, setting} -> is_plain_map(setting)
     end
   end
 
@@ -277,18 +337,25 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
   defp invalid_capabilities(capabilities, reason),
     do: {:error, Error.validation_error(:client_capabilities, capabilities, reason)}
 
-  defp request_meta(set) do
-    case Keyword.keys(set) do
-      [] ->
-        %{}
+  # A forwarding request answers for one downstream client, so it neither
+  # reads nor fills the response cache, which the client's own callers share:
+  # an answer chosen for that client's capabilities must not reach them, and
+  # theirs must not answer it.
+  defp request_meta(set, opts) do
+    meta =
+      if set == [] and not manual?(opts),
+        do: %{},
+        else: %{cache_mode: :bypass}
 
-      modern_options ->
-        meta = %{modern_options: modern_options}
+    meta =
+      case Keyword.keys(set) do
+        [] -> meta
+        modern_options -> Map.put(meta, :modern_options, modern_options)
+      end
 
-        case Keyword.fetch(set, :client_capabilities) do
-          {:ok, capabilities} -> Map.put(meta, :client_capabilities, capabilities)
-          :error -> meta
-        end
+    case Keyword.fetch(set, :client_capabilities) do
+      {:ok, capabilities} -> Map.put(meta, :client_capabilities, capabilities)
+      :error -> meta
     end
   end
 

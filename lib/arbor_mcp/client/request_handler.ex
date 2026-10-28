@@ -63,15 +63,10 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
   # A result the server said is still fresh is answered without asking it
   # again (see ResponseCache), unless the call asked to refresh or bypass it.
-  # Only while connected: a disconnected client says so. A legacy request
-  # with options only 2026-07-28 defines is refused (see send_built_request/6),
-  # not answered.
+  # Only while connected: a disconnected client says so.
   defp cached_result(method, params, meta, state) do
     with :use <- Map.get(meta, :cache_mode, :use),
          :ready <- Map.get(state, :connection_status),
-         true <-
-           Map.get(meta, :modern_options, []) == [] or
-             VersionRegistry.modern?(Map.get(state, :protocol_version)),
          %ResponseCache{} = cache <- Map.get(state, :response_cache),
          {:ok, result} <- ResponseCache.lookup(cache, ResponseCache.key(method, params), now()) do
       :telemetry.execute([:arbor_mcp, :client, :cache, :hit], %{}, %{method: method})

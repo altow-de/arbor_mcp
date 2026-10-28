@@ -677,10 +677,11 @@ defmodule Arbor.MCP.Client do
   explicit `:progress_token`. A round passes the checks automatic MRTR
   makes, apart from `:max_mrtr_rounds`; the caller runs the rounds.
   `:input_responses`, `:request_state` and `:client_capabilities` without
-  `mrtr: :manual`, or on a connection that settled on a legacy revision,
-  return `{:error, %Arbor.MCP.Error.ValidationError{}}`. See "Forwarding
-  clients" in the configuration guide for the full contract. `read_resource/3`
-  and `get_prompt/4` take the same options.
+  `mrtr: :manual`, malformed, or on a connection that settled on a legacy
+  revision, return `{:error, %Arbor.MCP.Error.ValidationError{}}`. A request
+  with any of these options, or with `mrtr: :manual`, bypasses the response
+  cache. See "Forwarding clients" in the configuration guide for the full
+  contract. `read_resource/3` and `get_prompt/4` take the same options.
   """
   @spec call_tool(t(), String.t(), map(), keyword() | timeout()) ::
           {:ok, Arbor.MCP.Response.t() | map()}
