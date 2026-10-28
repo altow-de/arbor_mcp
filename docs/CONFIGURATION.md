@@ -1244,8 +1244,20 @@ fails returns the `{:error, %Arbor.MCP.Error.ProtocolError{}}` automatic MRTR
 would return, for example `-32021` for an undeclared capability. The byte
 limit counts the round's `_meta`, which must be an object if present.
 `:max_mrtr_rounds` doesn't apply, because the caller runs the rounds and
-should bound them itself. `input_responses:` must map input request ids to
-response objects, and is held to `:max_mrtr_bytes` too.
+should bound them itself.
+
+`input_responses:` must map input request ids to the results the 2026-07-28
+schema defines for input requests:
+
+- an elicitation result: `action` of `accept`, `decline` or `cancel`, and
+  optional `content` of strings, numbers, booleans or lists of strings;
+- a `CreateMessageResult`: `role`, `model`, and a content block or a list of
+  them;
+- a `ListRootsResult`: `roots`, each with a `uri`.
+
+The client keeps nothing between rounds, so it can't tell which input
+request an id answered: a response that is any one of these passes. The
+responses are held to `:max_mrtr_bytes` too.
 
 A gateway built on `Arbor.MCP.Server.Handler` can hand the upstream round to
 its downstream client as its own `input_required`, keeping the upstream
@@ -1302,8 +1314,9 @@ can't reset its timeout on progress.
 
 `input_responses:` and `request_state:` without `mrtr: :manual`,
 `client_capabilities:` without it on a request that can return
-`input_required`, and any malformed value return
-`{:error, %Arbor.MCP.Error.ValidationError{}}` before anything is sent.
+`input_required`, and any malformed value, a struct where an object belongs
+included, return `{:error, %Arbor.MCP.Error.ValidationError{}}` before
+anything is sent.
 Automatic MRTR would answer a round chosen for capabilities the client's own
 handler may not have; a request that can't pause has no round to answer, so
 it may declare any capabilities. On a connection that settled on a legacy revision,
@@ -1317,8 +1330,12 @@ request state, which may hold a user's answers or a resumable token.
 `client_capabilities:` applies to the request it is passed with. The
 client's own checks follow its start capabilities: which extension result
 types it accepts, such as Tasks results, and what automatic MRTR answers.
-The response cache keys a result by its request's params, not by the
-capabilities it declared.
+
+A request with `client_capabilities:`, `input_responses:`, `request_state:`
+or `mrtr: :manual` neither reads nor fills the response cache, whatever
+`:cache_mode` says. Its answer belongs to one downstream client, and the
+cache to the client's own callers: an answer chosen for the downstream
+client's capabilities must not reach them, and theirs must not answer it.
 
 A manual round reports the events automatic MRTR reports, with
 `mode: :manual` in their metadata where automatic rounds carry

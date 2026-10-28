@@ -58,9 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before anything is sent. Every round of one call repeats its arguments,
   capabilities and progress token, because an arbor_mcp server binds
   `requestState` to them, so `mrtr: :manual` with
-  `reset_timeout_on_progress: true` needs an explicit `:progress_token`. See
-  "Forwarding clients" in `docs/CONFIGURATION.md`. Thanks to Wagner for the
-  design and the first implementation.
+  `reset_timeout_on_progress: true` needs an explicit `:progress_token`.
+  Each input response must be an elicitation, sampling or roots result as
+  the 2026-07-28 schema defines them. A request with any of these options
+  neither reads nor fills the response cache, so a downstream client's
+  answers never reach the client's own callers. See "Forwarding clients" in
+  `docs/CONFIGURATION.md`. Thanks to Wagner for the design and the first
+  implementation.
 
 ### Changed
 
