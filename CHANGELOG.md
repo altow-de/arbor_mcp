@@ -51,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A partial inline OAuth step-up grant no longer replaces shared credentials
+  with fewer scopes. Only compatible waiters receive that grant; a waiter
+  whose own flow omits required scopes fails definitively with
+  `{:oauth_failed, :insufficient_scope}` without another flow or POST retry.
+  Full superset grants and authentication after a 401 still update credentials.
 - Concurrent inline OAuth scope step-ups now wait for tokens covering their own
   scopes, with separate serialized flows when needed. Challenged scopes are
   passed to the inline flow with credentials. Retained HTTP health pings can

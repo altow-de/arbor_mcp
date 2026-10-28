@@ -78,12 +78,14 @@ defmodule Arbor.MCP.Client.HTTPAuth do
     do: send(pid, {:modern_http_stream_auth_result, ref, result})
 
   def result(%{http_auth: %{worker: %{pid: pid, id: id}}} = state, pid, id, result) do
+    worker = state.http_auth.worker
     state = stop_worker(state)
 
     transport =
       case result do
         {:ok, token, scopes} ->
-          if Enum.any?(state.http_auth.waiters, fn {_ref, waiter} -> live?(waiter, state) end) do
+          if store_token?(worker, state.transport_state, scopes) and
+               Enum.any?(state.http_auth.waiters, fn {_ref, waiter} -> live?(waiter, state) end) do
             HTTP.put_oauth_token(
               state.transport_state,
               %{access_token: token, scope: Enum.join(scopes, " ")},
@@ -103,6 +105,11 @@ defmodule Arbor.MCP.Client.HTTPAuth do
   end
 
   def result(state, _pid, _id, _result), do: state
+
+  # A 401 invalidates the previous credentials. A step-up must preserve the
+  # shared token's scopes; narrower grants may still serve individual waiters.
+  defp store_token?(%{status: 401}, _transport, _scopes), do: true
+  defp store_token?(_worker, transport, scopes), do: covers?(scopes, transport.granted_scopes)
 
   def waiter_timeout(state, ref) do
     case Map.get(state.http_auth.waiters, ref) do
@@ -174,7 +181,8 @@ defmodule Arbor.MCP.Client.HTTPAuth do
       id: id,
       timer: nil,
       deadline: nil,
-      scopes: challenge.scopes
+      scopes: challenge.scopes,
+      status: challenge.status
     }
 
     %{state | http_auth: %{state.http_auth | worker: worker}} |> join_flow()
@@ -293,8 +301,12 @@ defmodule Arbor.MCP.Client.HTTPAuth do
     end)
   end
 
-  defp flow_outcome({:ok, token, granted}, waiter, _id) do
-    if covers?(granted, waiter.scopes), do: {:ok, token}, else: :queued
+  defp flow_outcome({:ok, token, granted}, waiter, id) do
+    cond do
+      covers?(granted, waiter.scopes) -> {:ok, token}
+      waiter.flow == id -> {:error, {:oauth_failed, :insufficient_scope}}
+      true -> :queued
+    end
   end
 
   defp flow_outcome({:error, _} = error, %{flow: id}, id), do: error

@@ -143,15 +143,104 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
   end
 
   @tag :reauth_round3
-  test "a flow that grants less than requested does not consume the request's last retry" do
+  @tag :reauth_round4
+  test "an insufficient grant fails definitively without consuming the last POST retry" do
     {client, counter} = start_client(&finish/2, scoped_step_up: true, narrow_step_up: true)
-    assert {:ok, _} = Client.call_tool(client, "protected", %{"need" => "alpha"}, format: :map)
+
+    assert {:error, %{reason: {:oauth_failed, :insufficient_scope}}} =
+             Client.call_tool(client, "protected", %{"need" => "alpha"},
+               timeout: 1_000,
+               format: :map
+             )
+
     state = Agent.get(counter, & &1)
-    assert state.tokens == 3
+    assert state.tokens == 2
     assert state.grants["token-2"] == ["tools.call"]
     assert [headers] = Map.values(state.posts)
-    assert headers == [[], ["Bearer token-1"], ["Bearer token-3"]]
+    assert headers == [[], ["Bearer token-1"]]
+    assert :sys.get_state(client).http_auth.worker == nil
+    assert :sys.get_state(client).http_auth.waiters == %{}
     refute_received {:wrong_scope_retry, _, _}
+  end
+
+  @tag :reauth_round4
+  test "a narrower step-up grant preserves shared write credentials and does not loop flows" do
+    {client, counter} =
+      start_client(&finish/2,
+        scoped_step_up: true,
+        base_scopes: ["read", "write"],
+        partial_grant: ["read"],
+        hold_step_up_metadata: true
+      )
+
+    admin =
+      Task.async(fn ->
+        Client.call_tool(client, "protected", %{"need" => "admin"}, timeout: 1_000, format: :map)
+      end)
+
+    assert_receive {:scope_challenge, "admin", server, admin_id}, 2_000
+    send(server, :challenge)
+    assert_receive {:metadata_stalled, metadata}, 2_000
+    on_exit(fn -> send(metadata, :release) end)
+    state = :sys.get_state(client)
+    assert state.transport_state.access_token == "token-1"
+    assert state.transport_state.granted_scopes == ["read", "write"]
+    monitor = Process.monitor(state.http_auth.worker.pid)
+    send(metadata, :release)
+    assert_receive {:DOWN, ^monitor, :process, _worker, _}, 2_000
+
+    state = :sys.get_state(client)
+    assert state.transport_state.access_token == "token-1"
+    assert state.transport_state.granted_scopes == ["read", "write"]
+
+    assert {:ok, _} =
+             Client.call_tool(client, "protected", %{"need" => "write"},
+               timeout: 1_000,
+               format: :map
+             )
+
+    assert {:error, %{reason: {:oauth_failed, :insufficient_scope}}} = Task.await(admin, 1_500)
+    state = Agent.get(counter, & &1)
+    assert state.tokens == 2
+    assert state.grants["token-2"] == ["read"]
+    assert state.posts[admin_id] == [[], ["Bearer token-1"]]
+    assert [write_headers] = state.posts |> Map.delete(admin_id) |> Map.values()
+    assert write_headers == [["Bearer token-1"]]
+    assert :sys.get_state(client).http_auth.worker == nil
+    assert :sys.get_state(client).http_auth.waiters == %{}
+    refute_received {:metadata_stalled, _}
+    refute_received {:wrong_scope_retry, _, _}
+  end
+
+  @tag :reauth_round4
+  test "a superset step-up grant replaces shared credentials and their granted scopes" do
+    {client, counter} =
+      start_client(&finish/2, scoped_step_up: true, base_scopes: ["read", "write"])
+
+    assert {:ok, _} = Client.call_tool(client, "protected", %{"need" => "admin"}, format: :map)
+    state = :sys.get_state(client)
+    assert state.transport_state.access_token == "token-2"
+    assert state.transport_state.granted_scopes == ["read", "write", "admin"]
+    assert Agent.get(counter, & &1.tokens) == 2
+    refute_received {:wrong_scope_retry, _, _}
+  end
+
+  @tag :reauth_round4
+  test "a 401 flow may replace rejected credentials with a narrower valid token" do
+    {client, counter} =
+      start_client(&finish/2,
+        scoped_step_up: true,
+        base_scopes: ["read", "write"],
+        reject_read_token: true
+      )
+
+    assert {:ok, _} = Client.call_tool(client, "protected", %{"need" => "write"}, format: :map)
+    assert :sys.get_state(client).transport_state.granted_scopes == ["read", "write"]
+    assert {:ok, _} = Client.call_tool(client, "protected", %{"need" => "read"}, format: :map)
+    state = :sys.get_state(client)
+    assert state.transport_state.access_token == "token-2"
+    assert state.transport_state.granted_scopes == ["read"]
+    assert Agent.get(counter, & &1.tokens) == 2
   end
 
   for provider <- [:inline, :provider] do
@@ -759,23 +848,38 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
         challenge(
           conn,
           Keyword.get(opts, :challenge_status, 401),
-          opts[:challenge] || ~s(Bearer resource_metadata="#{origin}/prm", scope="tools.call")
+          opts[:challenge] ||
+            ~s(Bearer resource_metadata="#{origin}/prm", scope="#{base_scopes(opts)}")
         )
 
       ["Bearer " <> token] ->
-        if opts[:scoped_step_up] do
-          scoped_step_up(conn, request, token, counter, origin, owner, answer, opts)
+        authenticated_call(conn, request, token, counter, origin, owner, answer, opts)
+    end
+  end
+
+  defp authenticated_call(conn, request, token, counter, origin, owner, answer, opts) do
+    cond do
+      opts[:reject_read_token] && token == "token-1" &&
+          request["params"]["arguments"]["need"] == "read" ->
+        challenge(
+          conn,
+          401,
+          ~s(Bearer error="insufficient_scope", resource_metadata="#{origin}/prm", scope="read")
+        )
+
+      opts[:scoped_step_up] ->
+        scoped_step_up(conn, request, token, counter, origin, owner, answer, opts)
+
+      true ->
+        if opts[:reject_retries] || (opts[:step_up] && token == "token-1") do
+          challenge(
+            conn,
+            403,
+            ~s(Bearer error="insufficient_scope", resource_metadata="#{origin}/prm", scope="tools.call admin")
+          )
         else
-          if opts[:reject_retries] || (opts[:step_up] && token == "token-1") do
-            challenge(
-              conn,
-              403,
-              ~s(Bearer error="insufficient_scope", resource_metadata="#{origin}/prm", scope="tools.call admin")
-            )
-          else
-            assert token in ["token-1", "token-2"]
-            answer.(request, conn)
-          end
+          assert token in ["token-1", "token-2"]
+          answer.(request, conn)
         end
     end
   end
@@ -796,7 +900,7 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
       challenge(
         conn,
         403,
-        ~s(Bearer error="insufficient_scope", resource_metadata="#{origin}/prm", scope="tools.call #{scope}")
+        ~s(Bearer error="insufficient_scope", resource_metadata="#{origin}/prm", scope="#{base_scopes(opts)} #{scope}")
       )
     end
   end
@@ -865,7 +969,13 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
       assert params["redirect_uri"] == authorization["redirect_uri"]
       assert params["resource"] == origin <> "/mcp"
       n = Agent.get_and_update(counter, &{&1.tokens + 1, %{&1 | tokens: &1.tokens + 1}})
-      granted = if opts[:narrow_step_up] && n == 2, do: "tools.call", else: authorization["scope"]
+
+      granted =
+        cond do
+          opts[:partial_grant] && n >= 2 -> Enum.join(opts[:partial_grant], " ")
+          opts[:narrow_step_up] && n == 2 -> "tools.call"
+          true -> authorization["scope"]
+        end
 
       Agent.update(
         counter,
@@ -888,6 +998,8 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
       end
     end)
   end
+
+  defp base_scopes(opts), do: opts |> Keyword.get(:base_scopes, ["tools.call"]) |> Enum.join(" ")
 
   defp establishment(:legacy, version) do
     %{
