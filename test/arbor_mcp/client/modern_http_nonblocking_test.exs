@@ -16,6 +16,7 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
   @moduletag :capture_log
 
   alias Arbor.MCP.Client
+  alias Arbor.MCP.Error.TransportError
   alias Arbor.MCP.Server.{Context, Runtime}
   alias Arbor.MCP.Transport.HTTP
 
@@ -270,6 +271,29 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
       refute_received :authenticated
     end
 
+    # A modern request without an auth provider used to be re-sent from the
+    # client process after a 401 or 403, holding every other request until
+    # that POST was answered.
+    test "a challenge OAuth can't answer fails the request without re-sending it" do
+      client = start_bypass_client()
+
+      assert {:error, %TransportError{reason: {:unauthorized, 401, _body, "Basic" <> _}}} =
+               Client.call_tool(client, "basic", %{}, timeout: 5_000)
+
+      assert_received {:posted, "tools/call"}
+      refute_received {:posted, "tools/call"}
+    end
+
+    test "a failed OAuth flow fails the request without re-sending it" do
+      client = start_bypass_client()
+
+      assert {:error, %TransportError{reason: {:oauth_failed, _reason}}} =
+               Client.call_tool(client, "bearer", %{}, timeout: 5_000)
+
+      assert_received {:posted, "tools/call"}
+      refute_received {:posted, "tools/call"}
+    end
+
     test "without a provider, a challenge another request already answered gets its token" do
       ref = make_ref()
 
@@ -293,6 +317,40 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
   end
 
   describe "a POST task without an auth provider" do
+    test "on a modern connection asks its client to authenticate and re-sends itself" do
+      bypass = Bypass.open()
+      attempts = start_supervised!({Agent, fn -> 0 end})
+
+      Bypass.expect(bypass, "POST", "/mcp", fn conn ->
+        case Agent.get_and_update(attempts, &{&1 + 1, &1 + 1}) do
+          1 ->
+            conn
+            |> Plug.Conn.put_resp_header("www-authenticate", ~s(Bearer realm="mcp"))
+            |> Plug.Conn.resp(401, "")
+
+          2 ->
+            assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer inline-token"]
+            json(conn, %{"jsonrpc" => "2.0", "id" => 7, "result" => complete()})
+        end
+      end)
+
+      transport = modern_transport(bypass.port)
+      request = encoded_call(7)
+
+      assert {:ok, _transport} = HTTP.send_async(request, transport)
+      assert_receive {:async_post_task, _monitor, task, 7}
+
+      assert_receive {:http_post_auth_challenge, ^task, ref,
+                      %{status: 401, www_authenticate: ~s(Bearer realm="mcp"), token: nil}},
+                     2_000
+
+      send(task, {:http_post_auth_result, ref, {:ok, "inline-token"}})
+
+      assert_receive {:async_post_result, {:ok, _state, body}, %{request_id: 7}}, 2_000
+      assert %{"id" => 7, "result" => %{"resultType" => "complete"}} = Jason.decode!(body)
+      assert Agent.get(attempts, & &1) == 2
+    end
+
     test "on a legacy-era connection still hands its request back to be re-sent" do
       bypass = Bypass.open()
 

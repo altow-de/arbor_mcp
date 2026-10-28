@@ -386,8 +386,8 @@ defmodule Arbor.MCP.Transport.HTTP do
   @doc false
   # Sends `message` synchronously from the calling process, running any
   # authentication its response asks for. The client re-sends a request this
-  # way when an async POST hands back an auth challenge, so only one
-  # authentication runs at a time.
+  # way when a legacy-era async POST without an auth provider hands back an
+  # auth challenge, so only one authentication runs at a time.
   # An authentication failure returns the transport state too, so the
   # provider's record of what it tried is kept.
   @spec send_authenticated(term(), t()) ::
@@ -482,8 +482,12 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   # A POST task does not authenticate: with several in flight, each would run
-  # the OAuth flow. It hands an auth challenge back to the client process,
-  # which re-sends that request with send_authenticated/2.
+  # the OAuth flow. It hands an auth challenge to the client process, which
+  # answers one at a time across its requests: with the auth provider, or,
+  # for a modern request without one, with the OAuth flow a synchronous send
+  # runs (see answer_challenge_inline/2). A legacy-era task without a
+  # provider hands its request back instead, and the client re-sends it with
+  # send_authenticated/2.
   defp perform_async(message, state, parent, attempts \\ 0) do
     stream =
       PostStream.consumer(parent,
@@ -491,29 +495,31 @@ defmodule Arbor.MCP.Transport.HTTP do
         max_kept_bytes: state.max_response_bytes
       )
 
+    client_answers? = not is_nil(state.auth_provider) or state.protocol_era == :modern
+
     case perform_http_request(message, state, event_stream: stream) do
       {:ok, response} ->
-        case {extract_auth_status(response), state.auth_provider} do
-          {:ok, _provider} ->
+        case {extract_auth_status(response), client_answers?} do
+          {:ok, _client_answers?} ->
             {handle_http_response(response, state, message), state}
 
           # As a modern request stream does: the client process answers the
           # challenge, one at a time across its requests, and this task sends
           # the request again itself, so the client isn't held up meanwhile.
           # At most an initial 401 and a 403 step-up.
-          {{kind, www_auth}, provider} when not is_nil(provider) and attempts < 2 ->
+          {{kind, www_auth}, true} when attempts < 2 ->
             case await_authentication(parent, kind, www_auth, state) do
               {:ok, token} ->
                 perform_async(message, apply_token_to_state(state, token), parent, attempts + 1)
 
               {:error, reason} ->
-                {{:error, {:authentication_failed, reason}}, state}
+                {authentication_failure(reason, response, state, message), state}
             end
 
-          {_challenge, provider} when not is_nil(provider) ->
+          {_challenge, true} ->
             {handle_http_response(response, state, message), state}
 
-          {_challenge, nil} ->
+          {_challenge, false} ->
             {{:error, {:reauthenticate, message}}, state}
         end
 
@@ -521,6 +527,18 @@ defmodule Arbor.MCP.Transport.HTTP do
         {{:error, reason}, state}
     end
   end
+
+  defp authentication_failure(reason, _response, %{auth_provider: provider}, _message)
+       when not is_nil(provider),
+       do: {:error, {:authentication_failed, reason}}
+
+  # Without a provider the caller sees what a synchronous send reported: the
+  # server's own response to a challenge OAuth can't answer, or the failed
+  # OAuth flow.
+  defp authentication_failure(:no_credentials, response, state, message),
+    do: handle_http_response(response, state, message)
+
+  defp authentication_failure(reason, _response, _state, _message), do: {:error, reason}
 
   @auth_wait_ms 600_000
 
@@ -714,28 +732,65 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
-  # Attempt OAuth discovery and retry if auth_config is available
-  defp maybe_oauth_retry(headers, original_body, %{auth_config: nil} = state) do
-    # No explicit auth config — try full OAuth flow if this looks like an OAuth challenge
-    www_auth = Headers.get(headers, "www-authenticate")
+  # Obtains the credentials the challenge asks for, then sends the request
+  # again with them.
+  defp maybe_oauth_retry(headers, original_body, state) do
+    case inline_credentials(Headers.get(headers, "www-authenticate"), state) do
+      {:ok, new_state} ->
+        case perform_http_request(original_body, new_state) do
+          {:ok, response} -> {:ok, response, new_state}
+          {:error, reason} -> {:error, reason}
+        end
 
+      no_retry ->
+        no_retry
+    end
+  end
+
+  @doc false
+  # Answers, from the client process, the 401 or 403 that a modern POST task
+  # without an auth provider handed back (see perform_async/4): runs the
+  # OAuth flow a synchronous send would run, and returns the token for the
+  # task to send its request again with. Only the authentication runs here,
+  # one challenge at a time; the request itself is re-sent by its task.
+  # `{:error, :no_credentials}` means the challenge is not one OAuth can
+  # answer, so the task delivers the server's response as it came.
+  @spec answer_challenge_inline(t(), map()) :: {{:ok, String.t()} | {:error, term()}, t()}
+  def answer_challenge_inline(%__MODULE__{} = state, challenge) when is_map(challenge) do
+    case inline_credentials(Map.get(challenge, :www_authenticate), state) do
+      {:ok, %{access_token: token} = new_state} when is_binary(token) ->
+        {{:ok, token}, new_state}
+
+      {:ok, _no_token} ->
+        {{:error, {:oauth_failed, :no_access_token}}, state}
+
+      :no_challenge ->
+        {{:error, :no_credentials}, state}
+
+      {:error, reason} ->
+        {{:error, reason}, state}
+    end
+  end
+
+  # The credentials a 401 or 403 asks for when no auth provider is
+  # configured: the state carrying the new token, :no_challenge when OAuth
+  # can't answer the challenge, or {:error, {:oauth_failed, reason}}.
+  defp inline_credentials(www_auth, %{auth_config: nil} = state) do
+    # No explicit auth config — try full OAuth flow if this looks like an OAuth challenge
     if www_auth && String.starts_with?(www_auth, "Bearer") do
-      run_full_oauth_flow(www_auth, original_body, state)
+      run_full_oauth_flow(www_auth, state)
     else
       :no_challenge
     end
   end
 
-  defp maybe_oauth_retry(headers, original_body, %{access_token: token} = state)
+  defp inline_credentials(www_auth, %{access_token: token} = state)
        when is_binary(token) and byte_size(token) > 0 do
     # Already have a token but got 401/403 — check if this is a scope step-up
-    www_auth = Headers.get(headers, "www-authenticate") || ""
-
-    if String.contains?(www_auth, "insufficient_scope") do
+    if String.contains?(www_auth || "", "insufficient_scope") do
       # Scope step-up: clear token and re-auth with new scope requirements
       Logger.info("Scope step-up required, re-authorizing")
-      new_state = %{state | access_token: nil, auth_completed: false}
-      maybe_oauth_retry(headers, original_body, new_state)
+      inline_credentials(www_auth, %{state | access_token: nil, auth_completed: false})
     else
       # Token rejected for other reason — auth loop protection
       Logger.warning("Auth failed after successful OAuth flow, not retrying")
@@ -743,10 +798,9 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
-  defp maybe_oauth_retry(headers, original_body, state) do
+  defp inline_credentials(www_auth, state) do
     # Have auth_config with credentials — use FullOAuthFlow which handles
     # PRM discovery with header fallback and pre-existing credentials
-    www_auth = Headers.get(headers, "www-authenticate")
     resource_url = build_url(state, "")
 
     config =
@@ -758,22 +812,8 @@ defmodule Arbor.MCP.Transport.HTTP do
 
     case FullOAuthFlow.execute(config) do
       {:ok, token_result} ->
-        access_token = token_result[:access_token] || token_result["access_token"]
-        Logger.info("OAuth token obtained, retrying request")
-
-        # Update state with token and add Authorization header
-        new_state = %{
-          state
-          | access_token: access_token,
-            auth_completed: true,
-            headers: put_bearer_header(state.headers, access_token)
-        }
-
-        # Retry the original request with auth headers
-        case perform_http_request(original_body, new_state) do
-          {:ok, response} -> {:ok, response, new_state}
-          {:error, reason} -> {:error, reason}
-        end
+        Logger.info("OAuth token obtained")
+        {:ok, with_oauth_token(state, token_result)}
 
       {:error, reason} ->
         Logger.warning("OAuth discovery flow failed", reason: LogSummary.describe(reason))
@@ -781,7 +821,7 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
-  defp run_full_oauth_flow(www_auth, original_body, state) do
+  defp run_full_oauth_flow(www_auth, state) do
     Logger.info("Attempting full OAuth flow (authorization code + PKCE)")
     resource_url = build_url(state, "")
 
@@ -797,25 +837,26 @@ defmodule Arbor.MCP.Transport.HTTP do
 
     case FullOAuthFlow.execute(config) do
       {:ok, token_result} ->
-        access_token = token_result[:access_token] || token_result["access_token"]
-        Logger.info("Full OAuth flow succeeded, retrying request")
-
-        new_state = %{
-          state
-          | access_token: access_token,
-            auth_completed: true,
-            headers: put_bearer_header(state.headers, access_token)
-        }
-
-        case perform_http_request(original_body, new_state) do
-          {:ok, response} -> {:ok, response, new_state}
-          {:error, reason} -> {:error, reason}
-        end
+        Logger.info("Full OAuth flow succeeded")
+        {:ok, with_oauth_token(state, token_result)}
 
       {:error, reason} ->
         Logger.warning("Full OAuth flow failed", reason: LogSummary.describe(reason))
         {:error, {:oauth_failed, reason}}
     end
+  end
+
+  # The state carrying the token an OAuth flow returned, in its
+  # Authorization header too.
+  defp with_oauth_token(state, token_result) do
+    access_token = token_result[:access_token] || token_result["access_token"]
+
+    %{
+      state
+      | access_token: access_token,
+        auth_completed: true,
+        headers: put_bearer_header(state.headers, access_token)
+    }
   end
 
   defp extract_scope_from_www_auth(nil), do: []

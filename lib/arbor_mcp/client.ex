@@ -1966,9 +1966,10 @@ defmodule Arbor.MCP.Client do
     result
   end
 
-  # One of this client's legacy POST tasks got a 401 or 403, as a modern
-  # request stream can: answered here, in turn with every other challenge,
-  # and the task sends its request again with the token.
+  # One of this client's POST tasks got a 401 or 403, as a modern request
+  # stream can: answered here, in turn with every other challenge, and the
+  # task sends its request again with the token, so no request is re-sent
+  # from this process.
   def handle_info(
         {:http_post_auth_challenge, task, ref, challenge},
         %{transport_mod: HTTP, transport_state: %HTTP{} = transport_state} = state
@@ -2611,11 +2612,12 @@ defmodule Arbor.MCP.Client do
     {:noreply, state}
   end
 
-  # The server asked the task's POST to authenticate. Re-sending from this
-  # process runs at most one authentication at a time, and later challenges
-  # reuse the credentials it obtained. A POST that carried no request (a
-  # notification, a batch, a reply to a server request) is re-sent too; a
-  # request whose caller has given up is not.
+  # The server asked a legacy-era task's POST to authenticate, and the client
+  # has no auth provider (modern-era tasks ask the client instead, above).
+  # Re-sending from this process runs at most one authentication at a time,
+  # and later challenges reuse the credentials it obtained. A POST that
+  # carried no request (a notification, a batch, a reply to a server request)
+  # is re-sent too; a request whose caller has given up is not.
   defp handle_async_post_result({:error, {:reauthenticate, message}}, meta, state) do
     request_id = Map.get(meta, :request_id)
 
@@ -2703,9 +2705,6 @@ defmodule Arbor.MCP.Client do
        else: run_stream_challenge(transport_state, challenge)
   end
 
-  defp answer_stream_challenge(%HTTP{auth_provider: nil} = transport_state, _challenge),
-    do: {{:error, :no_auth_provider}, transport_state}
-
   defp answer_stream_challenge(transport_state, challenge),
     do: run_stream_challenge(transport_state, challenge)
 
@@ -2713,6 +2712,11 @@ defmodule Arbor.MCP.Client do
     do: Enum.all?(scopes, &(&1 in granted))
 
   defp scopes_granted?(_provider_state, _scopes), do: false
+
+  # Only a modern POST task asks without an auth provider: the transport's
+  # own OAuth flow answers it, here, as it would a synchronous send.
+  defp run_stream_challenge(%HTTP{auth_provider: nil} = transport_state, challenge),
+    do: HTTP.answer_challenge_inline(transport_state, challenge)
 
   defp run_stream_challenge(%HTTP{auth_provider: provider} = transport_state, challenge) do
     callback = if challenge.status == 401, do: :handle_unauthorized, else: :handle_forbidden
