@@ -66,6 +66,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers never reach the client's own callers. See "Forwarding clients" in
   `docs/CONFIGURATION.md`. Thanks to Wagner for the design and the first
   implementation.
+- `progress_to: pid` on any `Arbor.MCP.Client` request also sends the
+  request's progress to `pid` as
+  `{:arbor_mcp_progress, client, progress_token, params}`, alongside the
+  client handler's `handle_progress/3`, so a process that forwards the
+  request for another client can relay it (#92). `client` is the client
+  process.
+  - It works on every transport that carries progress: modern and legacy
+    Streamable HTTP, stdio, BEAM and the test transport.
+  - A request without a progress token gets one. Under automatic MRTR, all
+    rounds share it. With `mrtr: :manual`, the caller must pass
+    `:progress_token` and repeat it on every round, or the call returns a
+    `ValidationError`.
+  - Delivery stops at the response. A dead target misses the updates without
+    failing the request.
+
+  See "Progress to another process" in `docs/PROTOCOL_GUIDE.md`.
 
 ### Changed
 

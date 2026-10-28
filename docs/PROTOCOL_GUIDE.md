@@ -397,6 +397,49 @@ Outside a callback, or for another request's token, publish by token:
 
 `Arbor.MCP.Client.call_tool/4` also accepts `:meta` and merges it with `:progress_token`.
 
+### Progress to another process
+
+With `progress_to: pid`, a request's progress also goes to `pid`, alongside
+the handler, as
+`{:arbor_mcp_progress, client, progress_token, params}`. `client` is the
+client process, so a process that waits on several clients can tell them
+apart, and `params` is the notification's params, as `handle_progress/3` gets
+them. A process that forwards a request for another client, such as a
+gateway, relays it from there:
+
+```elixir
+caller = self()
+
+task =
+  Task.async(fn ->
+    Arbor.MCP.Client.call_tool(client, "import", %{},
+      progress_to: caller,
+      progress_token: "job-42"
+    )
+  end)
+
+receive do
+  {:arbor_mcp_progress, ^client, "job-42", %{"progress" => progress} = params} ->
+    _ = Arbor.MCP.Server.Context.report_progress(progress, params["total"], params["message"])
+end
+```
+
+- **A token is added if the request has none,** as for
+  `reset_timeout_on_progress`, since progress names its request only by
+  token. With `mrtr: :manual` on `tools/call`, `resources/read` or
+  `prompts/get`, pass `:progress_token` yourself and repeat it on every
+  round; without one the call returns a `ValidationError`, because a
+  generated token would differ between rounds. Under automatic MRTR every
+  round already shares the request's token, so each round's progress
+  arrives.
+- **Delivery stops at the response.** Progress that arrives after it, as
+  late notifications on stdio or legacy HTTP can, isn't sent.
+- **A dead target misses the updates.** The request goes on, and the handler
+  still gets them.
+- **Every transport that carries progress delivers it:** modern Streamable
+  HTTP request streams, legacy Streamable HTTP (on a POST's event stream or
+  the session's GET stream), stdio, BEAM and the test transport.
+
 ### Keeping a long request alive
 
 As with the TypeScript SDK's `resetTimeoutOnProgress`, a request made with
