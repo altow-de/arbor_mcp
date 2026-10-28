@@ -368,13 +368,19 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
 
   # Private functions
 
+  # The two operations put the transport state in different places:
+  # send_message/2 answers {:ok, state} or {:ok, state, response}, and
+  # receive_message answers {:ok, message, state}.
   defp execute_wrapped_operation(function, args, state) do
     case apply(state.wrapped_module, function, args) do
       {:ok, new_wrapped_state} ->
         {:ok, %{state | wrapped_state: new_wrapped_state}}
 
-      {:ok, result, new_wrapped_state} ->
-        {:ok, result, %{state | wrapped_state: new_wrapped_state}}
+      {:ok, new_wrapped_state, response} when function == :send_message ->
+        {:ok, %{state | wrapped_state: new_wrapped_state}, response}
+
+      {:ok, message, new_wrapped_state} ->
+        {:ok, message, %{state | wrapped_state: new_wrapped_state}}
 
       {:error, reason} = error ->
         Logger.debug("Transport operation failed",
