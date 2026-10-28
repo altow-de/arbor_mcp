@@ -211,9 +211,12 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
 
   @impl true
   def close(%__MODULE__{} = state) do
-    # Always attempt the actual transport cleanup, even after a component dies.
-    result = close_wrapped(state)
+    # The components stop first: the transport's close can take until its
+    # caller's cleanup deadline (a stuck stdio server, an HTTP session DELETE
+    # that stalls), and a caller that then kills it must not leave them
+    # running. The transport cleanup is still always attempted.
     components = Enum.map([state.circuit_breaker_pid, state.health_check_pid], &stop_component/1)
+    result = close_wrapped(state)
 
     # A component that would not stop is the wrapper's own failure, not the
     # wrapped transport's: say which, so a caller can tell them apart.

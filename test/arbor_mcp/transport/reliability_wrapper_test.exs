@@ -138,6 +138,48 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapperTest do
     # response} and receive_message with {:ok, message, state}; the wrapper
     # used to read both as {:ok, result, state}, which swapped the state and
     # the response of a send.
+    # A caller bounds a transport's close and kills it at its deadline (a
+    # stuck stdio server, a stalled HTTP session DELETE), so the components
+    # must already be stopped by then, or they outlive the transport.
+    test "close stops its components before the wrapped transport's close" do
+      defmodule BlockingCloseTransport do
+        @behaviour Arbor.MCP.Transport
+
+        def connect(opts), do: {:ok, %{test: opts[:test]}}
+        def send_message(_message, state), do: {:ok, state}
+        def receive_message(state), do: {:ok, "message", state}
+        def connected?(_state), do: true
+
+        def close(state) do
+          send(state.test, {:closing, self()})
+
+          receive do
+            :finish -> :ok
+          end
+        end
+      end
+
+      {:ok, transport_state} = BlockingCloseTransport.connect(test: self())
+
+      {:ok, wrapped} =
+        ReliabilityWrapper.wrap(BlockingCloseTransport, transport_state,
+          circuit_breaker: [failure_threshold: 3],
+          health_check: [check_interval: 60_000]
+        )
+
+      breaker_ref = Process.monitor(wrapped.circuit_breaker_pid)
+      checker_ref = Process.monitor(wrapped.health_check_pid)
+      closer = Task.async(fn -> ReliabilityWrapper.close(wrapped) end)
+
+      assert_receive {:closing, closing}, 2_000
+      # Both are down while the transport's close is still running.
+      assert_receive {:DOWN, ^breaker_ref, :process, _breaker, _reason}, 2_000
+      assert_receive {:DOWN, ^checker_ref, :process, _checker, _reason}, 2_000
+
+      send(closing, :finish)
+      assert :ok = Task.await(closer)
+    end
+
     test "keeps a synchronous send's response apart from its state" do
       defmodule SyncTransport do
         @behaviour Arbor.MCP.Transport
