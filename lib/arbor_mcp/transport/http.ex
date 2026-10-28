@@ -139,7 +139,10 @@ defmodule Arbor.MCP.Transport.HTTP do
     tool_headers: %{},
     modern_streams: %{},
     sse_deferred_attempted: false,
-    auth_completed: false
+    auth_completed: false,
+    # The scopes granted to the token the transport's own OAuth flow
+    # obtained, when there is no auth provider (see put_oauth_token/3).
+    granted_scopes: []
   ]
 
   @type t :: %__MODULE__{
@@ -168,7 +171,8 @@ defmodule Arbor.MCP.Transport.HTTP do
           dns_timeout_ms: pos_integer(),
           dns_resolver: module() | function(),
           allowed_private_hosts: [String.t()],
-          deadline: integer() | nil
+          deadline: integer() | nil,
+          granted_scopes: [String.t()]
         }
 
   @default_endpoint "/mcp/v1"
@@ -813,7 +817,7 @@ defmodule Arbor.MCP.Transport.HTTP do
     case FullOAuthFlow.execute(config) do
       {:ok, token_result} ->
         Logger.info("OAuth token obtained")
-        {:ok, with_oauth_token(state, token_result)}
+        {:ok, put_oauth_token(state, token_result, extract_scope_from_www_auth(www_auth))}
 
       {:error, reason} ->
         Logger.warning("OAuth discovery flow failed", reason: LogSummary.describe(reason))
@@ -838,7 +842,7 @@ defmodule Arbor.MCP.Transport.HTTP do
     case FullOAuthFlow.execute(config) do
       {:ok, token_result} ->
         Logger.info("Full OAuth flow succeeded")
-        {:ok, with_oauth_token(state, token_result)}
+        {:ok, put_oauth_token(state, token_result, scopes)}
 
       {:error, reason} ->
         Logger.warning("Full OAuth flow failed", reason: LogSummary.describe(reason))
@@ -846,17 +850,32 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
-  # The state carrying the token an OAuth flow returned, in its
-  # Authorization header too.
-  defp with_oauth_token(state, token_result) do
+  @doc false
+  # The state carrying the token an OAuth flow without an auth provider
+  # returned, in its Authorization header too, and the scopes it was granted:
+  # those the token response names, else the ones the flow asked for, as for
+  # the OAuth provider. The client checks a later 403 against them, so a
+  # step-up another request already obtained isn't run again.
+  @spec put_oauth_token(t(), map(), [String.t()]) :: t()
+  def put_oauth_token(%__MODULE__{} = state, token_result, requested_scopes)
+      when is_map(token_result) do
     access_token = token_result[:access_token] || token_result["access_token"]
 
     %{
       state
       | access_token: access_token,
         auth_completed: true,
-        headers: put_bearer_header(state.headers, access_token)
+        headers: put_bearer_header(state.headers, access_token),
+        granted_scopes: token_scopes(token_result, requested_scopes)
     }
+  end
+
+  defp token_scopes(token_result, requested_scopes) do
+    case token_result[:scope] || token_result["scope"] do
+      scopes when is_binary(scopes) -> String.split(scopes, " ", trim: true)
+      scopes when is_list(scopes) -> Enum.filter(scopes, &(is_binary(&1) and &1 != ""))
+      _missing -> requested_scopes
+    end
   end
 
   defp extract_scope_from_www_auth(nil), do: []

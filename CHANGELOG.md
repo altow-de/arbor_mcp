@@ -58,10 +58,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behind it, and the request could not be cancelled meanwhile. Now the
   client process runs only the OAuth flow, still one challenge at a time
   across requests, and the request's own task sends it again with the new
-  token, as with an auth provider. A challenge OAuth can't answer, such as
-  `Basic`, fails the request at once with the server's 401 instead of after a
-  second, unauthenticated POST; the error is the same. Legacy-era
-  connections are unchanged.
+  token, as with an auth provider. The client records the scopes that
+  flow's token was granted, so a concurrent 403 step-up it already covered
+  reuses the token rather than running another flow. A challenge OAuth
+  can't answer, such as `Basic`, fails the request at once with the server's
+  401 instead of after a second, unauthenticated POST; the error is the same.
+  Legacy-era connections are unchanged.
 - An unsupported-version error (`-32022`) lists `supported` as exactly the
   revisions the mount or server accepts, from the same source its request
   validation uses (`Arbor.MCP.Server.RequestContext.accepted_versions/1`), in

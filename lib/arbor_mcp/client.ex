@@ -2700,7 +2700,7 @@ defmodule Arbor.MCP.Client do
     # Another stream replaced the rejected token. That answers a 401; a 403
     # needs the challenged scopes, which a refresh alone doesn't add.
     if challenge.status == 401 or
-         scopes_granted?(transport_state.auth_provider_state, challenge.scopes),
+         scopes_granted?(granted_scopes(transport_state), challenge.scopes),
        do: {{:ok, current}, transport_state},
        else: run_stream_challenge(transport_state, challenge)
   end
@@ -2708,10 +2708,16 @@ defmodule Arbor.MCP.Client do
   defp answer_stream_challenge(transport_state, challenge),
     do: run_stream_challenge(transport_state, challenge)
 
-  defp scopes_granted?(%{granted_scopes: granted}, [_ | _] = scopes) when is_list(granted),
+  # What the current token was granted: by the auth provider, or by the
+  # transport's own OAuth flow when there is none.
+  defp granted_scopes(%HTTP{auth_provider: nil, granted_scopes: granted}), do: granted
+  defp granted_scopes(%HTTP{auth_provider_state: %{granted_scopes: granted}}), do: granted
+  defp granted_scopes(_transport_state), do: []
+
+  defp scopes_granted?(granted, [_ | _] = scopes) when is_list(granted),
     do: Enum.all?(scopes, &(&1 in granted))
 
-  defp scopes_granted?(_provider_state, _scopes), do: false
+  defp scopes_granted?(_granted, _scopes), do: false
 
   # Only a modern POST task asks without an auth provider: the transport's
   # own OAuth flow answers it, here, as it would a synchronous send.

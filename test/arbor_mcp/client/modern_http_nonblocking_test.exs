@@ -296,23 +296,68 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
 
     test "without a provider, a challenge another request already answered gets its token" do
       ref = make_ref()
-
-      # This test process stands in for the POST task.
-      state = %Client{
-        transport_mod: HTTP,
-        transport_state: %{modern_transport() | access_token: "obtained"},
-        pending_requests: %{},
-        pending_batches: %{},
-        cancelled_requests: MapSet.new(),
-        async_post_tasks: %{make_ref() => {self(), 1}}
-      }
-
+      state = client_state(%{modern_transport() | access_token: "obtained"})
       challenge = %{status: 401, www_authenticate: "Bearer", scopes: [], token: nil}
 
       assert {:noreply, ^state} =
                Client.handle_info({:http_post_auth_challenge, self(), ref, challenge}, state)
 
       assert_received {:http_post_auth_result, ^ref, {:ok, "obtained"}}
+    end
+
+    # Two requests sent with the "stale" token both get a 403 step-up. The
+    # inline flow can't run in a test (it fetches OAuth metadata only over
+    # HTTPS), so this starts from the state the first one's flow leaves,
+    # built as that flow builds it. Any further flow here would fail: this
+    # transport's endpoint is plain http.
+    test "without a provider, concurrent 403 step-ups run one flow" do
+      flows = count_oauth_flows()
+      stale = %{modern_transport() | access_token: "stale"}
+
+      stepped_up =
+        HTTP.put_oauth_token(
+          stale,
+          %{access_token: "stepped-up", scope: "tools.read tools.call"},
+          [
+            "tools.call"
+          ]
+        )
+
+      state = client_state(stepped_up)
+      ref = make_ref()
+
+      challenge = %{
+        status: 403,
+        www_authenticate: ~s(Bearer error="insufficient_scope", scope="tools.call"),
+        scopes: ["tools.call"],
+        token: "stale"
+      }
+
+      assert {:noreply, ^state} =
+               Client.handle_info({:http_post_auth_challenge, self(), ref, challenge}, state)
+
+      assert_received {:http_post_auth_result, ^ref, {:ok, "stepped-up"}}
+      refute_received {:oauth_flow_started, ^flows}
+
+      # A scope the first flow didn't get still needs a flow of its own.
+      admin = %{challenge | www_authenticate: ~s(Bearer scope="admin"), scopes: ["admin"]}
+
+      assert {:noreply, _state} =
+               Client.handle_info({:http_post_auth_challenge, self(), ref, admin}, state)
+
+      assert_received {:http_post_auth_result, ^ref, {:error, {:oauth_failed, _reason}}}
+      assert_received {:oauth_flow_started, ^flows}
+    end
+
+    test "the inline flow records the scopes its token was granted" do
+      transport = modern_transport()
+
+      assert %HTTP{access_token: "granted", granted_scopes: ["a", "b"]} =
+               HTTP.put_oauth_token(transport, %{access_token: "granted", scope: "a b"}, ["a"])
+
+      # A token response that names no scope grants the ones asked for.
+      assert %HTTP{granted_scopes: ["a"]} =
+               HTTP.put_oauth_token(transport, %{"access_token" => "asked"}, ["a"])
     end
   end
 
@@ -387,6 +432,38 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
     assert first == "notifications/example"
     assert_receive {:posted, "tools/call"}
     refute_received {:posted, _method}
+  end
+
+  # This test process stands in for the POST task.
+  defp client_state(transport_state) do
+    %Client{
+      transport_mod: HTTP,
+      transport_state: transport_state,
+      pending_requests: %{},
+      pending_batches: %{},
+      cancelled_requests: MapSet.new(),
+      async_post_tasks: %{make_ref() => {self(), 1}}
+    }
+  end
+
+  # Each OAuth flow that starts sends {:oauth_flow_started, ref} here.
+  defp count_oauth_flows do
+    ref = make_ref()
+    test_pid = self()
+    handler = {__MODULE__, ref}
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:arbor_mcp, :auth, :flow, :started],
+        fn _event, _measurements, _metadata, _config ->
+          send(test_pid, {:oauth_flow_started, ref})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    ref
   end
 
   defp receive_holding do
