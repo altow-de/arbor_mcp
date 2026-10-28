@@ -318,9 +318,10 @@ defmodule Arbor.MCP.Client do
 
   Over Streamable HTTP the client stays an HTTP client: each request after
   establishment still POSTs from its own task. The circuit breaker admits
-  every POST and records how it ended; an open circuit refuses a request
-  with a `:circuit_open` transport error before anything is sent. A request
-  stream is admitted, but its outcome isn't recorded.
+  every POST and records how it ended (a crash or a timeout is a failure, a
+  cancellation isn't counted); an open circuit refuses a request with a
+  `:circuit_open` transport error before anything is sent. A request stream
+  is admitted, but its outcome isn't recorded.
 
   ## Reliability Examples
 
@@ -2797,10 +2798,10 @@ defmodule Arbor.MCP.Client do
   # Modern streamable HTTP cancels an ordinary request by closing only that
   # request's connection. Other transports send the protocol cancellation
   # notification.
-  defp cancel_on_wire(request_id, method, params, state) do
+  defp cancel_on_wire(request_id, method, params, state, outcome \\ :release) do
     case state do
       %{transport_mod: HTTP, transport_state: %HTTP{protocol_era: :modern}} ->
-        RequestHandler.close_request_stream(request_id, state)
+        RequestHandler.close_request_stream(request_id, state, outcome)
 
       %{transport_mod: LegacySSE} ->
         retired_state = RequestHandler.close_request_stream(request_id, state)
@@ -2822,10 +2823,10 @@ defmodule Arbor.MCP.Client do
   defp cancel_timed_out(request_id, state) do
     case Protocol.encode_cancelled(request_id, "Request timed out") do
       {:ok, %{"method" => method, "params" => params}} ->
-        cancel_on_wire(request_id, method, params, state)
+        cancel_on_wire(request_id, method, params, state, :failure)
 
       {:error, :cannot_cancel_initialize} ->
-        RequestHandler.close_request_stream(request_id, state)
+        RequestHandler.close_request_stream(request_id, state, :failure)
     end
   end
 

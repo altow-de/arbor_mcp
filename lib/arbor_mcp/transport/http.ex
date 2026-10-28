@@ -322,8 +322,11 @@ defmodule Arbor.MCP.Transport.HTTP do
   # Gives the transport the components of a ReliabilityWrapper that wrapped
   # it, so a client keeps a bare HTTP transport: every request after
   # establishment still POSTs from its own task. The breaker then admits each
-  # POST, synchronous or not, and records its outcome; a request stream is
-  # admitted, and its outcome isn't recorded. Its per-call :timeout doesn't
+  # POST, synchronous or not, and settles each admission once: a POST task
+  # with its result, or, stopped first, as a failure at the caller's timeout
+  # and released when the caller cancelled (settle_post/3); the breaker
+  # counts a task that crashes as a failure. A request stream is admitted,
+  # and its outcome isn't recorded. Its per-call :timeout doesn't
   # apply: each exchange has its own deadline, the caller's or the
   # transport's :request_timeout. close/1 stops the components.
   @spec attach_reliability(t(), ReliabilityWrapper.t()) :: t()
@@ -413,6 +416,16 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
+  # A failed authentication returns {:error, reason, state}; the breaker
+  # counts it as the failure it is.
+  defp authenticated_outcome({:error, reason, _state}), do: {:error, reason}
+  defp authenticated_outcome(result), do: result
+
+  defp reattach_authenticated({:error, reason, %__MODULE__{} = state}, reliability),
+    do: {:error, reason, %{state | reliability: reliability}}
+
+  defp reattach_authenticated(result, reliability), do: reattach(result, reliability)
+
   defp async_send?(%__MODULE__{use_sse: true, sse_pid: sse_pid}) when is_pid(sse_pid), do: true
   defp async_send?(%__MODULE__{}), do: false
 
@@ -433,6 +446,17 @@ defmodule Arbor.MCP.Transport.HTTP do
   # provider's record of what it tried is kept.
   @spec send_authenticated(term(), t()) ::
           {:ok, t()} | {:ok, t(), term()} | {:error, term()} | {:error, term(), t()}
+  def send_authenticated(
+        message,
+        %__MODULE__{reliability: %ReliabilityWrapper{} = reliability} = state
+      ) do
+    with :ok <- ReliabilityWrapper.admit(reliability) do
+      result = send_authenticated(message, %{state | reliability: nil})
+      ReliabilityWrapper.report(reliability, authenticated_outcome(result))
+      reattach_authenticated(result, reliability)
+    end
+  end
+
   def send_authenticated(message, %__MODULE__{} = state) do
     case perform_and_maybe_auth(message, state) do
       {:ok, response} ->
@@ -529,19 +553,31 @@ defmodule Arbor.MCP.Transport.HTTP do
     do: perform_async(message, state, parent)
 
   defp admitted_async(message, %{reliability: reliability} = state, parent) do
-    case ReliabilityWrapper.admit(reliability) do
+    case ReliabilityWrapper.hold(reliability) do
       :ok ->
         {result, sent_state} = perform_async(message, state, parent)
-
-        unless match?({:error, {:reauthenticate, _message}}, result),
-          do: ReliabilityWrapper.report(reliability, result)
-
+        ReliabilityWrapper.settle(reliability, self(), post_outcome(result))
         {result, sent_state}
 
       {:error, reason} ->
         {{:error, reason}, state}
     end
   end
+
+  # A request handed back to be re-sent after authenticating hasn't ended:
+  # its re-send is admitted and recorded on its own (send_authenticated/2).
+  defp post_outcome({:error, {:reauthenticate, _message}}), do: :release
+  defp post_outcome(result), do: {:result, result}
+
+  @doc false
+  # Settles the breaker admission of a POST task the client is about to stop
+  # (see attach_reliability/2): `:failure` at the caller's timeout, `:release`
+  # when the caller cancelled. A task that already settled is left as it is.
+  @spec settle_post(t(), pid(), :failure | :release) :: :ok
+  def settle_post(%__MODULE__{reliability: %ReliabilityWrapper{} = reliability}, task, outcome),
+    do: ReliabilityWrapper.settle(reliability, task, outcome)
+
+  def settle_post(%__MODULE__{}, _task, _outcome), do: :ok
 
   # A POST task does not authenticate: with several in flight, each would run
   # the OAuth flow. It hands an auth challenge back to the client process,

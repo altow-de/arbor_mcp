@@ -141,6 +141,167 @@ defmodule Arbor.MCP.Client.ReliabilityHTTPTest do
     refute_received {:holding, "refused", _handler}
   end
 
+  describe "a POST task's admission is settled once" do
+    @strict [circuit_breaker: [failure_threshold: 1, reset_timeout: 60_000]]
+
+    test "as a failure when the task crashes" do
+      client = start_client(:modern_only, @strict)
+
+      task =
+        Task.async(fn -> Client.call_tool(client, "hold", %{"label" => "crashed"}, 5_000) end)
+
+      handler = receive_holding()
+      [{_monitor, {post_task, _id}}] = Map.to_list(:sys.get_state(client).async_post_tasks)
+      Process.exit(post_task, :kill)
+
+      assert {:error, _crashed} = Task.await(task)
+      send(handler, :release)
+      assert_refused(client)
+    end
+
+    test "as a failure when the client times the request out" do
+      client = start_client(:modern_only, @strict)
+
+      assert {:error, :timeout} =
+               Client.call_tool(client, "hold", %{"label" => "slow"}, timeout: 300)
+
+      assert_receive {:holding, "slow", _handler}
+      assert_refused(client)
+    end
+
+    # Without a timeout of its own the POST runs past the client's default
+    # timeout, which then stops the task.
+    test "as a failure when the client's default timeout stops the task" do
+      client = start_client(:modern_only, @strict, timeout: 300)
+
+      assert {:error, :timeout} = Client.call_tool(client, "hold", %{"label" => "untimed"}, [])
+      assert_receive {:holding, "untimed", handler}
+      send(handler, :release)
+      assert_refused(client)
+    end
+
+    test "released, not counted, when the caller cancels" do
+      client = start_client(:modern_only, @strict)
+
+      task =
+        Task.async(fn -> Client.call_tool(client, "hold", %{"label" => "cancelled"}, 5_000) end)
+
+      handler = receive_holding()
+      [request_id] = Client.get_pending_requests(client)
+      assert :ok = Client.send_cancelled(client, request_id, "not needed")
+      assert {:error, :cancelled} = Task.await(task)
+      send(handler, :release)
+
+      assert %{total_failures: 0, state: :closed} = breaker_stats(client)
+      assert {:ok, _} = Client.call_tool(client, "hold", %{"label" => "quick"}, 2_000)
+      assert_receive {:holding, "quick", _handler}
+    end
+  end
+
+  # The provider-less path on this branch: a 401 hands the request back to
+  # the client process, which re-sends it after the OAuth flow.
+  test "a re-send whose authentication fails counts as a failure" do
+    bypass = Bypass.open()
+    test_pid = self()
+
+    Bypass.stub(bypass, "POST", "/mcp", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      case Jason.decode!(body) do
+        %{"method" => "server/discover", "id" => id} ->
+          json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => discover()})
+
+        %{"method" => "tools/call"} ->
+          send(test_pid, :call_posted)
+
+          conn
+          |> Plug.Conn.put_resp_header("www-authenticate", "Bearer")
+          |> Plug.Conn.resp(401, "")
+      end
+    end)
+
+    {:ok, client} =
+      Client.start_link(
+        transport: :http,
+        url: "http://127.0.0.1:#{bypass.port}/mcp",
+        protocol_mode: :modern_only,
+        reliability: [circuit_breaker: [failure_threshold: 1, reset_timeout: 60_000]],
+        health_check_interval: nil,
+        reconnect: false
+      )
+
+    on_exit(fn -> stop(client) end)
+
+    # The OAuth flow fails at once: this server's metadata isn't served
+    # over HTTPS.
+    assert {:error, %TransportError{reason: {:oauth_failed, _reason}}} =
+             Client.call_tool(client, "protected", %{}, 2_000)
+
+    assert_received :call_posted
+    assert_received :call_posted
+
+    assert {:error, %TransportError{reason: :circuit_open}} =
+             Client.call_tool(client, "protected", %{}, 2_000)
+
+    refute_received :call_posted
+  end
+
+  test "the breaker and health check stop even when the session DELETE stalls" do
+    bypass = Bypass.open()
+
+    Bypass.stub(bypass, "POST", "/mcp", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      case Jason.decode!(body) do
+        %{"method" => "initialize", "id" => id} ->
+          result = %{
+            "protocolVersion" => "2025-06-18",
+            "capabilities" => %{},
+            "serverInfo" => %{"name" => "stalling", "version" => "1"}
+          }
+
+          conn
+          |> Plug.Conn.put_resp_header("mcp-session-id", "stalling-session")
+          |> json(%{"jsonrpc" => "2.0", "id" => id, "result" => result})
+
+        _notification ->
+          Plug.Conn.resp(conn, 202, "")
+      end
+    end)
+
+    # The DELETE outlives the client's whole cleanup budget.
+    Bypass.stub(bypass, "DELETE", "/mcp", fn conn ->
+      hold_until_released()
+      Plug.Conn.resp(conn, 204, "")
+    end)
+
+    {:ok, client} =
+      Client.start_link(
+        transport: :http,
+        url: "http://127.0.0.1:#{bypass.port}/mcp",
+        protocol_mode: :legacy_only,
+        use_sse: false,
+        client_cleanup_timeout: 300,
+        reliability: [
+          circuit_breaker: [failure_threshold: 5],
+          health_check: [check_interval: 60_000]
+        ],
+        health_check_interval: nil,
+        reconnect: false
+      )
+
+    %ReliabilityWrapper{circuit_breaker_pid: breaker, health_check_pid: checker} =
+      :sys.get_state(client).transport_state.reliability
+
+    breaker_ref = Process.monitor(breaker)
+    checker_ref = Process.monitor(checker)
+
+    _cleanup = Client.disconnect(client)
+
+    assert_receive {:DOWN, ^breaker_ref, :process, ^breaker, _reason}, 2_000
+    assert_receive {:DOWN, ^checker_ref, :process, ^checker, _reason}, 2_000
+  end
+
   test "POSTs that fail open the circuit" do
     bypass = Bypass.open()
     test_pid = self()
@@ -189,6 +350,20 @@ defmodule Arbor.MCP.Client.ReliabilityHTTPTest do
 
   defp era(version), do: Arbor.MCP.Internal.VersionRegistry.era_for(version)
 
+  # The circuit is open: a call is refused before anything is sent.
+  defp assert_refused(client) do
+    assert {:error, %TransportError{reason: :circuit_open}} =
+             Client.call_tool(client, "hold", %{"label" => "refused"}, 2_000)
+
+    refute_received {:holding, "refused", _handler}
+  end
+
+  defp breaker_stats(client),
+    do:
+      ReliabilityWrapper.get_circuit_breaker_stats(
+        :sys.get_state(client).transport_state.reliability
+      )
+
   defp receive_holding do
     assert_receive {:holding, _label, handler}, 3_000
     handler
@@ -209,7 +384,7 @@ defmodule Arbor.MCP.Client.ReliabilityHTTPTest do
 
   # A scripted dual-era server: it answers server/discover and initialize,
   # and holds each tools/call until the test releases it.
-  defp start_client(protocol_mode) do
+  defp start_client(protocol_mode, reliability \\ @reliability, opts \\ []) do
     bypass = Bypass.open()
     test_pid = self()
 
@@ -220,12 +395,14 @@ defmodule Arbor.MCP.Client.ReliabilityHTTPTest do
 
     {:ok, client} =
       Client.start_link(
-        transport: :http,
-        url: "http://127.0.0.1:#{bypass.port}/mcp",
-        protocol_mode: protocol_mode,
-        reliability: @reliability,
-        health_check_interval: nil,
-        reconnect: false
+        [
+          transport: :http,
+          url: "http://127.0.0.1:#{bypass.port}/mcp",
+          protocol_mode: protocol_mode,
+          reliability: reliability,
+          health_check_interval: nil,
+          reconnect: false
+        ] ++ opts
       )
 
     on_exit(fn -> stop(client) end)
@@ -248,9 +425,18 @@ defmodule Arbor.MCP.Client.ReliabilityHTTPTest do
   defp respond(conn, %{"method" => "tools/call", "id" => id, "params" => params}, test_pid) do
     label = get_in(params, ["arguments", "label"])
     send(test_pid, {:holding, label, self()})
+    unless label == "quick", do: hold_until_released()
 
-    # A client that cancels closes the connection; end normally when Cowboy
-    # stops this handler for that.
+    content = [%{"type" => "text", "text" => label}]
+    result = %{"resultType" => "complete", "content" => content}
+    json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => result})
+  end
+
+  defp respond(conn, _notification, _test_pid), do: Plug.Conn.resp(conn, 202, "")
+
+  # A client that cancels closes the connection; end normally when Cowboy
+  # stops this handler for that.
+  defp hold_until_released do
     Process.flag(:trap_exit, true)
 
     receive do
@@ -259,13 +445,7 @@ defmodule Arbor.MCP.Client.ReliabilityHTTPTest do
     after
       5_000 -> :ok
     end
-
-    content = [%{"type" => "text", "text" => label}]
-    result = %{"resultType" => "complete", "content" => content}
-    json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => result})
   end
-
-  defp respond(conn, _notification, _test_pid), do: Plug.Conn.resp(conn, 202, "")
 
   defp json(conn, body) do
     conn

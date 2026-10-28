@@ -61,9 +61,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps the circuit breaker and health check itself, so each request after
   establishment POSTs from its own task as without `reliability:`, with the
   same cancellation and authentication. The breaker admits every POST and
-  records its outcome; a request stream is admitted but its outcome isn't
+  settles each admission once: with the POST's result, as a failure when
+  the task crashes or the client stops it at a timeout, and released, not
+  counted, when the caller cancels. A request re-sent after authenticating
+  is admitted and counted on its own, so repeated failed authentication
+  opens the circuit. A request stream is admitted but its outcome isn't
   recorded. Its `:timeout` doesn't apply over HTTP, where each exchange
-  keeps its own deadline.
+  keeps its own deadline. The breaker and health check now stop before the
+  transport closes, so a close the client cuts off (a stalled session
+  DELETE, a stuck stdio server) no longer leaves them running.
 - An unsupported-version error (`-32022`) lists `supported` as exactly the
   revisions the mount or server accepts, from the same source its request
   validation uses (`Arbor.MCP.Server.RequestContext.accepted_versions/1`), in

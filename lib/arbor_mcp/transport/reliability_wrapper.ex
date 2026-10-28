@@ -331,6 +331,28 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
   def admit(%__MODULE__{}), do: :ok
 
   @doc false
+  # For a send its transport makes from a process of its own, which may be
+  # killed before it ends (see CircuitBreaker.hold/1): settle/3 then settles
+  # the admission exactly once, and the breaker settles one its holder never
+  # did when that process goes down.
+  @spec hold(t()) :: :ok | {:error, :circuit_open | :circuit_breaker_unavailable}
+  def hold(%__MODULE__{config: %{circuit_breaker_enabled: true}, circuit_breaker_pid: pid}),
+    do: CircuitBreaker.hold(pid)
+
+  def hold(%__MODULE__{}), do: :ok
+
+  @doc false
+  @spec settle(t(), pid(), {:result, term()} | :failure | :release) :: :ok
+  def settle(
+        %__MODULE__{config: %{circuit_breaker_enabled: true}, circuit_breaker_pid: pid},
+        holder,
+        outcome
+      ),
+      do: CircuitBreaker.settle(pid, holder, outcome)
+
+  def settle(%__MODULE__{}, _holder, _outcome), do: :ok
+
+  @doc false
   @spec report(t(), term()) :: :ok
   def report(
         %__MODULE__{config: %{circuit_breaker_enabled: true}, circuit_breaker_pid: pid},
