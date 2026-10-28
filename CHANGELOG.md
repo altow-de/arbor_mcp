@@ -35,6 +35,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Arbor.MCP.Reliability.CircuitBreaker.call_with_deadline/3` runs an
   operation that has its own deadline through a breaker without the
   breaker's per-call `:timeout` cutting it short.
+- Request options for a client that forwards requests for another client,
+  such as a gateway, on `Arbor.MCP.Client.call_tool/4`, `read_resource/3`
+  and `get_prompt/4` (MCP 2026-07-28, #92). `nil` leaves each one unset.
+  - `mrtr: :manual` returns an `input_required` round as
+    `{:input_required, %{input_requests: ..., request_state: ...}}` instead
+    of answering it with the client handler. The round passes the checks
+    automatic MRTR makes, `:max_input_requests`, `:max_mrtr_bytes` and the
+    declared capabilities included; `:max_mrtr_rounds` doesn't apply.
+  - `input_responses:` and `request_state:` continue the call on its next
+    round.
+  - `client_capabilities:` replaces the start capabilities in one request's
+    `_meta`, so the server chooses its input requests from the downstream
+    client's capabilities.
+
+  The last three need `mrtr: :manual` and a 2026-07-28 connection; otherwise
+  they return `{:error, %Arbor.MCP.Error.ValidationError{}}` before anything
+  is sent. Every round of one call repeats its arguments, capabilities and
+  progress token, because an arbor_mcp server binds `requestState` to them.
+  See "Forwarding clients" in `docs/CONFIGURATION.md`. Thanks to Wagner for
+  the design and the first implementation.
 
 ### Changed
 
