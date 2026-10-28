@@ -104,8 +104,8 @@ connection. The raw
 
 A client that forwards the call for another client, such as a gateway, lets
 that client answer instead. With `mrtr: :manual` the round comes back as
-`{:input_required, %{input_requests: requests, request_state: state}}`, and
-`input_responses:` and `request_state:` continue the call; with
+`{:input_required, %{input_requests: requests, request_state: state, meta: meta}}`,
+and `input_responses:` and `request_state:` continue the call; with
 `client_capabilities:` the request declares the other client's capabilities:
 
 ```elixir
@@ -126,7 +126,8 @@ answers = ask_downstream(requests)
   )
 ```
 
-Each round repeats the arguments, capabilities and progress token. See
+Each round repeats the arguments, capabilities and progress token, so
+`reset_timeout_on_progress: true` needs an explicit `:progress_token` here. See
 [Forwarding clients](CONFIGURATION.md#forwarding-clients-mcp-2026-07-28).
 
 ### URL mode

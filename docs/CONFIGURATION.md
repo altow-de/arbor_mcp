@@ -1225,22 +1225,24 @@ passed through without filtering them first.
 
 | Option | Effect |
 |---|---|
-| `mrtr: :manual` | Returns an `input_required` round as `{:input_required, %{input_requests: requests, request_state: state}}` instead of answering it with the client handler. `:auto`, the default, keeps automatic MRTR. |
+| `mrtr: :manual` | Returns an `input_required` round as `{:input_required, %{input_requests: requests, request_state: state, meta: meta}}` instead of answering it with the client handler. `:auto`, the default, keeps automatic MRTR. |
 | `input_responses:`, `request_state:` | With `mrtr: :manual`, continue the call: they become the next round's `inputResponses` and `requestState`. Valid for `tools/call`, `resources/read` and `prompts/get`. |
-| `client_capabilities:` | With `mrtr: :manual`, replaces the client's start capabilities in this request's `_meta`, so the server chooses its input requests from what the downstream client declared. |
+| `client_capabilities:` | Replaces the client's start capabilities in this request's `_meta`, so the server chooses its input requests, and anything else it bases on capabilities, from what the downstream client declared. On `tools/call`, `resources/read` and `prompts/get` it needs `mrtr: :manual`; other requests, such as `list_tools/2` or `complete/4`, take it on its own. |
 
 `{:input_required, ...}` is distinct from `{:ok, ...}` because the call isn't
 finished. `input_requests` maps each input request id to the request as the
-server sent it (`"method"` and `"params"`), and `request_state` is the
-server's opaque string, or `nil` when it sent none. Both formats return the
-same value.
+server sent it (`"method"` and `"params"`), and is empty when the server sent
+only a request state. `request_state` is the server's opaque string and
+`meta` the round's `_meta` object, each `nil` when the server sent none.
+Both formats return the same value.
 
 Before it returns a round, the client checks it as automatic MRTR checks one
 before calling the handler: its shape, `:max_input_requests`,
 `:max_mrtr_bytes`, and that each input request needs only capabilities the
 request declared, with `client_capabilities:` or at start. A round that
 fails returns the `{:error, %Arbor.MCP.Error.ProtocolError{}}` automatic MRTR
-would return, for example `-32021` for an undeclared capability.
+would return, for example `-32021` for an undeclared capability. The byte
+limit counts the round's `_meta`, which must be an object if present.
 `:max_mrtr_rounds` doesn't apply, because the caller runs the rounds and
 should bound them itself. `input_responses:` must map input request ids to
 response objects, and is held to `:max_mrtr_bytes` too.
@@ -1292,14 +1294,19 @@ binds its `requestState` to the request's params, `_meta` included, and to
 the capabilities the request declared, and rejects a round that differs with
 `-32602` and the reason `request_state_binding_mismatch`. A gateway that sets
 its own upstream progress token therefore keeps it for all rounds of the call.
-With `reset_timeout_on_progress: true`, pass `:progress_token` yourself: the
-token the client adds otherwise differs on every round.
+`mrtr: :manual` with `reset_timeout_on_progress: true` needs a
+`:progress_token` (or `"progressToken"` in `:meta`), and returns a
+`ValidationError` without one: the token the client would add differs on
+every round. `read_resource/3` takes no progress token, so a manual read
+can't reset its timeout on progress.
 
-`client_capabilities:`, `input_responses:` and `request_state:` without
-`mrtr: :manual`, or with a malformed value, return
+`input_responses:` and `request_state:` without `mrtr: :manual`,
+`client_capabilities:` without it on a request that can return
+`input_required`, and any malformed value return
 `{:error, %Arbor.MCP.Error.ValidationError{}}` before anything is sent.
 Automatic MRTR would answer a round chosen for capabilities the client's own
-handler may not have. On a connection that settled on a legacy revision,
+handler may not have; a request that can't pause has no round to answer, so
+it may declare any capabilities. On a connection that settled on a legacy revision,
 where capabilities were fixed at `initialize` and there is no MRTR, these
 options return a `ValidationError` too. `mrtr: :manual` alone is accepted
 there and changes nothing: a legacy server asks for input with
@@ -1312,6 +1319,17 @@ client's own checks follow its start capabilities: which extension result
 types it accepts, such as Tasks results, and what automatic MRTR answers.
 The response cache keys a result by its request's params, not by the
 capabilities it declared.
+
+A manual round reports the events automatic MRTR reports, with
+`mode: :manual` in their metadata where automatic rounds carry
+`mode: :auto`. `[:arbor_mcp, :client, :mrtr, :round]` with
+`%{round: 1, input_requests: count}` marks a round handed to the caller (each
+call hands over at most one; the caller counts the rounds of a forwarded
+call). `[:arbor_mcp, :client, :mrtr, :failure]` with `%{round: 0}` and a
+`reason` class (`:missing_capability`, `:protocol_error` or `:timeout`) marks
+a round that failed its checks. Like every MRTR event, they carry only the
+method and those classes, never input requests, responses, request state or
+`_meta`.
 
 ## Modern subscriptions (MCP 2026-07-28)
 
