@@ -901,17 +901,13 @@ defmodule Arbor.MCP.Client.RequestHandler do
             error = request_stream_error(reason)
 
             GenServer.reply(from, {:error, error})
-
-            {:noreply,
-             %{state | pending_requests: Map.delete(state.pending_requests, request_id)}}
+            {:noreply, drop_pending(state, request_id)}
 
           {from, :single} ->
             error = request_stream_error(reason)
 
             GenServer.reply(from, {:error, error})
-
-            {:noreply,
-             %{state | pending_requests: Map.delete(state.pending_requests, request_id)}}
+            {:noreply, drop_pending(state, request_id)}
 
           _not_pending ->
             {:noreply, state}
@@ -2000,14 +1996,12 @@ defmodule Arbor.MCP.Client.RequestHandler do
         {from, :single, _method} ->
           # Reply with cancelled error and remove from pending
           GenServer.reply(from, {:error, :cancelled})
-          new_pending = Map.delete(state.pending_requests, request_id)
-          {:noreply, %{updated_state | pending_requests: new_pending}}
+          {:noreply, drop_pending(updated_state, request_id)}
 
         {from, :single} ->
           # Reply with cancelled error and remove from pending
           GenServer.reply(from, {:error, :cancelled})
-          new_pending = Map.delete(state.pending_requests, request_id)
-          {:noreply, %{updated_state | pending_requests: new_pending}}
+          {:noreply, drop_pending(updated_state, request_id)}
 
         _ ->
           # Other types of requests (batch, etc.)
@@ -2207,9 +2201,11 @@ defmodule Arbor.MCP.Client.RequestHandler do
   # input the client handler is still answering. Each such request or
   # fulfilment holds one monitor on its caller: `caller_watches` maps
   # {:request, id} or {:mrtr, task_pid} to it, and `caller_monitors` maps it
-  # back. A watch is dropped when its request completes, and any whose
-  # request settled another way (a timeout, a cancellation, an error) when
-  # the next one is added, so the maps hold about the requests in flight.
+  # back. A watch is dropped, and its monitor with it, as soon as what it
+  # watched settles: every path that removes a pending request goes through
+  # drop_pending/2, and every end of an MRTR fulfilment calls
+  # forget_caller/2. Adding a watch also prunes any left behind, as a
+  # backstop only.
 
   @doc false
   # On for every modern request unless the caller turned it off; on a legacy
@@ -2253,6 +2249,16 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
         {key, state}
     end
+  end
+
+  @doc false
+  # Drops a request that settled, whichever way (a response, an error, a
+  # timeout, a cancellation, a failed send), and the watch on its caller with
+  # it, so no monitor outlives what it watched.
+  @spec drop_pending(map(), term()) :: map()
+  def drop_pending(state, request_id) do
+    state = %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+    forget_caller(state, {:request, request_id})
   end
 
   @doc false

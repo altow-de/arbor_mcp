@@ -677,6 +677,10 @@ defmodule Arbor.MCP.Client do
     or `{:error, error}` tuples, in the same order as the original requests.
   - `{:error, reason}` - If the batch request fails (e.g., timeout).
 
+  A batch takes only a timeout: it doesn't take `cancel_on_caller_exit:` and
+  isn't cancelled when its caller exits. JSON-RPC batching is a legacy
+  feature, removed from MCP in 2025-06-18.
+
   ## Example
 
       requests = [
@@ -696,6 +700,8 @@ defmodule Arbor.MCP.Client do
   Convenience alias for batch_request/3.
 
   Sends a batch of JSON-RPC requests. Available in protocol version 2025-03-26 only.
+  Like `batch_request/3`, it takes only a timeout and isn't cancelled when its
+  caller exits.
   """
   @spec send_batch(t(), [map()], timeout()) :: {:ok, [any()]} | {:error, any()}
   def send_batch(client, requests, timeout \\ 30_000) do
@@ -1894,14 +1900,12 @@ defmodule Arbor.MCP.Client do
       {from, :single, _method} ->
         # Reply with cancelled error and remove from pending
         GenServer.reply(from, {:error, :cancelled})
-        new_pending = Map.delete(state.pending_requests, request_id)
-        {:reply, :ok, prune_legacy_posts(%{updated_state | pending_requests: new_pending})}
+        {:reply, :ok, prune_legacy_posts(RequestHandler.drop_pending(updated_state, request_id))}
 
       {from, :single} ->
         # Reply with cancelled error and remove from pending
         GenServer.reply(from, {:error, :cancelled})
-        new_pending = Map.delete(state.pending_requests, request_id)
-        {:reply, :ok, prune_legacy_posts(%{updated_state | pending_requests: new_pending})}
+        {:reply, :ok, prune_legacy_posts(RequestHandler.drop_pending(updated_state, request_id))}
 
       _ ->
         # Other types of requests (batch, etc.) - just track as cancelled
@@ -2394,23 +2398,13 @@ defmodule Arbor.MCP.Client do
         GenServer.reply(from, {:error, :timeout})
 
         state = cancel_timed_out(request_id, state)
-
-        {:noreply,
-         prune_legacy_posts(%{
-           state
-           | pending_requests: Map.delete(state.pending_requests, request_id)
-         })}
+        {:noreply, prune_legacy_posts(RequestHandler.drop_pending(state, request_id))}
 
       {from, :single} ->
         GenServer.reply(from, {:error, :timeout})
 
         state = cancel_timed_out(request_id, state)
-
-        {:noreply,
-         prune_legacy_posts(%{
-           state
-           | pending_requests: Map.delete(state.pending_requests, request_id)
-         })}
+        {:noreply, prune_legacy_posts(RequestHandler.drop_pending(state, request_id))}
 
       {_from, :batch, _ids, _received} when state.transport_mod == LegacySSE ->
         state = RequestHandler.close_request_stream(request_id, state)
@@ -2577,11 +2571,11 @@ defmodule Arbor.MCP.Client do
       case Map.get(state.pending_requests, id) do
         {from, :single, _method} ->
           GenServer.reply(from, {:error, error})
-          %{state | pending_requests: Map.delete(state.pending_requests, id)}
+          RequestHandler.drop_pending(state, id)
 
         {from, :single} ->
           GenServer.reply(from, {:error, error})
-          %{state | pending_requests: Map.delete(state.pending_requests, id)}
+          RequestHandler.drop_pending(state, id)
 
         {from, :batch, ordered_ids, received} when is_map(received) ->
           # Preserve responses already delivered for this exact envelope. Its
@@ -2880,11 +2874,7 @@ defmodule Arbor.MCP.Client do
     )
 
     state = cancel_upstream(request_id, "Caller exited", state)
-
-    prune_legacy_posts(%{
-      state
-      | pending_requests: Map.delete(state.pending_requests, request_id)
-    })
+    prune_legacy_posts(RequestHandler.drop_pending(state, request_id))
   end
 
   # A POST that failed at or after its caller's deadline is the caller's
@@ -2902,7 +2892,7 @@ defmodule Arbor.MCP.Client do
       _other -> :ok
     end
 
-    %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+    RequestHandler.drop_pending(state, request_id)
   end
 
   defp fail_async_post_request(state, request_id, reason, deadline \\ nil) do
@@ -2914,12 +2904,12 @@ defmodule Arbor.MCP.Client do
     case request_id && Map.get(state.pending_requests, request_id) do
       {from, :single, _method} ->
         GenServer.reply(from, {:error, error})
-        state = %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+        state = RequestHandler.drop_pending(state, request_id)
         if timed_out?, do: cancel_timed_out(request_id, state), else: state
 
       {from, :single} ->
         GenServer.reply(from, {:error, error})
-        state = %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+        state = RequestHandler.drop_pending(state, request_id)
         if timed_out?, do: cancel_timed_out(request_id, state), else: state
 
       _ ->

@@ -19,7 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handler that is answering the round's input requests. `false` turns it
   off. Absent or `nil`, it is on for modern requests and off for legacy ones
   (see Changed); any other value raises `ArgumentError`. The `all_*` list
-  helpers pass it to each page request. Each cancellation emits
+  helpers pass it to each page request, and a `tools/call` to the
+  `tools/list` refresh it makes after a header mismatch. The legacy batches
+  (`batch_request/3`, `send_batch/3`) don't take it. Each cancellation emits
   `[:arbor_mcp, :client, :request, :caller_exited]`.
 - Under `:prefer_modern`, a stdio server that exits without answering the
   `server/discover` probe, as Python `mcp` 1.6 and 1.8 stdio servers do, or

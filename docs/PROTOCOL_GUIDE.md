@@ -437,7 +437,11 @@ connection it happens only when the call asks for it, since there it sends a
 - anything else raises `ArgumentError`.
 
 Every request function takes it, the `all_*` list helpers included, which
-pass it to each page request.
+pass it to each page request, and so does the `tools/list` refresh a
+`tools/call` makes after a header mismatch on its caller's behalf. Batches
+(`batch_request/3`, `send_batch/3`) are the exception: they take only a
+timeout and aren't cancelled when their caller exits. JSON-RPC batching is a
+legacy feature, removed from MCP in 2025-06-18.
 
 ```elixir
 # A modern request that should finish even if its caller goes away.

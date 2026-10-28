@@ -375,8 +375,9 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
 
   # Every public function that takes request options accepts the option
   # (none raises), and the content helpers, which check their options
-  # themselves, pass it on.
-  test "every request function accepts cancel_on_caller_exit" do
+  # themselves, pass it on. The legacy batches take only a timeout, by
+  # design, and aren't cancelled with their caller.
+  test "every request function but the batches accepts cancel_on_caller_exit" do
     client = start_beam_client(:modern_only)
 
     for value <- [true, false, nil] do
@@ -419,12 +420,99 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
     assert_receive {:server_completed, "content"}, 3_000
   end
 
+  describe "a tools/call that refreshes tools/list after a header mismatch" do
+    # The refresh is made on the caller's behalf: it is watched as the call
+    # is, so the call's opt-out covers it too.
+    test "watches its caller as the call does" do
+      for {opts, watched?} <- [{[], true}, {[cancel_on_caller_exit: false], false}] do
+        client = start_header_mismatch_client()
+
+        {caller, caller_ref} =
+          start_caller(fn ->
+            Client.call_tool(client, "mismatch", %{}, [timeout: 5_000] ++ opts)
+          end)
+
+        assert_receive {:refreshing, handler}, 3_000
+        assert watched_by?(caller, client) == watched?
+
+        kill(caller, caller_ref)
+        send(handler, :release)
+      end
+    end
+  end
+
+  describe "a caller that stays alive" do
+    test "keeps no watch once its requests timed out, failed or were cancelled" do
+      client = start_http_client()
+
+      # A walk whose second page outlives the walk's timeout.
+      assert {:error, :timeout} = Client.all_prompts(client, timeout: 300)
+      assert_receive {:holding, "page-2", _handler, _id}
+      assert_receive {:server_cancelled, "page-2", _reason}, 3_000
+      assert_no_watch(client)
+
+      # A call cancelled explicitly.
+      task = Task.async(fn -> hold(client, "explicit") end)
+      {"explicit", _handler} = receive_holding()
+      [request_id] = Client.get_pending_requests(client)
+      assert :ok = Client.send_cancelled(client, request_id, "not needed")
+      assert {:error, :cancelled} = Task.await(task)
+      assert_no_watch(client)
+
+      # An error response.
+      assert {:error, _unknown_tool} = Client.call_tool(client, "missing", %{}, timeout: 2_000)
+      assert_no_watch(client)
+
+      # An MRTR round whose input fulfilment outlives the call's timeout.
+      assert {:error, :timeout} =
+               Client.call_tool(client, "onboard", %{"mode" => "block"}, timeout: 300)
+
+      assert_receive {:elicitation_started, _fulfilment}
+      wait_until(fn -> :sys.get_state(client).mrtr_tasks == %{} end, timeout: 2_000)
+      assert_no_watch(client)
+    end
+
+    test "keeps no watch once its connection is lost" do
+      client = start_beam_client(:modern_only)
+      test_pid = self()
+
+      caller =
+        spawn(fn ->
+          send(test_pid, {:caller_result, self(), hold(client, "lost")})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      {"lost", _handler} = receive_holding()
+      assert watched_by?(caller, client)
+
+      # As the transport reports a lost connection.
+      send(client, {:transport_closed, :connection_lost})
+
+      assert_receive {:caller_result, ^caller, {:error, _closed}}, 3_000
+      refute watched_by?(caller, client)
+      assert %{caller_watches: watches, caller_monitors: monitors} = :sys.get_state(client)
+      assert watches == %{} and monitors == %{}
+      send(caller, :stop)
+    end
+  end
+
   test "an invalid cancel_on_caller_exit is refused" do
     client = start_beam_client(:modern_only)
 
     assert_raise ArgumentError, ~r/cancel_on_caller_exit must be a boolean/, fn ->
       Client.call_tool(client, "quick", %{}, cancel_on_caller_exit: :yes)
     end
+  end
+
+  # No caller watch or monitor is left, and none on this test process.
+  defp assert_no_watch(client) do
+    wait_until(fn -> Client.get_pending_requests(client) == [] end, timeout: 3_000)
+    assert %{caller_watches: watches, caller_monitors: monitors} = :sys.get_state(client)
+    assert watches == %{} and monitors == %{}
+    refute watched_by?(self(), client)
   end
 
   defp hold(client, label, opts \\ []),
@@ -546,6 +634,71 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
 
     on_exit(fn -> stop(client) end)
     client
+  end
+
+  # A scripted modern server whose "mismatch" call fails with -32020 until
+  # the client has refreshed tools/list, which holds until released.
+  defp start_header_mismatch_client do
+    bypass = Bypass.open()
+    test_pid = self()
+    refreshed = start_supervised!({Agent, fn -> false end}, id: make_ref())
+
+    Bypass.stub(bypass, "POST", "/mcp", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      case Jason.decode!(body) do
+        %{"method" => "server/discover", "id" => id} ->
+          json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => discover_result()})
+
+        %{"method" => "tools/list", "id" => id} ->
+          send(test_pid, {:refreshing, self()})
+
+          receive do
+            :release -> :ok
+          after
+            5_000 -> :ok
+          end
+
+          Agent.update(refreshed, fn _ -> true end)
+          result = %{"resultType" => "complete", "tools" => []}
+          json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => result})
+
+        %{"method" => "tools/call", "id" => id} ->
+          if Agent.get(refreshed, & &1) do
+            result = %{"resultType" => "complete", "content" => []}
+            json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => result})
+          else
+            error = %{"code" => -32_020, "message" => "Header mismatch"}
+            json(conn, %{"jsonrpc" => "2.0", "id" => id, "error" => error})
+          end
+      end
+    end)
+
+    {:ok, client} =
+      Client.start_link(
+        transport: :http,
+        url: "http://127.0.0.1:#{bypass.port}/mcp",
+        protocol_mode: :modern_only,
+        protocol_version: "2026-07-28",
+        health_check_interval: nil,
+        reconnect: false
+      )
+
+    on_exit(fn -> stop(client) end)
+    client
+  end
+
+  defp discover_result do
+    %{
+      "resultType" => "complete",
+      "supportedVersions" => ["2026-07-28"],
+      "capabilities" => %{"tools" => %{}},
+      "ttlMs" => 0,
+      "cacheScope" => "private",
+      "_meta" => %{
+        "io.modelcontextprotocol/serverInfo" => %{"name" => "mismatch", "version" => "1"}
+      }
+    }
   end
 
   # A scripted legacy-era server: "hang" runs until its connection closes.
