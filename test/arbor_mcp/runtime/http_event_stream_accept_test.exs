@@ -39,6 +39,8 @@ defmodule Arbor.MCP.Server.Runtime.HTTPEventStreamAcceptTest do
     "application/json, text/event-stream;q=0.000",
     "application/json, text/event-stream;q=abc",
     ~S(application/json, text/event-stream;q="1"),
+    "application/json, text/event-stream;q",
+    "application/json, text/event-stream;q=",
     "application/json",
     "*/*",
     "application/json, text/*",

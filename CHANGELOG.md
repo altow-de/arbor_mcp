@@ -51,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `Accept: application/json, text/event-stream;q` — a `q` parameter with no
+  value — treated the range as quality 1, so a request that asked for
+  progress was answered with an event stream, and a legacy session GET opened
+  one, although the client named a weight it never spelled. A malformed
+  weight, bare or empty included, makes its range unusable, so those requests
+  get JSON and the GET its existing refusal (found and fixed on the 1.x line
+  first, `ex_mcp` a2d8ccc).
+
 - An unsupported-version error (`-32022`) lists `supported` as exactly the
   revisions the mount or server accepts, from the same source its request
   validation uses (`Arbor.MCP.Server.RequestContext.accepted_versions/1`), in
