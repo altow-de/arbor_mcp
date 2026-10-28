@@ -66,6 +66,8 @@ defmodule Arbor.MCP.Client.Internal.Request do
   end
 
   defp validate_options!(opts) do
+    # `nil` leaves it to the era: on for modern requests, off for legacy ones.
+    validate_option!(opts, :cancel_on_caller_exit, [nil, true, false], "a boolean")
     validate_option!(opts, :format, [:map, :struct], ":map or :struct")
     validate_option!(opts, :cache_mode, [:use, :refresh, :bypass], ":use, :refresh or :bypass")
     validate_option!(opts, :reset_timeout_on_progress, [true, false], "a boolean")
@@ -109,6 +111,8 @@ defmodule Arbor.MCP.Client.Internal.Request do
 
     progress_timeout = progress_timeout(client, opts, default_timeout)
     params = if progress_timeout, do: ensure_progress_token(params), else: params
+    cancel_on_caller_exit = Keyword.get(opts, :cancel_on_caller_exit)
+    request_meta = Map.put(request_meta, :cancel_on_caller_exit, cancel_on_caller_exit)
 
     result =
       if explicit_timeout || progress_timeout do
