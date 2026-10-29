@@ -328,9 +328,9 @@ defmodule Arbor.MCP.Client do
   Over Streamable HTTP the client stays an HTTP client: each request after
   establishment still POSTs from its own task. The circuit breaker admits
   every POST and records how it ended (a crash or a timeout is a failure, a
-  cancellation isn't counted); an open circuit refuses a request with a
-  `:circuit_open` transport error before anything is sent. A request stream
-  is admitted, but its outcome isn't recorded.
+  cancellation or the caller's exit isn't counted); an open circuit refuses a
+  request with a `:circuit_open` transport error before anything is sent. A
+  request stream is admitted, but its outcome isn't recorded.
 
   ## Reliability Examples
 
@@ -3112,8 +3112,7 @@ defmodule Arbor.MCP.Client do
   defp close_transport(%{transport_mod: mod, transport_state: transport_state}, close_mode)
        when not is_nil(mod) and not is_nil(transport_state) do
     deadline = cleanup_deadline()
-    # Every caller has retired the transport's links (retire_links/1).
-    cleanup_state = Deadline.put_cleanup_on_transport(mod, transport_state, deadline)
+    cleanup_state = Deadline.put_on_transport(mod, transport_state, deadline)
 
     result =
       if ConnectionScope.current() && close_mode == :native do
@@ -3124,11 +3123,65 @@ defmodule Arbor.MCP.Client do
         bounded_transport_close(mod, cleanup_state, deadline)
       end
 
+    stop_reliability_components(mod, transport_state, deadline)
     ConnectionScope.closed(mod, transport_state, result)
     result
   end
 
   defp close_transport(_state, _close_mode), do: :ok
+
+  # The circuit breaker and health checker the client started with its
+  # transport (`reliability:`) are its own linked processes, and its close
+  # paths retire their links with the transport's (retire_links/1;
+  # terminate/2 needs none, as the client handles no message after it). So
+  # they are stopped here, in the client's own process, once the transport's
+  # close has returned or been cut off at the cleanup deadline: a close cut
+  # off there (a stalled session DELETE, a stuck stdio server, a busy health
+  # check holding up the wrapper's own stop) must not leave them running.
+  # Each gets a graceful stop within what is left of the cleanup budget, and
+  # is killed once that runs out. One the close stopped already is passed.
+  defp stop_reliability_components(mod, transport_state, deadline) do
+    mod
+    |> reliability_components(transport_state)
+    |> Enum.each(&stop_reliability_component(&1, deadline))
+  end
+
+  defp reliability_components(HTTP, %HTTP{reliability: %ReliabilityWrapper{} = wrapper}),
+    do: component_pids(wrapper)
+
+  defp reliability_components(ReliabilityWrapper, %ReliabilityWrapper{} = wrapper),
+    do: component_pids(wrapper)
+
+  defp reliability_components(_mod, _transport_state), do: []
+
+  defp component_pids(wrapper),
+    do: Enum.filter([wrapper.circuit_breaker_pid, wrapper.health_check_pid], &is_pid/1)
+
+  # :sys.terminate/3 rather than GenServer.stop/3, whose wait for the exit
+  # can raise when a stop is accepted just before its timeout.
+  defp stop_reliability_component(pid, deadline) do
+    monitor = Process.monitor(pid)
+
+    case Deadline.remaining(deadline) do
+      0 ->
+        :ok
+
+      wait ->
+        try do
+          :sys.terminate(pid, :normal, wait)
+        catch
+          :exit, _reason -> :ok
+        end
+    end
+
+    receive do
+      {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+    after
+      Deadline.remaining(deadline) ->
+        Process.demonitor(monitor, [:flush])
+        Process.exit(pid, :kill)
+    end
+  end
 
   defp perform_transport_close(mod, cleanup_state) do
     case mod.close(cleanup_state) do
@@ -3208,6 +3261,9 @@ defmodule Arbor.MCP.Client do
     state = %{state | cleanup_result: remember_cleanup(state.cleanup_result, quiesce_result)}
     state = retire_callback_work(state)
     state = retire_links(state)
+    # The transport may have closed by itself (it never went through
+    # close_transport/2), and a reconnect starts fresh components.
+    stop_reliability_components(state.transport_mod, state.transport_state, deadline)
     reply_pending_with_close_error(reason, state)
     state = RequestHandler.forget_callers(state)
     notify_subscription_processes(state, {:client_subscription_disconnected, reason})
@@ -3514,7 +3570,7 @@ defmodule Arbor.MCP.Client do
 
     # However the client stops (stop/2, its starter's exit, a linked
     # process's crash), the connection and any child process go with it.
-    close_transport(retire_links(state))
+    close_transport(state)
     Lifetime.cleanup(deadline)
     :ok
   end

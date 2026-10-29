@@ -1635,14 +1635,11 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
-  # The components attached here stop within this close's cleanup deadline,
-  # if it has one, handed to the wrapper with them (and with whether the
-  # client retired their links, see Deadline.put_cleanup_on_transport/3).
+  # The components attached here are closed with the transport, as the
+  # wrapper closes them (see attach_reliability/2).
   @impl true
-  def close(%__MODULE__{reliability: %ReliabilityWrapper{} = reliability} = state) do
-    state = %{state | reliability: nil}
-    ReliabilityWrapper.close(%{reliability | deadline: state.deadline, wrapped_state: state})
-  end
+  def close(%__MODULE__{reliability: %ReliabilityWrapper{} = reliability} = state),
+    do: ReliabilityWrapper.close(%{reliability | wrapped_state: %{state | reliability: nil}})
 
   def close(%__MODULE__{} = state) do
     :telemetry.execute([:arbor_mcp, :transport, :connection, :closed], %{}, %{

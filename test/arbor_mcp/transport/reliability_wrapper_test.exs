@@ -1,6 +1,5 @@
 defmodule Arbor.MCP.Transport.ReliabilityWrapperTest do
   use ExUnit.Case, async: true
-  alias Arbor.MCP.Client.Deadline
   alias Arbor.MCP.Transport.{ReliabilityWrapper, Test}
 
   defmodule StatefulFailure do
@@ -19,25 +18,6 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapperTest do
     def close(_state), do: :ok
     @impl true
     def connected?(_state), do: true
-  end
-
-  # Tells the test process when it is closed.
-  defmodule SlowStopTransport do
-    @behaviour Arbor.MCP.Transport
-    @impl true
-    def connect(opts), do: {:ok, %{test: opts[:test]}}
-    @impl true
-    def send_message(_message, state), do: {:ok, state}
-    @impl true
-    def receive_message(state), do: {:ok, "message", state}
-    @impl true
-    def connected?(_state), do: true
-
-    @impl true
-    def close(state) do
-      send(state.test, :transport_closed)
-      :ok
-    end
   end
 
   test "public wrapped failures keep two-tuples while internal sends retain state" do
@@ -197,172 +177,6 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapperTest do
                ReliabilityWrapper.send_message("test", wrapped_state)
     end
 
-    # A synchronous transport answers send_message/2 with {:ok, state,
-    # response} and receive_message with {:ok, message, state}; the wrapper
-    # used to read both as {:ok, result, state}, which swapped the state and
-    # the response of a send.
-    # A caller bounds a transport's close and kills it at its deadline (a
-    # stuck stdio server, a stalled HTTP session DELETE), so the components
-    # must already be stopped by then, or they outlive the transport.
-    test "close stops its components before the wrapped transport's close" do
-      defmodule BlockingCloseTransport do
-        @behaviour Arbor.MCP.Transport
-
-        def connect(opts), do: {:ok, %{test: opts[:test]}}
-        def send_message(_message, state), do: {:ok, state}
-        def receive_message(state), do: {:ok, "message", state}
-        def connected?(_state), do: true
-
-        def close(state) do
-          send(state.test, {:closing, self()})
-
-          receive do
-            :finish -> :ok
-          end
-        end
-      end
-
-      {:ok, transport_state} = BlockingCloseTransport.connect(test: self())
-
-      {:ok, wrapped} =
-        ReliabilityWrapper.wrap(BlockingCloseTransport, transport_state,
-          circuit_breaker: [failure_threshold: 3],
-          health_check: [check_interval: 60_000]
-        )
-
-      breaker_ref = Process.monitor(wrapped.circuit_breaker_pid)
-      checker_ref = Process.monitor(wrapped.health_check_pid)
-      closer = Task.async(fn -> ReliabilityWrapper.close(wrapped) end)
-
-      assert_receive {:closing, closing}, 2_000
-      # Both are down while the transport's close is still running.
-      assert_receive {:DOWN, ^breaker_ref, :process, _breaker, _reason}, 2_000
-      assert_receive {:DOWN, ^checker_ref, :process, _checker, _reason}, 2_000
-
-      send(closing, :finish)
-      assert :ok = Task.await(closer)
-    end
-
-    # A health check waiting on its target held the checker's loop, so
-    # close/1 waited out its stop and killed it, and the kill took down the
-    # process that wrapped the transport when another one closed it.
-    test "close stops a checker mid-check gracefully, sparing the wrapper's owner" do
-      defmodule ClosingTransport do
-        @behaviour Arbor.MCP.Transport
-
-        def connect(opts), do: {:ok, %{test: opts[:test]}}
-        def send_message(_message, state), do: {:ok, state}
-        def receive_message(state), do: {:ok, "message", state}
-        def connected?(_state), do: true
-
-        def close(state) do
-          send(state.test, :transport_closed)
-          :ok
-        end
-      end
-
-      test_pid = self()
-      {:ok, transport_state} = ClosingTransport.connect(test: test_pid)
-
-      {:ok, wrapped} =
-        ReliabilityWrapper.wrap(ClosingTransport, transport_state,
-          health_check: [
-            check_interval: 60_000,
-            timeout: 30_000,
-            check_fn: fn _target ->
-              send(test_pid, {:checking, self()})
-              receive do: (:never -> {:ok, %{}})
-            end
-          ]
-        )
-
-      assert_receive {:checking, check}, 3_000
-      checker_ref = Process.monitor(wrapped.health_check_pid)
-      check_ref = Process.monitor(check)
-
-      # Closed from a process other than the checker's linker (this one).
-      assert :ok = Task.await(Task.async(fn -> ReliabilityWrapper.close(wrapped) end))
-      assert_received :transport_closed
-      assert_receive {:DOWN, ^checker_ref, :process, _checker, :normal}
-      assert_receive {:DOWN, ^check_ref, :process, ^check, _reason}
-    end
-
-    # The client kills its close at the cleanup deadline. A stop that waited
-    # past what was left of it (a 50 ms floor) was cut off with it: the
-    # breaker was never killed and the transport's close never called.
-    test "close kills a stuck component at once when too little of the budget is left" do
-      defmodule ShortBudgetTransport do
-        @behaviour Arbor.MCP.Transport
-
-        def connect(opts), do: {:ok, %{test: opts[:test]}}
-        def send_message(_message, state), do: {:ok, state}
-        def receive_message(state), do: {:ok, "message", state}
-        def connected?(_state), do: true
-
-        def close(state) do
-          send(state.test, :transport_closed)
-          :ok
-        end
-      end
-
-      test_pid = self()
-      {:ok, transport_state} = ShortBudgetTransport.connect(test: test_pid)
-
-      {:ok, wrapped} =
-        ReliabilityWrapper.wrap(ShortBudgetTransport, transport_state,
-          circuit_breaker: [failure_threshold: 3]
-        )
-
-      breaker = wrapped.circuit_breaker_pid
-      Process.unlink(breaker)
-
-      # Held inside a call of its own, the breaker can't answer a stop.
-      spawn(fn ->
-        :sys.replace_state(breaker, fn state ->
-          send(test_pid, :stuck)
-          receive do: (:never -> state)
-        end)
-      end)
-
-      assert_receive :stuck
-      breaker_ref = Process.monitor(breaker)
-
-      closing = Deadline.put_on_transport(ReliabilityWrapper, wrapped, Deadline.after_ms(20))
-
-      # As the client does, the close gets 20 ms before it is killed.
-      closer = Task.async(fn -> ReliabilityWrapper.close(closing) end)
-      _result = Task.yield(closer, 20) || Task.shutdown(closer, :brutal_kill)
-
-      assert_receive :transport_closed
-      assert_receive {:DOWN, ^breaker_ref, :process, ^breaker, :killed}
-    end
-
-    test "keeps a synchronous send's response apart from its state" do
-      defmodule SyncTransport do
-        @behaviour Arbor.MCP.Transport
-
-        def connect(_opts), do: {:ok, %{sent: 0}}
-        def send_message(_message, state), do: {:ok, %{state | sent: state.sent + 1}, "reply"}
-        def receive_message(state), do: {:ok, "message", state}
-        def close(_state), do: :ok
-        def connected?(_state), do: true
-      end
-
-      {:ok, transport_state} = SyncTransport.connect([])
-
-      for opts <- [[circuit_breaker: [failure_threshold: 3]], []] do
-        {:ok, wrapped} = ReliabilityWrapper.wrap(SyncTransport, transport_state, opts)
-
-        assert {:ok, %ReliabilityWrapper{wrapped_state: %{sent: 1}}, "reply"} =
-                 ReliabilityWrapper.send_message("request", wrapped)
-
-        assert {:ok, "message", %ReliabilityWrapper{wrapped_state: %{sent: 0}}} =
-                 ReliabilityWrapper.receive_message(wrapped)
-
-        ReliabilityWrapper.close(wrapped)
-      end
-    end
-
     test "operates without circuit breaker when disabled" do
       {:ok, transport_state} = Test.connect([])
 
@@ -401,6 +215,36 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapperTest do
       {:ok, wrapped_state} = ReliabilityWrapper.wrap(Test, transport_state, [])
 
       assert ReliabilityWrapper.connected?(wrapped_state) == Test.connected?(transport_state)
+    end
+
+    # A synchronous transport answers send_message/2 with {:ok, state,
+    # response} and receive_message with {:ok, message, state}; the wrapper
+    # used to read both as {:ok, result, state}, which swapped the state and
+    # the response of a send.
+    test "keeps a synchronous send's response apart from its state" do
+      defmodule SyncTransport do
+        @behaviour Arbor.MCP.Transport
+
+        def connect(_opts), do: {:ok, %{sent: 0}}
+        def send_message(_message, state), do: {:ok, %{state | sent: state.sent + 1}, "reply"}
+        def receive_message(state), do: {:ok, "message", state}
+        def close(_state), do: :ok
+        def connected?(_state), do: true
+      end
+
+      {:ok, transport_state} = SyncTransport.connect([])
+
+      for opts <- [[circuit_breaker: [failure_threshold: 3]], []] do
+        {:ok, wrapped} = ReliabilityWrapper.wrap(SyncTransport, transport_state, opts)
+
+        assert {:ok, %ReliabilityWrapper{wrapped_state: %{sent: 1}}, "reply"} =
+                 ReliabilityWrapper.send_message("request", wrapped)
+
+        assert {:ok, "message", %ReliabilityWrapper{wrapped_state: %{sent: 0}}} =
+                 ReliabilityWrapper.receive_message(wrapped)
+
+        ReliabilityWrapper.close(wrapped)
+      end
     end
   end
 
@@ -483,77 +327,6 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapperTest do
     end
   end
 
-  describe "close/1 and the wrapper's owner" do
-    # Without a deadline each component gets its own 500 ms stop, as before deadlines came to
-    # close/1. A 500 ms budget the components shared left the second too
-    # little after a slow first, and killing it killed the process that
-    # wrapped the transport, which another process was closing.
-    test "without a deadline, gives each component its own stop" do
-      test_pid = self()
-      {owner, wrapped} = start_owner(SlowStopTransport, test_pid)
-      owner_ref = Process.monitor(owner)
-
-      # Each answers its stop well within its own 500 ms, not within one
-      # 500 ms for both.
-      stop_after(wrapped.circuit_breaker_pid, 450)
-      stop_after(wrapped.health_check_pid, 100)
-      breaker_ref = Process.monitor(wrapped.circuit_breaker_pid)
-      checker_ref = Process.monitor(wrapped.health_check_pid)
-
-      closer = Task.async(fn -> ReliabilityWrapper.close(wrapped) end)
-      assert :ok = Task.await(closer, 3_000)
-      assert_receive :transport_closed
-      assert_receive {:DOWN, ^breaker_ref, :process, _breaker, :normal}
-      assert_receive {:DOWN, ^checker_ref, :process, _checker, :normal}
-      refute_received {:DOWN, ^owner_ref, :process, ^owner, _reason}
-      assert Process.alive?(owner)
-    end
-
-    # A component that accepted its stop is already exiting normally.
-    # Killing it because its terminate callback ran past the stop's timeout
-    # sent its owner :killed.
-    test "waits for a component that accepted its stop to finish exiting" do
-      test_pid = self()
-
-      {owner, wrapped, slow} =
-        start_owner(SlowStopTransport, test_pid, fn ->
-          spawn_link(fn -> exit_after_stop(600) end)
-        end)
-
-      owner_ref = Process.monitor(owner)
-      slow_ref = Process.monitor(slow)
-      # Stands in for a breaker whose exit takes 600 ms once it accepts a stop.
-      wrapped = %{wrapped | circuit_breaker_pid: slow}
-
-      closer = Task.async(fn -> ReliabilityWrapper.close(wrapped) end)
-      assert :ok = Task.await(closer, 3_000)
-      assert_receive {:DOWN, ^slow_ref, :process, ^slow, :normal}
-      refute_received {:DOWN, ^owner_ref, :process, ^owner, _reason}
-      assert Process.alive?(owner)
-    end
-
-    # Within a deadline, a component may be killed only when nothing linked
-    # to it can die of that. Here its owner is another process, which has
-    # retired nothing, so the component gets its graceful stop, however
-    # little is left of the deadline.
-    test "within a deadline, doesn't kill a component another process is linked to" do
-      test_pid = self()
-      {owner, wrapped} = start_owner(SlowStopTransport, test_pid)
-      owner_ref = Process.monitor(owner)
-
-      stop_after(wrapped.circuit_breaker_pid, 100)
-      breaker_ref = Process.monitor(wrapped.circuit_breaker_pid)
-      closing = Deadline.put_on_transport(ReliabilityWrapper, wrapped, Deadline.after_ms(20))
-
-      closer = Task.async(fn -> ReliabilityWrapper.close(closing) end)
-      assert :ok = Task.await(closer, 3_000)
-      assert_receive :transport_closed
-      assert_receive {:DOWN, ^breaker_ref, :process, _breaker, :normal}
-      refute_received {:DOWN, ^owner_ref, :process, ^owner, _reason}
-      assert Process.alive?(owner)
-    end
-  end
-
   describe "capabilities/1" do
     test "passes through capabilities from wrapped transport" do
       {:ok, transport_state} = Test.connect([])
@@ -562,65 +335,6 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapperTest do
 
       # Test transport implements capabilities/1 and returns [:push]
       assert ReliabilityWrapper.capabilities(wrapped_state) == [:push]
-    end
-  end
-
-  # Has `component` answer its next stop only `delay_ms` after it comes.
-  defp stop_after(component, delay_ms) do
-    test_pid = self()
-
-    spawn(fn ->
-      :sys.replace_state(
-        component,
-        fn state ->
-          send(test_pid, {:stalling, component})
-
-          receive do
-            {:system, _from, {:terminate, _reason}} = stop ->
-              Process.sleep(delay_ms)
-              send(self(), stop)
-          end
-
-          state
-        end,
-        :infinity
-      )
-    end)
-
-    assert_receive {:stalling, ^component}
-  end
-
-  # A process that wraps `transport` with a breaker and a health check, so
-  # it is linked to both, and then just waits; `also`, run there too, may
-  # start more processes linked to it.
-  defp start_owner(transport, test_pid, also \\ nil) do
-    owner =
-      spawn(fn ->
-        {:ok, transport_state} = transport.connect(test: test_pid)
-
-        {:ok, wrapped} =
-          ReliabilityWrapper.wrap(transport, transport_state,
-            circuit_breaker: [failure_threshold: 3],
-            health_check: [check_interval: 60_000]
-          )
-
-        send(test_pid, {:wrapped, wrapped, also && also.()})
-        receive do: (:never -> :ok)
-      end)
-
-    on_exit(fn -> Process.exit(owner, :kill) end)
-    assert_receive {:wrapped, wrapped, started}
-    if also, do: {owner, wrapped, started}, else: {owner, wrapped}
-  end
-
-  # Accepts a stop at once, as a GenServer does, and exits normally only
-  # `exit_ms` later, as one with a slow terminate callback would.
-  defp exit_after_stop(exit_ms) do
-    receive do
-      {:system, from, {:terminate, reason}} ->
-        :gen.reply(from, :ok)
-        Process.sleep(exit_ms)
-        exit(reason)
     end
   end
 end

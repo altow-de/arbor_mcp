@@ -101,13 +101,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JWE, derives shared secrets or exports password-encrypted keys, and MRTR
   request state is sealed with `:crypto` directly and checks the tag length.
   The floor keeps applications' dependency graphs off the affected releases.
-- `Arbor.MCP.Reliability.HealthCheck.get_status/1` answers at once while a
-  check is in progress, with the status the finished checks left, instead of
-  waiting for that check: each check now runs in a process of its own, off
-  the checker's loop. Its other calls are taken as before, in the order they
-  came and after a check in progress: `check_now/1` still runs a check of its
-  own and returns its result, and a subscriber hears of the same transitions,
-  however its `subscribe/1` or `unsubscribe/1` falls against a check.
 
 ### Fixed
 
@@ -125,17 +118,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decides first: as a failure when the task crashes or the client's timeout
   abandons the POST, in either era, so a late response doesn't count, and
   released, not counted, when the caller cancels or exits, even while the
-  POST waits on authentication or before its task has started. A request re-sent after authenticating
-  settles with the re-send's result, and a definitive refusal counts as a
-  failure, so repeated failed authentication opens the circuit. A request
-  stream is admitted but its outcome isn't recorded. Its `:timeout` doesn't
-  apply over HTTP, where each exchange keeps its own deadline. The breaker
-  and health check now stop before the transport closes, within half of the
-  client's cleanup budget over any transport, so a close the client cuts off
-  (a stalled session DELETE, a stuck stdio server) no longer leaves them
-  running, and the close is still attempted. A health checker stops at once
-  even while a check waits on its target, and its check, one that traps
-  exits included, no longer outlives it, however it goes down.
+  POST waits on authentication or before its task has started. A request
+  re-sent after authenticating settles with the re-send's result, and a
+  definitive refusal counts as a failure, so repeated failed authentication
+  opens the circuit. A request stream is admitted but its outcome isn't
+  recorded. Its `:timeout` doesn't apply over HTTP, where each exchange keeps
+  its own deadline. A client's circuit breaker and health check no longer
+  outlive it: whenever the client closes or loses its transport, it stops
+  them itself, within what is left of its cleanup budget, after the
+  transport's close, so a close it cuts off (a stalled session DELETE, a
+  stuck stdio server, a busy health check) no longer leaves them running.
 - Probe and handshake receive failures retain refreshed authentication state
   during fallback and cleanup. Synchronous HTTP state-bearing failures stay
   internal; public transport `send_message/2` errors remain `{:error, reason}`.

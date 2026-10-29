@@ -401,6 +401,8 @@ defmodule Arbor.MCP.Client.ReliabilityHTTPTest do
     end
   end
 
+  # The client cuts off a close that stalls past its cleanup budget, before
+  # the wrapper stops the components, and then stops them itself.
   test "the breaker and health check stop even when the session DELETE stalls" do
     bypass = Bypass.open()
 
@@ -464,7 +466,9 @@ defmodule Arbor.MCP.Client.ReliabilityHTTPTest do
   end
 
   # A health check waits on its check, so a busy checker can't answer a
-  # graceful stop; the client's cleanup budget must still cover the close.
+  # graceful stop: the wrapper's wait for it outlasts the client's cleanup
+  # budget. The session DELETE still goes first, and the client then stops
+  # the checker itself.
   test "a busy health check neither outlives the client nor stops the session DELETE" do
     bypass = Bypass.open()
     test_pid = self()

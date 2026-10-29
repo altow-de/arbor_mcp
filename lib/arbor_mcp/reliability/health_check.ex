@@ -34,17 +34,6 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
 
       # Manual health check
       HealthCheck.check_now(checker)
-
-  ## Checks
-
-  Each check runs in a process of its own, off the checker's loop, so
-  `get_status/1` answers while a check is in progress, and stopping the
-  checker stops its check with it. Every other call is taken in the order it
-  came, after any check in progress or asked for before it, as when checks
-  ran in the loop: `check_now/1` and each periodic check get a check of
-  their own, one at a time, and a `subscribe/1` or `unsubscribe/1` made
-  during a check takes effect after that check has notified the
-  subscribers.
   """
 
   use GenServer
@@ -56,8 +45,6 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
   @default_timeout 5_000
   @default_failure_threshold 3
   @default_recovery_threshold 2
-  # How long stopping a check may take; its watcher answers at once.
-  @check_shutdown_ms 1_000
 
   defstruct [
     :name,
@@ -69,8 +56,6 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
     :recovery_threshold,
     :on_status_change,
     :timer_ref,
-    :check,
-    deferred: [],
     status: :unknown,
     consecutive_failures: 0,
     consecutive_successes: 0,
@@ -100,8 +85,6 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
           recovery_threshold: pos_integer(),
           on_status_change: (status(), status() -> any()) | nil,
           timer_ref: reference() | nil,
-          check: map() | nil,
-          deferred: [{term(), GenServer.from() | nil}],
           status: status(),
           consecutive_failures: non_neg_integer(),
           consecutive_successes: non_neg_integer(),
@@ -135,9 +118,7 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
   end
 
   @doc """
-  Gets the current health status, as the checks finished so far left it.
-
-  It answers at once, also while a check is in progress.
+  Gets the current health status.
   """
   @spec get_status(GenServer.server()) :: {status(), map()}
   def get_status(checker) do
@@ -145,10 +126,7 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
   end
 
   @doc """
-  Runs a health check and returns its result.
-
-  The check starts once any check already running, or asked for earlier,
-  has finished, so the result is always a sample taken after the call.
+  Triggers an immediate health check.
   """
   @spec check_now(GenServer.server()) :: check_result()
   def check_now(checker) do
@@ -234,198 +212,97 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
     {:reply, {state.status, status_info}, state}
   end
 
-  # Every other call, and a periodic check, is taken in the order it came,
-  # after any check in progress or asked for before it, as when checks ran
-  # in this loop: only get_status/1 answers at once.
-  def handle_call(request, from, %{check: nil} = state),
-    do: {:noreply, perform(request, from, state)}
+  def handle_call(:check_now, _from, state) do
+    {result, new_state} = perform_health_check(state)
+    {:reply, result, new_state}
+  end
 
-  def handle_call(request, from, state), do: {:noreply, defer(state, {request, from})}
+  def handle_call({:get_history, limit}, _from, state) do
+    history = Enum.take(state.history, limit)
+    {:reply, history, state}
+  end
+
+  def handle_call({:subscribe, pid}, _from, state) do
+    Process.monitor(pid)
+    new_subscribers = MapSet.put(state.subscribers, pid)
+    {:reply, :ok, %{state | subscribers: new_subscribers}}
+  end
+
+  def handle_call({:unsubscribe, pid}, _from, state) do
+    new_subscribers = MapSet.delete(state.subscribers, pid)
+    {:reply, :ok, %{state | subscribers: new_subscribers}}
+  end
+
+  def handle_call(:pause, _from, state) do
+    if state.timer_ref do
+      Process.cancel_timer(state.timer_ref)
+    end
+
+    {:reply, :ok, %{state | timer_ref: nil}}
+  end
+
+  def handle_call(:resume, _from, state) do
+    timer_ref = Process.send_after(self(), :perform_check, 1000)
+    {:reply, :ok, %{state | timer_ref: timer_ref}}
+  end
 
   @impl GenServer
-  def handle_info(:perform_check, %{check: nil} = state),
-    do: {:noreply, perform(:perform_check, nil, state)}
+  def handle_info(:perform_check, state) do
+    {_result, new_state} = perform_health_check(state)
 
-  def handle_info(:perform_check, state), do: {:noreply, defer(state, {:perform_check, nil})}
+    # Schedule next check
+    timer_ref = Process.send_after(self(), :perform_check, state.check_interval)
 
-  def handle_info({ref, reply}, %{check: %{task: %Task{ref: ref}}} = state) do
-    Process.demonitor(ref, [:flush])
-    {:noreply, finish_check(state, check_outcome({:ok, reply}))}
+    {:noreply, %{new_state | timer_ref: timer_ref}}
   end
-
-  def handle_info(
-        {:DOWN, ref, :process, _pid, reason},
-        %{check: %{task: %Task{ref: ref}}} = state
-      ) do
-    {:noreply, finish_check(state, check_outcome({:exit, reason}))}
-  end
-
-  def handle_info({:check_timeout, ref}, %{check: %{task: %Task{ref: ref} = task}} = state) do
-    outcome =
-      case stop_check(task) do
-        nil -> {:unhealthy, %{error: :timeout}}
-        finished -> check_outcome(finished)
-      end
-
-    {:noreply, finish_check(state, outcome)}
-  end
-
-  def handle_info({:check_timeout, _finished}, state), do: {:noreply, state}
 
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
     new_subscribers = MapSet.delete(state.subscribers, pid)
     {:noreply, %{state | subscribers: new_subscribers}}
   end
 
-  @impl GenServer
-  def terminate(_reason, %{check: %{task: task}}) do
-    stop_check(task)
-    :ok
-  end
-
-  def terminate(_reason, _state), do: :ok
-
   ## Private Functions
 
-  defp perform(:check_now, from, state), do: start_check(state, {:reply, from})
+  defp perform_health_check(state) do
+    start_time = System.monotonic_time(:millisecond)
+    timestamp = DateTime.utc_now()
 
-  # The next periodic check is scheduled when this one finishes.
-  defp perform(:perform_check, _from, state),
-    do: start_check(%{state | timer_ref: nil}, :periodic)
+    {status, details} = execute_check(state.check_fn, state.target, state.timeout)
 
-  defp perform({:get_history, limit}, from, state) do
-    GenServer.reply(from, Enum.take(state.history, limit))
-    state
-  end
-
-  defp perform({:subscribe, pid}, from, state) do
-    Process.monitor(pid)
-    GenServer.reply(from, :ok)
-    %{state | subscribers: MapSet.put(state.subscribers, pid)}
-  end
-
-  defp perform({:unsubscribe, pid}, from, state) do
-    GenServer.reply(from, :ok)
-    %{state | subscribers: MapSet.delete(state.subscribers, pid)}
-  end
-
-  defp perform(:pause, from, state) do
-    if state.timer_ref do
-      Process.cancel_timer(state.timer_ref)
-    end
-
-    GenServer.reply(from, :ok)
-    %{state | timer_ref: nil}
-  end
-
-  defp perform(:resume, from, state) do
-    GenServer.reply(from, :ok)
-    %{state | timer_ref: Process.send_after(self(), :perform_check, 1000)}
-  end
-
-  defp defer(state, request), do: %{state | deferred: state.deferred ++ [request]}
-
-  # After a check, the requests deferred behind it are taken in order, up to
-  # one that starts the next check.
-  defp run_deferred(%{check: nil, deferred: [{request, from} | deferred]} = state),
-    do: run_deferred(perform(request, from, %{state | deferred: deferred}))
-
-  defp run_deferred(state), do: state
-
-  # A check runs off this loop, so the checker answers get_status/1 and a
-  # stop (a closing transport's) while a check waits on its target.
-  defp start_check(state, request) do
-    task = start_check_task(state.check_fn, state.target)
-
-    check = %{
-      task: task,
-      timer: Process.send_after(self(), {:check_timeout, task.ref}, state.timeout),
-      started: System.monotonic_time(:millisecond),
-      timestamp: DateTime.utc_now(),
-      reply_to: reply_to(request),
-      periodic: request == :periodic
-    }
-
-    %{state | check: check}
-  end
-
-  defp reply_to({:reply, from}), do: from
-  defp reply_to(:periodic), do: nil
-
-  # The check function runs in a process of its own under a watcher task,
-  # which is linked to the checker and traps exits: however the checker goes
-  # down (a stop, a kill, its linker's exit), the watcher kills the check
-  # with it, so a check that traps exits itself can't outlive the checker. A
-  # check that crashes takes the watcher, and so the checker, down with it,
-  # as it did when it was the checker's own task.
-  defp start_check_task(check_fn, target) do
-    Task.async(fn ->
-      Process.flag(:trap_exit, true)
-      watcher = self()
-      callers = [watcher | Process.get(:"$callers", [])]
-
-      {runner, monitor} =
-        spawn_monitor(fn ->
-          Process.put(:"$callers", callers)
-          send(watcher, {:check_result, self(), check_fn.(target)})
-        end)
-
-      await_check(runner, monitor)
-    end)
-  end
-
-  defp await_check(runner, monitor) do
-    receive do
-      {:check_result, ^runner, result} ->
-        Process.demonitor(monitor, [:flush])
-        result
-
-      {:DOWN, ^monitor, :process, ^runner, reason} ->
-        exit(reason)
-
-      {:EXIT, _checker, _reason} ->
-        Process.exit(runner, :kill)
-
-        receive do
-          {:DOWN, ^monitor, :process, ^runner, _reason} -> exit(:shutdown)
-        end
-    end
-  end
-
-  # The watcher answers a shutdown at once, killing the check first.
-  defp stop_check(task), do: Task.shutdown(task, @check_shutdown_ms)
-
-  defp finish_check(%{check: check} = state, {status, details}) do
-    Process.cancel_timer(check.timer)
+    duration_ms = System.monotonic_time(:millisecond) - start_time
 
     result = %{
       status: status,
-      timestamp: check.timestamp,
-      duration_ms: System.monotonic_time(:millisecond) - check.started,
+      timestamp: timestamp,
+      duration_ms: duration_ms,
       details: details
     }
 
-    state = update_health_state(%{state | check: nil}, result)
-    if check.reply_to, do: GenServer.reply(check.reply_to, result)
+    new_state = update_health_state(state, result)
 
-    state =
-      if check.periodic,
-        do: %{
-          state
-          | timer_ref: Process.send_after(self(), :perform_check, state.check_interval)
-        },
-        else: state
-
-    run_deferred(state)
+    {result, new_state}
   end
 
-  defp check_outcome({:ok, {:ok, details}}), do: {:healthy, details}
-  defp check_outcome({:ok, {:error, reason}}), do: {:unhealthy, %{error: reason}}
-  # As reported when the check's result was matched in this loop.
-  defp check_outcome({:ok, other}),
-    do: {:unhealthy, %{error: Exception.format(:error, %CaseClauseError{term: {:ok, other}})}}
+  defp execute_check(check_fn, target, timeout) do
+    task = Task.async(fn -> check_fn.(target) end)
 
-  defp check_outcome({:exit, reason}), do: {:unhealthy, %{error: {:exit, reason}}}
+    case Task.yield(task, timeout) || Task.shutdown(task) do
+      {:ok, {:ok, details}} ->
+        {:healthy, details}
+
+      {:ok, {:error, reason}} ->
+        {:unhealthy, %{error: reason}}
+
+      nil ->
+        {:unhealthy, %{error: :timeout}}
+
+      {:exit, reason} ->
+        {:unhealthy, %{error: {:exit, reason}}}
+    end
+  rescue
+    e ->
+      {:unhealthy, %{error: Exception.format(:error, e)}}
+  end
 
   defp update_health_state(state, result) do
     new_state =

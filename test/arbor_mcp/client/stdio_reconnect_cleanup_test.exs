@@ -190,10 +190,10 @@ defmodule Arbor.MCP.Client.StdioReconnectCleanupTest do
   end
 
   describe "a stuck reliability component" do
-    # Its stop gets at most half of the client's cleanup budget whatever the
-    # wrapped transport, so the server's own stop is still attempted before
-    # the client gives up on the close: stdio carries no deadline of its
-    # own, and the component used to get its full 500 ms.
+    # The wrapper closes the server first and then waits up to 500 ms for
+    # each component, longer than the client's cleanup budget here, so the
+    # client cuts that close off. The client then stops its own components
+    # itself, and the stuck one is killed: it used to outlive the client.
     test "doesn't keep the server from being stopped", %{tmp_dir: tmp_dir} do
       log = Path.join(tmp_dir, "stuck-component.log")
 
@@ -211,20 +211,16 @@ defmodule Arbor.MCP.Client.StdioReconnectCleanupTest do
       stick(breaker)
       breaker_ref = Process.monitor(breaker)
 
-      # The breaker is killed within its share of the budget. Under load the
-      # server's own stop can outlast what is left, and the client then gives
-      # up on confirming it; it was attempted either way.
+      # The wrapper's own wait for the breaker outlasts the budget, so the
+      # client gives up on the close; the server's stop came first.
       assert Client.disconnect(client) in [:ok, {:error, :client_cleanup_timeout}]
 
       assert_receive {:DOWN, ^breaker_ref, :process, ^breaker, :killed}
       TestHelpers.wait_until(fn -> not os_process_alive?(os_pid) end, timeout: 2_000)
     end
 
-    # Waiting past what is left of the budget had the client kill the close
-    # while the breaker's stop still waited: the breaker was never killed,
-    # and it outlived the client. (Whether the server's stop is reached
-    # within 20 ms is up to the scheduler; reliability_wrapper_test checks
-    # the close is called.)
+    # With 20 ms there is no time for a graceful stop at all. (Whether the
+    # server's own stop is reached within 20 ms is up to the scheduler.)
     test "is killed at once when too little of the budget is left to wait",
          %{tmp_dir: tmp_dir} do
       log = Path.join(tmp_dir, "stuck-component-short.log")
