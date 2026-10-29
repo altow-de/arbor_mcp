@@ -114,6 +114,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleanup worker now survives that, and the client still bounds it by its
   cleanup deadline, so the transport closes (a stdio server is stopped, an
   HTTP stream ended) before the client goes, in the same order as before.
+- A `:cache_hints` entry for `server/discover` had no effect: discovery
+  filled in its own `ttlMs` of one hour and `cacheScope` `"public"`, and a
+  result's own fields win over a hint, so a server could not keep a discovery
+  result that differs by caller, its instructions for example, out of shared
+  caches. The hint now sets both; without one, discovery keeps its defaults.
 - `Accept: application/json, text/event-stream;q` — a `q` parameter with no
   value — and `q =1` / `q= 1`, whose whitespace around the equals sign
   violates the weight grammar (RFC 9110 section 12.4.2: optional whitespace
