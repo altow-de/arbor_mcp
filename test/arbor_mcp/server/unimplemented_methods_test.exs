@@ -26,6 +26,10 @@ defmodule Arbor.MCP.Server.UnimplementedMethodsTest do
     @impl true
     def handle_call_tool("echo", _args, state),
       do: {:ok, %{content: [%{type: "text", text: "ok"}]}, state}
+
+    # As a gateway answers when its upstream doesn't implement a method.
+    def handle_call_tool("forwarded", _args, state),
+      do: {:error, Arbor.MCP.Error.protocol_error(-32601, "Method not found: tools/call"), state}
   end
 
   defmodule TaskStore do
@@ -421,13 +425,18 @@ defmodule Arbor.MCP.Server.UnimplementedMethodsTest do
       assert {:ok, %{"tools" => [%{"name" => "echo"}]}} = Client.list_tools(client, format: :map)
     end
 
-    test "a modern client keeps its connection after the 404 over Bandit", %{runtime: runtime} do
+    test "a modern client gets the JSON-RPC error out of the 404 over Bandit", %{runtime: runtime} do
       client = bandit_client(runtime, :modern_only)
 
-      # The client doesn't yet read the JSON-RPC error out of a 404 body; it
-      # reports the HTTP error instead.
-      assert {:error, _not_served} = Client.list_prompts(client, format: :map)
+      assert {:error, %{"code" => -32601, "message" => "Method not found: prompts/list"}} =
+               Client.list_prompts(client, format: :map)
+
+      # A request stream, which a progress token opens, reads it the same way.
+      assert {:error, %{"code" => -32601, "message" => "Method not found: tools/call"}} =
+               Client.call_tool(client, "forwarded", %{}, progress_token: "p", format: :map)
+
       assert {:ok, %{"tools" => [%{"name" => "echo"}]}} = Client.list_tools(client, format: :map)
+      assert {:ok, %{connection_status: :ready}} = Client.status(client)
     end
 
     test "a legacy request keeps 200", %{runtime: runtime, opts: opts} do

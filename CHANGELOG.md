@@ -596,6 +596,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asynchronous requests that the gateway settles in its own loop. Each
   request's later steps still wait for its own answers, so results, batch
   arrays and errors keep their order.
+- Over modern (2026-07-28) Streamable HTTP, the client reported a `404`
+  that carries a JSON-RPC error for the request, which is how the transport
+  says a server doesn't implement a method, as
+  `{:error, %Arbor.MCP.Error.TransportError{reason: {:http_error, 404, body}}}`.
+  It now returns that JSON-RPC error, as it would from a `200`, on both a
+  plain POST and a request stream, and the connection stays `:ready`. Any
+  other `404`, and every legacy one, is still an HTTP error.
 - The deprecated HTTP+SSE GET stream (`legacy_http_sse: true`) sent
   `connection: keep-alive`. HTTP/2 forbids connection-specific header fields
   and its clients treat such a response as malformed (RFC 9113, section

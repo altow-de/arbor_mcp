@@ -257,6 +257,16 @@ The server returns one of these shapes:
   response; or
 - `202 Accepted` with no body for an accepted notification POST.
 
+A method the server doesn't implement, or one behind a capability it doesn't
+advertise, is answered with `404 Not Found` and a JSON-RPC `-32601` error,
+also for a request whose progress token would have opened an event stream,
+as long as nothing has been written to that stream yet. The client returns
+that error as it would one from a `200`, and keeps its connection. A `404`
+without a JSON-RPC error for the request stays an HTTP error.
+A server that advertises a capability but leaves out part of it, such as
+resource templates beside resources, or completion for one prompt argument,
+answers that part with an empty list or completion rather than `-32601`.
+
 A modern result always has `resultType: "complete"` or
 `resultType: "input_required"`. For `input_required`, the client satisfies the
 embedded elicitation, sampling, or roots requests and sends the original
