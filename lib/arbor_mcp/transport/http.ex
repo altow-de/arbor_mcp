@@ -266,7 +266,7 @@ defmodule Arbor.MCP.Transport.HTTP do
     max_retry_delay = Keyword.get(config, :max_retry_delay, 60_000)
 
     # Auth provider: explicit provider tuple, or auto-create from :auth config
-    {auth_provider, auth_provider_state} =
+    provider =
       init_auth_provider(
         Keyword.get(config, :auth_provider),
         auth_config,
@@ -296,8 +296,6 @@ defmodule Arbor.MCP.Transport.HTTP do
       modern_streams: %{},
       auth_config: auth_config,
       max_retry_delay: max_retry_delay,
-      auth_provider: auth_provider,
-      auth_provider_state: auth_provider_state,
       max_response_bytes: max_response_bytes,
       max_stream_buffer_bytes: max_stream_buffer_bytes,
       max_request_bytes: max_request_bytes,
@@ -310,7 +308,9 @@ defmodule Arbor.MCP.Transport.HTTP do
     # Per MCP spec, session ID comes from the server after initialization.
     # SSE is deferred until after the first successful POST (which provides
     # the session ID needed for the GET SSE stream).
-    with :ok <- validate_security(state),
+    with {:ok, {auth_provider, auth_provider_state}} <- provider,
+         state = %{state | auth_provider: auth_provider, auth_provider_state: auth_provider_state},
+         :ok <- validate_security(state),
          :ok <- TargetPolicy.validate_options(network_policy_options(state)) do
       if use_sse do
         Logger.debug("HTTP transport configured with SSE (deferred until after initialization)")
@@ -747,12 +747,8 @@ defmodule Arbor.MCP.Transport.HTTP do
     }
   end
 
-  defp init_auth_provider({mod, provider_config}, _auth_config, _base_url, _endpoint, _version) do
-    case mod.init(provider_config) do
-      {:ok, ps} -> {mod, ps}
-      {:error, _} -> {nil, nil}
-    end
-  end
+  defp init_auth_provider({mod, provider_config}, _auth_config, _base_url, _endpoint, _version),
+    do: start_auth_provider(mod, provider_config)
 
   defp init_auth_provider(nil, auth_config, base_url, endpoint, version)
        when is_map(auth_config) do
@@ -761,11 +757,37 @@ defmodule Arbor.MCP.Transport.HTTP do
       |> Map.put(:resource_url, base_url <> (endpoint || ""))
       |> Map.put(:protocol_version, version)
 
-    {:ok, ps} = OAuth.init(provider_config)
-    {OAuth, ps}
+    start_auth_provider(OAuth, provider_config)
   end
 
-  defp init_auth_provider(nil, _auth_config, _base_url, _endpoint, _version), do: {nil, nil}
+  defp init_auth_provider(nil, _auth_config, _base_url, _endpoint, _version),
+    do: {:ok, {nil, nil}}
+
+  # A configured provider that can't start fails the connection: without it,
+  # every request would go out without the credentials the application set up.
+  # Only an atom reason is kept, because a provider's other reasons, and its
+  # exceptions, may carry its config, secrets included.
+  defp start_auth_provider(mod, provider_config) do
+    case mod.init(provider_config) do
+      {:ok, provider_state} -> {:ok, {mod, provider_state}}
+      {:error, reason} when is_atom(reason) -> auth_provider_failed(mod, reason)
+      {:error, _reason} -> auth_provider_failed(mod, :redacted)
+      _invalid -> auth_provider_failed(mod, :invalid_init_result)
+    end
+  rescue
+    exception -> auth_provider_failed(mod, {:raised, exception.__struct__})
+  catch
+    kind, _reason -> auth_provider_failed(mod, kind)
+  end
+
+  defp auth_provider_failed(mod, reason) do
+    Logger.error(
+      "HTTP auth provider #{inspect(mod)} failed to initialize (#{inspect(reason)}); " <>
+        "not connecting without it"
+    )
+
+    {:error, {:auth_provider_init_failed, mod, reason}}
+  end
 
   # Check if the response is a 401 that we can handle with OAuth
   defp handle_auth_challenge({status_line, headers, _body}, original_body, state) do
