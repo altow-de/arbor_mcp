@@ -188,6 +188,39 @@ defmodule Arbor.MCP.Server.UnimplementedMethodsTest do
       }
     end
 
+    defp bandit_client(runtime, mode) do
+      opts = [runtime: runtime, path: "/mcp", protocol_mode: mode]
+
+      listener =
+        start_supervised!(
+          {Bandit, plug: {HttpPlug, opts}, ip: {127, 0, 0, 1}, port: 0, startup_log: false},
+          id: make_ref()
+        )
+
+      {:ok, {_ip, port}} = ThousandIsland.listener_info(listener)
+
+      {:ok, client} =
+        Client.start_link(
+          transport: :http,
+          url: "http://127.0.0.1:#{port}/mcp",
+          protocol_mode: mode,
+          use_sse: false,
+          security: %{origin: nil},
+          health_check_interval: nil,
+          reconnect: false
+        )
+
+      on_exit(fn ->
+        try do
+          Client.disconnect(client)
+        catch
+          :exit, _reason -> :ok
+        end
+      end)
+
+      client
+    end
+
     defp post(body, headers, opts) do
       headers
       |> Enum.reduce(Plug.Test.conn(:post, "/mcp", Jason.encode!(body)), fn {name, value}, conn ->
@@ -226,47 +259,22 @@ defmodule Arbor.MCP.Server.UnimplementedMethodsTest do
       conn.resp_body |> Jason.decode!() |> assert_method_not_found("prompts/get")
     end
 
-    for mode <- [:legacy_only, :modern_only] do
-      test "a client keeps its connection after the error over Bandit (#{mode})", %{
-        runtime: runtime
-      } do
-        mode = unquote(mode)
-        opts = [runtime: runtime, path: "/mcp", protocol_mode: mode]
+    test "a legacy client gets the JSON-RPC error over Bandit", %{runtime: runtime} do
+      client = bandit_client(runtime, :legacy_only)
 
-        listener =
-          start_supervised!(
-            {Bandit, plug: {HttpPlug, opts}, ip: {127, 0, 0, 1}, port: 0, startup_log: false},
-            id: make_ref()
-          )
+      assert {:error, %{"code" => -32601, "message" => "Method not found: prompts/list"}} =
+               Client.list_prompts(client, format: :map)
 
-        {:ok, {_ip, port}} = ThousandIsland.listener_info(listener)
+      assert {:ok, %{"tools" => [%{"name" => "echo"}]}} = Client.list_tools(client, format: :map)
+    end
 
-        {:ok, client} =
-          Client.start_link(
-            transport: :http,
-            url: "http://127.0.0.1:#{port}/mcp",
-            protocol_mode: mode,
-            use_sse: false,
-            security: %{origin: nil},
-            health_check_interval: nil,
-            reconnect: false
-          )
+    test "a modern client keeps its connection after the 404 over Bandit", %{runtime: runtime} do
+      client = bandit_client(runtime, :modern_only)
 
-        if mode == :legacy_only do
-          assert {:error, %{"code" => -32601, "message" => "Method not found: prompts/list"}} =
-                   Client.list_prompts(client, format: :map)
-        else
-          # The client doesn't yet read the JSON-RPC error out of a 404 body;
-          # it reports the HTTP error instead.
-          assert {:error, _not_served} = Client.list_prompts(client, format: :map)
-        end
-
-        # The connection stays usable.
-        assert {:ok, %{"tools" => [%{"name" => "echo"}]}} =
-                 Client.list_tools(client, format: :map)
-
-        Client.disconnect(client)
-      end
+      # The client doesn't yet read the JSON-RPC error out of a 404 body; it
+      # reports the HTTP error instead.
+      assert {:error, _not_served} = Client.list_prompts(client, format: :map)
+      assert {:ok, %{"tools" => [%{"name" => "echo"}]}} = Client.list_tools(client, format: :map)
     end
 
     test "a legacy request keeps 200", %{runtime: runtime, opts: opts} do
