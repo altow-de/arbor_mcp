@@ -49,6 +49,7 @@ defmodule Arbor.MCP.Client do
     Deadline,
     Diagnostics,
     EraCache,
+    HTTPAuth,
     Lifetime,
     NotificationListener,
     Pagination,
@@ -115,6 +116,8 @@ defmodule Arbor.MCP.Client do
     # Monitor refs of in-flight async POST tasks (Streamable HTTP transport),
     # mapped to the request id each task serves.
     async_post_tasks: %{},
+    # One inline OAuth worker, with independently bounded stream/POST waiters.
+    http_auth: %HTTPAuth{},
     # Progress tokens of pending requests, mapped to their request ids, so a
     # connection-level notifications/progress reaches the request it reports on.
     progress_requests: %{},
@@ -1970,21 +1973,62 @@ defmodule Arbor.MCP.Client do
     result
   end
 
-  # One of this client's legacy POST tasks got a 401 or 403, as a modern
-  # request stream can: answered here, in turn with every other challenge,
-  # and the task sends its request again with the token.
+  # A rejection is reported before any auth challenge or terminal response,
+  # including when the sender has already used its last authenticated retry.
+  def handle_info(
+        {:http_credential_rejected, kind, pid, request_id, generation},
+        %{transport_mod: HTTP, transport_state: %HTTP{} = transport} = state
+      ) do
+    owned? =
+      case kind do
+        :post ->
+          Enum.any?(state.async_post_tasks, fn {_ref, entry} -> entry == {pid, request_id} end)
+
+        :stream ->
+          HTTP.stream_owner?(transport, request_id, pid)
+
+        _other ->
+          false
+      end
+
+    if owned?,
+      do:
+        {:noreply,
+         HTTPAuth.reject_token(state, %{status: 401, credential_generation: generation})},
+      else: {:noreply, state}
+  end
+
+  # One of this client's POST tasks got a 401 or 403, as a modern request
+  # stream can: answered here, in turn with every other challenge, and the
+  # task sends its request again with the token, so no request is re-sent
+  # from this process.
   def handle_info(
         {:http_post_auth_challenge, task, ref, challenge},
-        %{transport_mod: HTTP, transport_state: %HTTP{} = transport_state} = state
+        %{transport_mod: HTTP, transport_state: %HTTP{}} = state
       )
       when is_pid(task) and is_map(challenge) do
-    if own_post_task?(state, task) do
-      {result, transport_state} = answer_stream_challenge(transport_state, challenge)
-      send(task, {:http_post_auth_result, ref, result})
-      {:noreply, %{state | transport_state: transport_state}}
-    else
-      send(task, {:http_post_auth_result, ref, {:error, :stream_retired}})
-      {:noreply, state}
+    owned =
+      Enum.find_value(state.async_post_tasks, fn
+        {_monitor, {^task, id}} -> {:owned, id}
+        _other -> nil
+      end)
+
+    case owned do
+      {:owned, request_id} ->
+        # Even a cancelled POST can report that the shared token was rejected.
+        # It must not start auth, but future requests must stop using that token.
+        state = HTTPAuth.reject_token(state, challenge)
+
+        if HTTPAuth.request_alive?(state, request_id) do
+          {:noreply, handle_auth_challenge(state, :post, task, request_id, ref, challenge)}
+        else
+          send(task, {:http_post_auth_result, ref, {:error, :stream_retired}})
+          {:noreply, state}
+        end
+
+      nil ->
+        send(task, {:http_post_auth_result, ref, {:error, :stream_retired}})
+        {:noreply, state}
     end
   end
 
@@ -2001,14 +2045,35 @@ defmodule Arbor.MCP.Client do
       )
       when is_map(challenge) do
     if HTTP.stream_owner?(transport_state, request_id, stream_pid) do
-      {result, transport_state} = answer_stream_challenge(transport_state, challenge)
-      send(stream_pid, {:modern_http_stream_auth_result, ref, result})
-      {:noreply, %{state | transport_state: transport_state}}
+      state = HTTPAuth.reject_token(state, challenge)
+      {:noreply, handle_auth_challenge(state, :stream, stream_pid, request_id, ref, challenge)}
     else
       send(stream_pid, {:modern_http_stream_auth_result, ref, {:error, :stream_retired}})
       {:noreply, state}
     end
   end
+
+  def handle_info({:http_inline_auth_result, pid, id, result}, state),
+    do: {:noreply, HTTPAuth.result(state, pid, id, result)}
+
+  def handle_info({:http_auth_waiter_timeout, ref}, state),
+    do: {:noreply, HTTPAuth.waiter_timeout(state, ref)}
+
+  def handle_info({:http_auth_worker_timeout, id, deadline}, state),
+    do: {:noreply, HTTPAuth.worker_timeout(state, id, deadline)}
+
+  def handle_info(
+        {:DOWN, ref, :process, _pid, _reason},
+        %{http_auth: %{worker: %{monitor: ref}}} = state
+      ),
+      do: {:noreply, HTTPAuth.down(state, ref)}
+
+  def handle_info(
+        {:DOWN, ref, :process, _pid, _reason},
+        %{http_auth: %{monitors: monitors}} = state
+      )
+      when is_map_key(monitors, ref),
+      do: {:noreply, HTTPAuth.down(state, ref)}
 
   def handle_info(
         {:modern_http_stream_finished, stream_pid, request_id},
@@ -2615,19 +2680,6 @@ defmodule Arbor.MCP.Client do
     {:noreply, state}
   end
 
-  # The server asked the task's POST to authenticate. Re-sending from this
-  # process runs at most one authentication at a time, and later challenges
-  # reuse the credentials it obtained. A POST that carried no request (a
-  # notification, a batch, a reply to a server request) is re-sent too; a
-  # request whose caller has given up is not.
-  defp handle_async_post_result({:error, {:reauthenticate, message}}, meta, state) do
-    request_id = Map.get(meta, :request_id)
-
-    if is_nil(request_id) or Map.has_key?(state.pending_requests, request_id),
-      do: resend_authenticated(message, meta, state),
-      else: {:noreply, state}
-  end
-
   # The caller receives the failure, as from a synchronous send, so it is not
   # logged as an error here.
   defp handle_async_post_result({:error, reason}, meta, state) do
@@ -2635,30 +2687,6 @@ defmodule Arbor.MCP.Client do
 
     {:noreply,
      fail_async_post_request(state, Map.get(meta, :request_id), reason, Map.get(meta, :deadline))}
-  end
-
-  defp resend_authenticated(message, meta, state) do
-    request_id = Map.get(meta, :request_id)
-    deadline = Map.get(meta, :deadline)
-    previous = Deadline.on_transport(HTTP, state.transport_state)
-    transport = Deadline.put_on_transport(HTTP, state.transport_state, deadline)
-    restore = &%{state | transport_state: Deadline.put_on_transport(HTTP, &1, previous)}
-
-    case HTTP.send_authenticated(message, transport) do
-      {:ok, transport, response_data} ->
-        RequestHandler.handle_post_response(response_data, request_id, restore.(transport))
-
-      {:ok, transport} ->
-        {:noreply, restore.(transport)}
-
-      {:error, reason, transport} ->
-        Logger.debug("Authenticated resend failed", reason: LogSummary.describe(reason))
-        {:noreply, fail_async_post_request(restore.(transport), request_id, reason, deadline)}
-
-      {:error, reason} ->
-        Logger.debug("Authenticated resend failed", reason: LogSummary.describe(reason))
-        {:noreply, fail_async_post_request(state, request_id, reason, deadline)}
-    end
   end
 
   defp cache_tool_list(
@@ -2690,41 +2718,44 @@ defmodule Arbor.MCP.Client do
     end
   end
 
-  defp own_post_task?(state, task) do
-    Enum.any?(state.async_post_tasks || %{}, fn
-      {_ref, {pid, _request_id}} -> pid == task
-      _other -> false
-    end)
+  defp handle_auth_challenge(
+         %{transport_state: %HTTP{auth_provider: nil}} = state,
+         kind,
+         pid,
+         id,
+         ref,
+         challenge
+       ) do
+    HTTPAuth.challenge(state, kind, pid, id, ref, challenge)
   end
 
-  defp answer_stream_challenge(%HTTP{access_token: current} = transport_state, challenge)
-       when is_binary(current) and current != :erlang.map_get(:token, challenge) do
-    # Another stream replaced the rejected token. That answers a 401; a 403
-    # needs the challenged scopes, which a refresh alone doesn't add.
-    if challenge.status == 401 or
-         scopes_granted?(transport_state.auth_provider_state, challenge.scopes),
-       do: {{:ok, current}, transport_state},
-       else: run_stream_challenge(transport_state, challenge)
+  defp handle_auth_challenge(state, kind, pid, id, ref, challenge) do
+    {result, transport} = answer_stream_challenge(state.transport_state, challenge)
+    HTTPAuth.reply(%{kind: kind, pid: pid, request_id: id, ref: ref}, result, transport)
+    %{state | transport_state: transport}
   end
 
-  defp answer_stream_challenge(%HTTP{auth_provider: nil} = transport_state, _challenge),
-    do: {{:error, :no_auth_provider}, transport_state}
-
-  defp answer_stream_challenge(transport_state, challenge),
-    do: run_stream_challenge(transport_state, challenge)
-
-  defp scopes_granted?(%{granted_scopes: granted}, [_ | _] = scopes) when is_list(granted),
-    do: Enum.all?(scopes, &(&1 in granted))
-
-  defp scopes_granted?(_provider_state, _scopes), do: false
+  defp answer_stream_challenge(transport, challenge) do
+    case HTTPAuth.cached_token(transport, challenge) do
+      token when is_binary(token) -> {{:ok, token}, transport}
+      nil -> run_stream_challenge(transport, challenge)
+    end
+  end
 
   defp run_stream_challenge(%HTTP{auth_provider: provider} = transport_state, challenge) do
+    # Provider callbacks remain serialized in the client. Provider-less flows
+    # use HTTPAuth's monitored worker so discovery cannot hold this loop.
     callback = if challenge.status == 401, do: :handle_unauthorized, else: :handle_forbidden
     args = [challenge.www_authenticate, challenge.scopes, transport_state.auth_provider_state]
 
     case apply(provider, callback, args) do
       {:ok, token, provider_state} when is_binary(token) ->
-        changes = %{access_token: token, auth_provider_state: provider_state}
+        changes = %{
+          access_token: token,
+          credential_generation: System.unique_integer([:positive, :monotonic]),
+          auth_provider_state: provider_state
+        }
+
         {{:ok, token}, merge_modern_stream_auth_state(transport_state, changes)}
 
       {:error, reason, provider_state} ->
@@ -2748,6 +2779,7 @@ defmodule Arbor.MCP.Client do
         %{
           transport_state
           | access_token: token,
+            credential_generation: Map.fetch!(changes, :credential_generation),
             auth_provider_state: provider_state,
             headers: headers
         }
@@ -2795,6 +2827,8 @@ defmodule Arbor.MCP.Client do
   # request's connection. Other transports send the protocol cancellation
   # notification.
   defp cancel_on_wire(request_id, method, params, state) do
+    state = HTTPAuth.cancel_request(state, request_id)
+
     case state do
       %{transport_mod: HTTP, transport_state: %HTTP{protocol_era: :modern}} ->
         RequestHandler.close_request_stream(request_id, state)
@@ -3010,7 +3044,7 @@ defmodule Arbor.MCP.Client do
       GenServer.reply(from, {:error, :client_disconnected})
     end)
 
-    %{state | server_request_tasks: %{}, mrtr_tasks: %{}}
+    HTTPAuth.retire(%{state | server_request_tasks: %{}, mrtr_tasks: %{}})
   end
 
   defp terminal_cleanup({:cleanup_failed, _reason, {:error, _} = result}), do: result
@@ -3572,10 +3606,35 @@ defmodule Arbor.MCP.Client do
     %{state | health_check_id: nil, health_check_ref: nil}
   end
 
-  defp send_health_ping(state) do
+  defp send_health_ping(
+         %{
+           transport_mod: HTTP,
+           transport_state: %HTTP{} = transport,
+           health_check_interval: interval
+         } = state
+       )
+       when is_integer(interval) and interval > 0 do
+    deadline = Deadline.earliest(transport.deadline, Deadline.after_ms(interval))
+
+    state =
+      do_send_health_ping(%{state | transport_state: HTTP.put_deadline(transport, deadline)})
+
+    %{state | transport_state: HTTP.put_deadline(state.transport_state, transport.deadline)}
+  end
+
+  defp send_health_ping(state), do: do_send_health_ping(state)
+
+  defp do_send_health_ping(state) do
     case RequestHandler.send_ping(state) do
       {:ok, request_id, new_state} ->
         %{new_state | health_check_id: request_id}
+
+      {:error, reason, new_state} ->
+        Logger.debug("MCP health check ping could not be sent",
+          reason: LogSummary.describe(reason)
+        )
+
+        %{new_state | health_check_id: nil}
 
       {:error, reason} ->
         Logger.debug("MCP health check ping could not be sent",

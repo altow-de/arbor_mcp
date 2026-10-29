@@ -7,7 +7,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
   """
 
   require Logger
-  alias Arbor.MCP.Client.{ConnectionScope, Lifetime}
+  alias Arbor.MCP.Client.{ConnectionScope, HTTPAuth, Lifetime}
   alias Arbor.MCP.Client.{Deadline, InputDispatcher, MRTR, NotificationListener, ResponseCache}
   alias Arbor.MCP.Error
   alias Arbor.MCP.Internal.{Maps, Protocol, RequestParams, VersionRegistry}
@@ -153,6 +153,10 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
             {:error, reason} ->
               {:reply, {:error, reason}, state}
+
+            {:error, reason, updated_state} ->
+              error = if HTTPAuth.refused?(reason), do: {:stream_error, reason}, else: reason
+              {:reply, {:error, error}, updated_state}
           end
 
         {:error, reason} ->
@@ -220,7 +224,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
   defp retryable_subscription_stream_close?(:invalid_stream_message), do: false
   defp retryable_subscription_stream_close?(:response_id_mismatch), do: false
   defp retryable_subscription_stream_close?(:final_response_required), do: false
-  defp retryable_subscription_stream_close?(_reason), do: true
+  defp retryable_subscription_stream_close?(reason), do: not HTTPAuth.refused?(reason)
 
   defp send_built_request(method, params, id, from, state, timeout_meta) do
     case build_request(method, params, id, state) do
@@ -244,10 +248,9 @@ defmodule Arbor.MCP.Client.RequestHandler do
            transport_state: %HTTP{protocol_era: :modern} = transport_state
          } = state
        ) do
-    with {:ok, encoded} <- encode_for_transport(HTTP, request),
-         {:ok, transport_state} <-
-           HTTP.open_stream(encoded, transport_state, self(), stream_kind: :subscription) do
-      {:ok, %{state | transport_state: transport_state}}
+    with {:ok, encoded} <- encode_for_transport(HTTP, request) do
+      HTTP.open_stream(encoded, transport_state, self(), stream_kind: :subscription)
+      |> transport_result(state)
     end
   end
 
@@ -331,13 +334,17 @@ defmodule Arbor.MCP.Client.RequestHandler do
         {:reply, {:error, not_sent_error(:caller_gone, state)}, state}
 
       {:error, reason} ->
-        if Deadline.expired?(deadline) do
-          # The caller's own timeout: it may already have reported one.
-          {:reply, {:error, :timeout}, state}
-        else
-          {:reply, {:error, send_failure(reason, state)}, state}
-        end
+        request_send_error(reason, state, deadline)
+
+      {:error, reason, updated_state} ->
+        request_send_error(reason, updated_state, deadline)
     end
+  end
+
+  defp request_send_error(reason, state, deadline) do
+    if Deadline.expired?(deadline),
+      do: {:reply, {:error, :timeout}, state},
+      else: {:reply, {:error, send_failure(reason, state)}, state}
   end
 
   defp request_send_context(from, state, meta) do
@@ -548,6 +555,9 @@ defmodule Arbor.MCP.Client.RequestHandler do
       {:ok, updated_state} ->
         {:ok, put_transport_deadline(updated_state, previous)}
 
+      {:error, reason, updated_state} ->
+        {:error, reason, put_transport_deadline(updated_state, previous)}
+
       error ->
         error
     end
@@ -588,17 +598,15 @@ defmodule Arbor.MCP.Client.RequestHandler do
   # Each request POSTs from its own task, so one slow request does not hold
   # the client: other requests and server messages proceed meanwhile.
   defp send_http_request(request, state) do
-    with {:ok, encoded} <- encode_for_transport(HTTP, request),
-         {:ok, transport_state} <- HTTP.send_async(encoded, state.transport_state) do
-      {:ok, %{state | transport_state: transport_state}}
+    with {:ok, encoded} <- encode_for_transport(HTTP, request) do
+      HTTP.send_async(encoded, state.transport_state) |> transport_result(state)
     end
   end
 
   defp open_request_stream(request, state, transport_state) do
-    with {:ok, encoded} <- encode_for_transport(HTTP, request),
-         {:ok, transport_state} <-
-           HTTP.open_stream(encoded, transport_state, self(), stream_kind: :request) do
-      {:ok, %{state | transport_state: transport_state}}
+    with {:ok, encoded} <- encode_for_transport(HTTP, request) do
+      HTTP.open_stream(encoded, transport_state, self(), stream_kind: :request)
+      |> transport_result(state)
     end
   end
 
@@ -774,15 +782,18 @@ defmodule Arbor.MCP.Client.RequestHandler do
         {:noreply, new_state}
 
       {:error, reason} ->
-        response =
-          {:error,
-           %{
-             type: :transport_error,
-             message: "Failed to send batch request: #{inspect(reason)}"
-           }}
+        batch_send_error(reason, state)
 
-        {:reply, response, state}
+      {:error, reason, updated_state} ->
+        batch_send_error(reason, updated_state)
     end
+  end
+
+  defp batch_send_error(reason, state) do
+    {:reply,
+     {:error,
+      %{type: :transport_error, message: "Failed to send batch request: #{inspect(reason)}"}},
+     state}
   end
 
   defp send_batch(requests, batch_id, from, %{transport_mod: LegacySSE} = state, meta) do
@@ -807,7 +818,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
     connection is already proven alive
   - `{:error, reason}` - the ping could not be sent
   """
-  @spec send_ping(map()) :: {:ok, term() | nil, map()} | {:error, any()}
+  @spec send_ping(map()) :: {:ok, term() | nil, map()} | {:error, any()} | {:error, any(), map()}
   def send_ping(state) do
     id = Protocol.generate_id()
 
@@ -815,13 +826,19 @@ defmodule Arbor.MCP.Client.RequestHandler do
       if VersionRegistry.modern?(state.protocol_version), do: "server/discover", else: "ping"
 
     with {:ok, request} <- build_request(method, %{}, id, state) do
-      case send_message(request, state) do
+      case send_health_request(request, state) do
         {:ok, updated_state, _response_data} -> {:ok, nil, updated_state}
         {:ok, updated_state} -> {:ok, id, updated_state}
         {:error, reason} -> {:error, reason}
+        {:error, reason, updated_state} -> {:error, reason, updated_state}
       end
     end
   end
+
+  defp send_health_request(request, %{transport_mod: HTTP, transport_state: %HTTP{}} = state),
+    do: send_http_request(request, state)
+
+  defp send_health_request(request, state), do: send_message(request, state)
 
   @doc """
   Parses a message from the transport.
@@ -957,6 +974,12 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
   def close_request_stream(_request_id, state), do: state
 
+  defp request_stream_error({:auth_refused, _reason} = refusal),
+    do: send_error(refusal, %{transport_mod: HTTP})
+
+  defp request_stream_error({:oauth_failed, _reason} = reason),
+    do: send_error(reason, %{transport_mod: HTTP})
+
   defp request_stream_error(reason) do
     if ambiguous_stream_break?(reason) do
       %Error.TransportError{
@@ -984,7 +1007,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
             ],
        do: false
 
-  defp ambiguous_stream_break?(_reason), do: true
+  defp ambiguous_stream_break?(reason), do: not HTTPAuth.refused?(reason)
 
   @doc """
   Handles a batch of responses from the transport.
@@ -1008,9 +1031,10 @@ defmodule Arbor.MCP.Client.RequestHandler do
   def handle_post_response(response_data, request_id, state) do
     case Protocol.parse_message(response_data) do
       {kind, payload, _echoed_id} when kind in [:result, :error] ->
-        if pending_single?(state.pending_requests, request_id),
-          do: handle_single_response({kind, payload, request_id}, state),
-          else: {:noreply, state}
+        if pending_single?(state.pending_requests, request_id) or
+             Map.get(state, :health_check_id) == request_id,
+           do: handle_single_response({kind, payload, request_id}, state),
+           else: {:noreply, state}
 
       _other ->
         parse_transport_message(response_data, state)
@@ -1439,6 +1463,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
          {:ok, state} <- send_http_request(notification, state) do
       state
     else
+      {:error, _reason, updated_state} -> updated_state
       _not_sent -> state
     end
   end
@@ -1472,12 +1497,16 @@ defmodule Arbor.MCP.Client.RequestHandler do
         {:noreply, state}
 
       {:error, reason} ->
-        Logger.error("Failed to send notification",
-          reason_shape: LogSummary.describe(reason)
-        )
+        notification_send_error(reason, state)
 
-        {:noreply, state}
+      {:error, reason, updated_state} ->
+        notification_send_error(reason, updated_state)
     end
+  end
+
+  defp notification_send_error(reason, state) do
+    Logger.error("Failed to send notification", reason_shape: LogSummary.describe(reason))
+    {:noreply, state}
   end
 
   @doc """
@@ -1491,21 +1520,26 @@ defmodule Arbor.MCP.Client.RequestHandler do
       {:error, :not_connected}
     else
       with {:ok, outbound_message} <- encode_for_transport(transport_mod, message) do
-        case transport_mod.send_message(outbound_message, transport_state) do
-          {:ok, new_transport_state, response_data} ->
-            # Non-SSE HTTP returns response immediately
-            {:ok, %{state | transport_state: new_transport_state}, response_data}
-
-          {:ok, new_transport_state} ->
-            # SSE and other streaming transports return 2-tuple
-            {:ok, %{state | transport_state: new_transport_state}}
-
-          {:error, reason} ->
-            {:error, reason}
-        end
+        Arbor.MCP.Transport.send_message_with_state(
+          transport_mod,
+          outbound_message,
+          transport_state
+        )
+        |> transport_result(state)
       end
     end
   end
+
+  defp transport_result({:ok, transport, response}, state),
+    do: {:ok, %{state | transport_state: transport}, response}
+
+  defp transport_result({:ok, transport}, state),
+    do: {:ok, %{state | transport_state: transport}}
+
+  defp transport_result({:error, reason, transport}, state),
+    do: {:error, reason, %{state | transport_state: transport}}
+
+  defp transport_result(result, _state), do: result
 
   defp encode_for_transport(Arbor.MCP.Transport.Local, message), do: {:ok, message}
   defp encode_for_transport(_transport_mod, message), do: Protocol.encode_to_string(message)
@@ -2350,11 +2384,15 @@ defmodule Arbor.MCP.Client.RequestHandler do
         end
 
       {:error, reason} ->
-        Logger.error("Failed to send response to server",
-          reason_shape: LogSummary.describe(reason)
-        )
+        response_send_error(reason, state)
 
-        {:noreply, state}
+      {:error, reason, updated_state} ->
+        response_send_error(reason, updated_state)
     end
+  end
+
+  defp response_send_error(reason, state) do
+    Logger.error("Failed to send response to server", reason_shape: LogSummary.describe(reason))
+    {:noreply, state}
   end
 end
