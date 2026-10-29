@@ -178,14 +178,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   well as the `handle_create_message/2` default. Over modern (2026-07-28)
   Streamable HTTP the error goes out with HTTP `404`, as the transport
   specification requires and as for an unknown method; legacy HTTP keeps
-  `200`. `resources/read` and `prompts/get` had answered "Resource not found"
-  and "Prompt not found" (`-32602`); they still do for a name that none of
-  the entries added with `Arbor.MCP.Server.add_resource/3`,
-  `add_resource_template/3` or `add_prompt/3` has, and registered entries are
-  still listed. A callback that calls `super` now gets an
+  `200`. A callback that calls `super` now gets an
   `Arbor.MCP.Error.ProtocolError` with code `-32601` instead of a string. A
   method whose capability the server doesn't advertise is still dispatched,
   so a handler that serves one without advertising it keeps working.
+- A server that serves a capability now answers the parts of it a handler
+  leaves out as the TypeScript SDK does, instead of with an error: an empty
+  `resources/list`, `resources/templates/list` or `prompts/list` (plus any
+  entries added with `Arbor.MCP.Server.add_resource/3` and its siblings), a
+  `completion/complete` with no values, and "Resource not found" or "Prompt
+  not found" (`-32602`) from `resources/read` or `prompts/get` for an
+  unknown name. So a DSL module with resources but no templates lists no
+  templates, one with only templates lists no resources, and a DSL prompt
+  argument without `complete:` completes to nothing; before, each answered
+  `-32000`. The server serves a capability when `server/discover`
+  advertises it: through the DSL, added entries, or the handler's own
+  `__server_capabilities__/0`.
 
 ### Fixed
 

@@ -86,7 +86,8 @@ defmodule Arbor.MCP.Server.UnimplementedMethodsTest do
   defp dispatch(request, handler \\ ToolsOnly) do
     {:ok, state} = handler.init([])
     assert {:response, response, ^state} = Dispatch.dispatch(request, handler, state, [])
-    response
+    # As the client would read it.
+    response |> Jason.encode!() |> Jason.decode!()
   end
 
   defp assert_method_not_found(response, method) do
@@ -171,10 +172,146 @@ defmodule Arbor.MCP.Server.UnimplementedMethodsTest do
         assert {:error, %{"code" => -32602, "message" => "Prompt not found: other"}} =
                  Client.get_prompt(client, "other", %{}, format: :map)
 
-        # Templates are a list of their own, which nothing serves yet.
-        assert {:error, %{"code" => -32601}} =
+        # The server now serves resources, so a list nothing fills is empty.
+        assert {:ok, %{"resourceTemplates" => []}} =
                  Client.list_resource_templates(client, format: :map)
       end
+
+      test "a registered template alone serves an empty resources/list (#{mode})" do
+        {server, client} = start_client(unquote(mode))
+        assert {:error, %{"code" => -32601}} = Client.list_resources(client, format: :map)
+
+        :ok =
+          Server.add_resource_template(
+            server,
+            %{uriTemplate: "mem://users/{id}", name: "user"},
+            fn uri, _vars -> {:ok, %{uri: uri, text: "u"}} end
+          )
+
+        assert {:ok, %{"resources" => []}} = Client.list_resources(client, format: :map)
+
+        assert {:ok, %{"resourceTemplates" => [%{"uriTemplate" => "mem://users/{id}"}]}} =
+                 Client.list_resource_templates(client, format: :map)
+      end
+    end
+  end
+
+  # A server that serves a capability answers the parts of it a handler
+  # leaves out as the TypeScript SDK's McpServer does: an empty list or
+  # completion, not -32601.
+  describe "served capabilities" do
+    defmodule Scaffold do
+      @moduledoc false
+      use Arbor.MCP.Server.Handler
+      use Arbor.MCP.Server.DSL, name: "scaffold", version: "1"
+
+      prompt "scaffold", "Scaffold a project" do
+        arg(:language, complete: ["elixir", "erlang"])
+        arg(:name)
+        render(fn args, state -> {:ok, "Scaffold #{args.name}", state} end)
+      end
+
+      resource "config://app", "Application configuration" do
+        read(fn %{uri: uri}, state -> {:ok, %{uri: uri, text: "{}"}, state} end)
+      end
+    end
+
+    defmodule TemplatesOnly do
+      @moduledoc false
+      use Arbor.MCP.Server.Handler
+      use Arbor.MCP.Server.DSL, name: "templates", version: "1"
+
+      resource_template "file:///{path}", "File contents" do
+        param(:path, :string)
+        read(fn %{path: path}, state -> {:ok, "contents for #{path}", state} end)
+      end
+    end
+
+    # Declares resources itself and serves only their list.
+    defmodule DeclaredResources do
+      @moduledoc false
+      use Arbor.MCP.Server.Handler
+
+      def __server_capabilities__, do: %{resources: %{}}
+
+      @impl true
+      def handle_list_resources(_cursor, state),
+        do: {:ok, [%{uri: "mem://a", name: "a"}], nil, state}
+    end
+
+    defp complete(argument, value) do
+      request("completion/complete", %{
+        "ref" => %{"type" => "ref/prompt", "name" => "scaffold"},
+        "argument" => %{"name" => argument, "value" => value}
+      })
+    end
+
+    test "an argument without a completer completes to nothing" do
+      assert %{"result" => %{"completion" => %{"values" => [], "hasMore" => false}}} =
+               "name" |> complete("my") |> dispatch(Scaffold)
+
+      assert %{"result" => %{"completion" => %{"values" => ["elixir", "erlang"]}}} =
+               "language" |> complete("e") |> dispatch(Scaffold)
+
+      assert %{"result" => %{"resultType" => "complete", "completion" => %{"values" => []}}} =
+               "completion/complete"
+               |> modern(%{
+                 "ref" => %{"type" => "ref/prompt", "name" => "scaffold"},
+                 "argument" => %{"name" => "name", "value" => "my"}
+               })
+               |> dispatch(Scaffold)
+    end
+
+    test "resources without templates list no templates, and templates no resources" do
+      for request <- [
+            request("resources/templates/list", %{}),
+            modern("resources/templates/list", %{})
+          ] do
+        assert %{"result" => %{"resourceTemplates" => []}} = dispatch(request, Scaffold)
+      end
+
+      for request <- [request("resources/list", %{}), modern("resources/list", %{})] do
+        assert %{"result" => %{"resources" => []}} = dispatch(request, TemplatesOnly)
+      end
+
+      assert %{"result" => %{"resourceTemplates" => []}} =
+               "resources/templates/list" |> request(%{}) |> dispatch(DeclaredResources)
+
+      assert %{"error" => %{"code" => -32602, "message" => "Resource not found: mem://b"}} =
+               "resources/read" |> request(%{"uri" => "mem://b"}) |> dispatch(DeclaredResources)
+    end
+
+    test "a capability the server doesn't serve stays -32601" do
+      # Scaffold serves prompts, resources and completions, but no tasks.
+      "tasks/get"
+      |> request(%{"taskId" => "t"})
+      |> dispatch(Scaffold)
+      |> assert_method_not_found("tasks/get")
+
+      # TemplatesOnly serves no prompts.
+      "prompts/list"
+      |> request(%{})
+      |> dispatch(TemplatesOnly)
+      |> assert_method_not_found("prompts/list")
+    end
+
+    test "the MessageProcessor path answers the same" do
+      conn =
+        "resources/templates/list"
+        |> modern(%{})
+        |> MessageProcessor.new()
+        |> MessageProcessor.process(%{handler: Scaffold})
+
+      refute Map.has_key?(conn.assigns, :http_status)
+      assert %{"result" => %{"resourceTemplates" => []}} = conn.response
+
+      conn =
+        "name"
+        |> complete("my")
+        |> MessageProcessor.new()
+        |> MessageProcessor.process(%{handler: Scaffold})
+
+      assert %{"result" => %{"completion" => %{"values" => []}}} = conn.response
     end
   end
 

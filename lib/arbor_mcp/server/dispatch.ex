@@ -398,12 +398,7 @@ defmodule Arbor.MCP.Server.Dispatch do
       :error ->
         ctx
         |> call(:handle_read_resource, [uri, state], "Read resource error", state, on_ok: on_ok)
-        |> unless_registered(ctx, [:resource, :resource_template], fn ->
-          Error.protocol_error(
-            ErrorCodes.resource_not_found(:modern),
-            "Resource not found: #{uri}"
-          )
-        end)
+        |> unless_served(ctx)
     end
   end
 
@@ -443,9 +438,7 @@ defmodule Arbor.MCP.Server.Dispatch do
       :error ->
         ctx
         |> call(:handle_get_prompt, [name, arguments, state], "Get prompt error", state)
-        |> unless_registered(ctx, [:prompt], fn ->
-          Error.protocol_error(ErrorCodes.invalid_params(), "Prompt not found: #{name}")
-        end)
+        |> unless_served(ctx)
     end
   end
 
@@ -455,12 +448,15 @@ defmodule Arbor.MCP.Server.Dispatch do
     ref = Map.get(ctx.params, "ref")
     argument = Map.get(ctx.params, "argument")
 
-    if exported?(ctx.module, :handle_complete, 4) do
-      context = Map.get(ctx.params, "context") || %{}
-      call(ctx, :handle_complete, [ref, argument, context, state], "Completion error", state)
-    else
-      call(ctx, :handle_complete, [ref, argument, state], "Completion error", state)
-    end
+    result =
+      if exported?(ctx.module, :handle_complete, 4) do
+        context = Map.get(ctx.params, "context") || %{}
+        call(ctx, :handle_complete, [ref, argument, context, state], "Completion error", state)
+      else
+        call(ctx, :handle_complete, [ref, argument, state], "Completion error", state)
+      end
+
+    unless_served(result, ctx)
   end
 
   defp do_dispatch("logging/setLevel", ctx, state) do
@@ -648,23 +644,25 @@ defmodule Arbor.MCP.Server.Dispatch do
   defp list_error(ctx, label, reason, state, _unimplemented),
     do: {:response, error_response(ctx.id, label, reason), state}
 
-  # resources/read and prompts/get for a name the registry doesn't hold. When
-  # the handler doesn't serve the method but the registry holds entries of
-  # its kind, the server does serve it, so the name is not found.
-  defp unless_registered(
+  # A method the handler doesn't serve, within a capability the server does
+  # serve: through the DSL, entries added at runtime or its own declaration.
+  # Like the TypeScript SDK, the server then answers an empty completion, or
+  # not-found for a name, rather than -32601 (see ResultNormalizer).
+  defp unless_served(
          {:response, %{"error" => %{"code" => @method_not_found}}, state} = result,
-         ctx,
-         kinds,
-         not_found
+         ctx
        ) do
-    registry = Registry.current()
-
-    if Enum.any?(kinds, &Registry.any?(registry, &1)),
-      do: {:response, JSONRPC.error(ctx.id, Error.to_json_rpc(not_found.())), state},
-      else: result
+    case ResultNormalizer.served_capability_answer(ctx.method, ctx.params, served(ctx)) do
+      {:ok, answer} -> {:response, JSONRPC.response(ctx.id, answer), state}
+      {:error, error} -> {:response, JSONRPC.error(ctx.id, Error.to_json_rpc(error)), state}
+      nil -> result
+    end
   end
 
-  defp unless_registered(result, _ctx, _kinds, _not_found), do: result
+  defp unless_served(result, _ctx), do: result
+
+  # What the server advertises, as server/discover reports it.
+  defp served(ctx), do: ctx.module |> handler_capabilities() |> with_registered_capabilities()
 
   defp cursor(ctx), do: Map.get(ctx.params, "cursor")
 
@@ -931,7 +929,9 @@ defmodule Arbor.MCP.Server.Dispatch do
   defp registered_list(ctx, fun, args, key, label, state, kind) do
     case Registry.entries(Registry.current(), kind) do
       [] ->
-        paginated(ctx, fun, args, key, label, state)
+        # A list the handler doesn't serve, within a capability the server
+        # serves, is empty.
+        ctx |> paginated(fun, args, key, label, state) |> unless_served(ctx)
 
       entries ->
         # A handler that doesn't serve this list lists only the registered

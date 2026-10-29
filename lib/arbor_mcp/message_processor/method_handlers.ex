@@ -638,22 +638,18 @@ defmodule Arbor.MCP.MessageProcessor.MethodHandlers do
   # Error details are logged, never embedded in the JSON-RPC response: the
   # `data.type` field carries a stable, machine-readable classification
   # instead of `inspect(reason)` output (audit M12).
-  defp put_error(conn, _message, %Error.ProtocolError{} = error, id) do
-    conn =
-      cond do
-        error.code == ErrorCodes.missing_required_client_capability() ->
-          Conn.assign(conn, :http_status, 400)
+  defp put_error(conn, message, %Error.ProtocolError{} = error, id) do
+    cond do
+      error.code == ErrorCodes.missing_required_client_capability() ->
+        conn = Conn.assign(conn, :http_status, 400)
+        %{conn | response: JSONRPC.error(id, Error.to_json_rpc(error))}
 
-        # A method the handler doesn't serve, such as a Handler default's
-        # answer, is a modern 404 like an unknown method.
-        error.code == ErrorCodes.method_not_found() ->
-          put_method_not_found_status(conn)
+      error.code == ErrorCodes.method_not_found() ->
+        put_unserved(conn, message, error, id)
 
-        true ->
-          conn
-      end
-
-    %{conn | response: JSONRPC.error(id, Error.to_json_rpc(error))}
+      true ->
+        %{conn | response: JSONRPC.error(id, Error.to_json_rpc(error))}
+    end
   end
 
   defp put_error(conn, message, reason, id) do
@@ -668,6 +664,31 @@ defmodule Arbor.MCP.MessageProcessor.MethodHandlers do
   defp put_method_not_found(conn, id) do
     conn = put_method_not_found_status(conn)
     %{conn | response: JSONRPC.error(id, -32601, "Method not found")}
+  end
+
+  # A method the handler doesn't serve, such as a Handler default's answer.
+  # Within a capability the server serves it gets the empty or not-found
+  # answer Dispatch gives; otherwise it is a modern 404, like an unknown
+  # method.
+  defp put_unserved(conn, message, error, id) do
+    request = conn.request || %{}
+    capabilities = Map.get(conn.assigns, :server_capabilities, %{})
+
+    case ResultNormalizer.served_capability_answer(
+           Map.get(request, "method"),
+           Map.get(request, "params"),
+           capabilities
+         ) do
+      {:ok, answer} ->
+        put_success(conn, answer, id)
+
+      {:error, not_found} ->
+        put_error(conn, message, not_found, id)
+
+      nil ->
+        conn = put_method_not_found_status(conn)
+        %{conn | response: JSONRPC.error(id, Error.to_json_rpc(error))}
+    end
   end
 
   defp put_method_not_found_status(conn) do

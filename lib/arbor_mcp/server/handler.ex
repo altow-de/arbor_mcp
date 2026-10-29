@@ -286,10 +286,18 @@ defmodule Arbor.MCP.Server.Handler do
   server did not advertise. Over modern Streamable HTTP that error is sent
   with HTTP status `404`. The defaults for `logging/setLevel` and
   `notifications/elicitation/complete` succeed instead, and with
-  `tasks: :store` the task defaults serve the task store. Tools, resources,
-  resource templates and prompts added with `Arbor.MCP.Server.add_tool/3` and
-  its siblings are served either way: `resources/read` and `prompts/get` for
-  a name none of them has then answer as not found, not `-32601`.
+  `tasks: :store` the task defaults serve the task store.
+
+  A server that does serve the method's capability answers the part a
+  handler leaves out as the TypeScript SDK does, not with `-32601`:
+  `resources/list`, `resources/templates/list` and `prompts/list` with an
+  empty list (plus any entries added with `Arbor.MCP.Server.add_tool/3` and
+  its siblings), `completion/complete` with no values, and `resources/read`
+  or `prompts/get` for an unknown name as not found. The server serves a
+  capability when it advertises it in `server/discover`: through the DSL,
+  through such added entries, or through the handler's own
+  `__server_capabilities__/0`. A DSL prompt argument without `complete:`
+  therefore completes to nothing.
   """
 
   @type state :: any()
