@@ -98,13 +98,15 @@ defmodule Arbor.MCP.Client.RemoteCallerDeadlineTest do
     on_exit(fn -> Arbor.MCP.TestHelpers.safe_stop_process(client) end)
 
     # A disconnect from a remote caller, as GenServer.call sends it, with a
-    # deadline on a clock that trails this one by a minute. The reply goes to
-    # the unreachable caller.
+    # deadline on a clock that trails this one by a minute. The reply tag is
+    # an alias of this process, which OTP replies to, so the test sees the
+    # remote caller's own answer.
     foreign = System.monotonic_time(:millisecond) - 60_000
-    send(client, {:"$gen_call", {remote_pid(), make_ref()}, {:ordinary_disconnect, foreign}})
+    tag = [:alias | :erlang.alias()]
+    send(client, {:"$gen_call", {remote_pid(), tag}, {:ordinary_disconnect, foreign}})
 
-    # A disconnect keeps its cleanup result for later calls.
-    assert :ok = Client.disconnect(client)
+    assert_receive {^tag, reply}, 10_000
+    assert reply == :ok
   end
 
   # A pid on a node this VM isn't connected to.
