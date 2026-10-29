@@ -1,5 +1,6 @@
 defmodule Arbor.MCP.Transport.ReliabilityWrapperTest do
   use ExUnit.Case, async: true
+  alias Arbor.MCP.Client.Deadline
   alias Arbor.MCP.Transport.{ReliabilityWrapper, Test}
 
   defmodule StatefulFailure do
@@ -265,6 +266,56 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapperTest do
       assert_received :transport_closed
       assert_receive {:DOWN, ^checker_ref, :process, _checker, :normal}
       assert_receive {:DOWN, ^check_ref, :process, ^check, _reason}
+    end
+
+    # The client kills its close at the cleanup deadline. A stop that waited
+    # past what was left of it (a 50 ms floor) was cut off with it: the
+    # breaker was never killed and the transport's close never called.
+    test "close kills a stuck component at once when too little of the budget is left" do
+      defmodule ShortBudgetTransport do
+        @behaviour Arbor.MCP.Transport
+
+        def connect(opts), do: {:ok, %{test: opts[:test]}}
+        def send_message(_message, state), do: {:ok, state}
+        def receive_message(state), do: {:ok, "message", state}
+        def connected?(_state), do: true
+
+        def close(state) do
+          send(state.test, :transport_closed)
+          :ok
+        end
+      end
+
+      test_pid = self()
+      {:ok, transport_state} = ShortBudgetTransport.connect(test: test_pid)
+
+      {:ok, wrapped} =
+        ReliabilityWrapper.wrap(ShortBudgetTransport, transport_state,
+          circuit_breaker: [failure_threshold: 3]
+        )
+
+      breaker = wrapped.circuit_breaker_pid
+      Process.unlink(breaker)
+
+      # Held inside a call of its own, the breaker can't answer a stop.
+      spawn(fn ->
+        :sys.replace_state(breaker, fn state ->
+          send(test_pid, :stuck)
+          receive do: (:never -> state)
+        end)
+      end)
+
+      assert_receive :stuck
+      breaker_ref = Process.monitor(breaker)
+
+      closing = Deadline.put_on_transport(ReliabilityWrapper, wrapped, Deadline.after_ms(20))
+
+      # As the client does, the close gets 20 ms before it is killed.
+      closer = Task.async(fn -> ReliabilityWrapper.close(closing) end)
+      _result = Task.yield(closer, 20) || Task.shutdown(closer, :brutal_kill)
+
+      assert_receive :transport_closed
+      assert_receive {:DOWN, ^breaker_ref, :process, ^breaker, :killed}
     end
 
     test "keeps a synchronous send's response apart from its state" do

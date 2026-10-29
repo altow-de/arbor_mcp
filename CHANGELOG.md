@@ -104,8 +104,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Arbor.MCP.Reliability.HealthCheck.get_status/1` answers at once while a
   check is in progress, with the status the finished checks left, instead of
   waiting for that check: each check now runs in a process of its own, off
-  the checker's loop. `check_now/1` is unchanged: it still runs a check of
-  its own, after any already running, and returns its result.
+  the checker's loop. Its other calls are taken as before, in the order they
+  came and after a check in progress: `check_now/1` still runs a check of its
+  own and returns its result, and a subscriber hears of the same transitions,
+  however its `subscribe/1` or `unsubscribe/1` falls against a check.
 
 ### Fixed
 

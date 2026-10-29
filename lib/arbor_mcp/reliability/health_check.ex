@@ -38,10 +38,13 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
   ## Checks
 
   Each check runs in a process of its own, off the checker's loop, so
-  `get_status/1` and the checker's other calls answer while a check is in
-  progress, and stopping the checker stops its check with it. Checks still
-  run one at a time: `check_now/1` and each periodic check get a check of
-  their own, in the order asked.
+  `get_status/1` answers while a check is in progress, and stopping the
+  checker stops its check with it. Every other call is taken in the order it
+  came, after any check in progress or asked for before it, as when checks
+  ran in the loop: `check_now/1` and each periodic check get a check of
+  their own, one at a time, and a `subscribe/1` or `unsubscribe/1` made
+  during a check takes effect after that check has notified the
+  subscribers.
   """
 
   use GenServer
@@ -67,7 +70,7 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
     :on_status_change,
     :timer_ref,
     :check,
-    check_queue: [],
+    deferred: [],
     status: :unknown,
     consecutive_failures: 0,
     consecutive_successes: 0,
@@ -98,7 +101,7 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
           on_status_change: (status(), status() -> any()) | nil,
           timer_ref: reference() | nil,
           check: map() | nil,
-          check_queue: [{:reply, GenServer.from()} | :periodic],
+          deferred: [{term(), GenServer.from() | nil}],
           status: status(),
           consecutive_failures: non_neg_integer(),
           consecutive_successes: non_neg_integer(),
@@ -231,48 +234,19 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
     {:reply, {state.status, status_info}, state}
   end
 
-  def handle_call(:check_now, from, state) do
-    {:noreply, request_check(state, {:reply, from})}
-  end
+  # Every other call, and a periodic check, is taken in the order it came,
+  # after any check in progress or asked for before it, as when checks ran
+  # in this loop: only get_status/1 answers at once.
+  def handle_call(request, from, %{check: nil} = state),
+    do: {:noreply, perform(request, from, state)}
 
-  def handle_call({:get_history, limit}, _from, state) do
-    history = Enum.take(state.history, limit)
-    {:reply, history, state}
-  end
-
-  def handle_call({:subscribe, pid}, _from, state) do
-    Process.monitor(pid)
-    new_subscribers = MapSet.put(state.subscribers, pid)
-    {:reply, :ok, %{state | subscribers: new_subscribers}}
-  end
-
-  def handle_call({:unsubscribe, pid}, _from, state) do
-    new_subscribers = MapSet.delete(state.subscribers, pid)
-    {:reply, :ok, %{state | subscribers: new_subscribers}}
-  end
-
-  def handle_call(:pause, _from, state) do
-    if state.timer_ref do
-      Process.cancel_timer(state.timer_ref)
-    end
-
-    # A periodic check running or waiting its turn no longer schedules the
-    # next, and one waiting its turn doesn't run.
-    check = state.check && %{state.check | periodic: false}
-    queue = Enum.reject(state.check_queue, &(&1 == :periodic))
-    {:reply, :ok, %{state | timer_ref: nil, check: check, check_queue: queue}}
-  end
-
-  def handle_call(:resume, _from, state) do
-    timer_ref = Process.send_after(self(), :perform_check, 1000)
-    {:reply, :ok, %{state | timer_ref: timer_ref}}
-  end
+  def handle_call(request, from, state), do: {:noreply, defer(state, {request, from})}
 
   @impl GenServer
-  def handle_info(:perform_check, state) do
-    # The next check is scheduled when this one finishes.
-    {:noreply, request_check(%{state | timer_ref: nil}, :periodic)}
-  end
+  def handle_info(:perform_check, %{check: nil} = state),
+    do: {:noreply, perform(:perform_check, nil, state)}
+
+  def handle_info(:perform_check, state), do: {:noreply, defer(state, {:perform_check, nil})}
 
   def handle_info({ref, reply}, %{check: %{task: %Task{ref: ref}}} = state) do
     Process.demonitor(ref, [:flush])
@@ -313,13 +287,53 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
 
   ## Private Functions
 
-  # A check runs off this loop, so the checker answers get_status/1 and a
-  # stop (a closing transport's) while a check waits on its target. Each
-  # check_now/1 and each periodic tick gets a check of its own, in the order
-  # asked, as when checks ran in this loop.
-  defp request_check(%{check: nil} = state, request), do: start_check(state, request)
-  defp request_check(state, request), do: %{state | check_queue: state.check_queue ++ [request]}
+  defp perform(:check_now, from, state), do: start_check(state, {:reply, from})
 
+  # The next periodic check is scheduled when this one finishes.
+  defp perform(:perform_check, _from, state),
+    do: start_check(%{state | timer_ref: nil}, :periodic)
+
+  defp perform({:get_history, limit}, from, state) do
+    GenServer.reply(from, Enum.take(state.history, limit))
+    state
+  end
+
+  defp perform({:subscribe, pid}, from, state) do
+    Process.monitor(pid)
+    GenServer.reply(from, :ok)
+    %{state | subscribers: MapSet.put(state.subscribers, pid)}
+  end
+
+  defp perform({:unsubscribe, pid}, from, state) do
+    GenServer.reply(from, :ok)
+    %{state | subscribers: MapSet.delete(state.subscribers, pid)}
+  end
+
+  defp perform(:pause, from, state) do
+    if state.timer_ref do
+      Process.cancel_timer(state.timer_ref)
+    end
+
+    GenServer.reply(from, :ok)
+    %{state | timer_ref: nil}
+  end
+
+  defp perform(:resume, from, state) do
+    GenServer.reply(from, :ok)
+    %{state | timer_ref: Process.send_after(self(), :perform_check, 1000)}
+  end
+
+  defp defer(state, request), do: %{state | deferred: state.deferred ++ [request]}
+
+  # After a check, the requests deferred behind it are taken in order, up to
+  # one that starts the next check.
+  defp run_deferred(%{check: nil, deferred: [{request, from} | deferred]} = state),
+    do: run_deferred(perform(request, from, %{state | deferred: deferred}))
+
+  defp run_deferred(state), do: state
+
+  # A check runs off this loop, so the checker answers get_status/1 and a
+  # stop (a closing transport's) while a check waits on its target.
   defp start_check(state, request) do
     task = start_check_task(state.check_fn, state.target)
 
@@ -394,19 +408,15 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
     state = update_health_state(%{state | check: nil}, result)
     if check.reply_to, do: GenServer.reply(check.reply_to, result)
 
-    # A resume/1 during the check has scheduled the next one already.
     state =
-      if check.periodic and is_nil(state.timer_ref),
+      if check.periodic,
         do: %{
           state
           | timer_ref: Process.send_after(self(), :perform_check, state.check_interval)
         },
         else: state
 
-    case state.check_queue do
-      [] -> state
-      [request | queue] -> start_check(%{state | check_queue: queue}, request)
-    end
+    run_deferred(state)
   end
 
   defp check_outcome({:ok, {:ok, details}}), do: {:healthy, details}

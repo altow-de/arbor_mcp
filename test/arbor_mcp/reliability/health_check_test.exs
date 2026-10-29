@@ -439,7 +439,6 @@ defmodule Arbor.MCP.Reliability.HealthCheckTest do
       assert_receive {:checking, check}
 
       assert {:unknown, _info} = HealthCheck.get_status(checker)
-      assert [] = HealthCheck.get_history(checker)
 
       send(check, :finish)
       assert %{status: :healthy} = result = Task.await(asker)
@@ -453,7 +452,7 @@ defmodule Arbor.MCP.Reliability.HealthCheckTest do
       assert_receive {:checking, check}
 
       second = Task.async(fn -> HealthCheck.check_now(checker) end)
-      wait_until(fn -> length(:sys.get_state(checker).check_queue) == 1 end, timeout: 2_000)
+      wait_until(fn -> length(:sys.get_state(checker).deferred) == 1 end, timeout: 2_000)
       refute_received {:checking, _another}
 
       send(check, :finish)
@@ -473,6 +472,79 @@ defmodule Arbor.MCP.Reliability.HealthCheckTest do
 
       assert :ok = GenServer.stop(checker, :normal, 1_000)
       assert_receive {:DOWN, ^check_ref, :process, ^check, :killed}
+    end
+  end
+
+  # Calls other than get_status/1 are taken after a check in progress, as
+  # when checks ran in the checker's loop, so a subscriber hears of exactly
+  # the transitions it would have.
+  describe "a subscription call during a check" do
+    setup context do
+      test_pid = self()
+
+      {:ok, checker} =
+        HealthCheck.start_link(
+          name: context.checker_name,
+          target: self(),
+          check_fn: fn _target ->
+            send(test_pid, {:checking, self()})
+
+            receive do
+              :finish -> {:ok, %{}}
+            end
+          end,
+          check_interval: 60_000,
+          timeout: 30_000,
+          recovery_threshold: 1
+        )
+
+      {:ok, checker: checker}
+    end
+
+    test "an unsubscribe/1 still gets that check's notification", %{checker: checker} do
+      test_pid = self()
+
+      subscriber =
+        spawn_link(fn ->
+          :ok = HealthCheck.subscribe(checker)
+          send(test_pid, :subscribed)
+          receive do: (:unsubscribe -> :ok)
+          :ok = HealthCheck.unsubscribe(checker)
+          send(test_pid, {:notified, notification()})
+        end)
+
+      assert_receive :subscribed
+      asker = Task.async(fn -> HealthCheck.check_now(checker) end)
+      assert_receive {:checking, check}
+
+      send(subscriber, :unsubscribe)
+      wait_until(fn -> reached?(checker, {:unsubscribe, subscriber}) end, timeout: 2_000)
+
+      send(check, :finish)
+      assert %{status: :healthy} = Task.await(asker)
+      assert_receive {:notified, {:health_status_changed, :unknown, :healthy, _metadata}}
+    end
+
+    test "a subscribe/1 doesn't get that check's notification", %{checker: checker} do
+      test_pid = self()
+      asker = Task.async(fn -> HealthCheck.check_now(checker) end)
+      assert_receive {:checking, check}
+
+      subscriber =
+        spawn_link(fn ->
+          :ok = HealthCheck.subscribe(checker)
+          receive do: (:report -> :ok)
+          # A notification would come before this answer.
+          HealthCheck.get_status(checker)
+          send(test_pid, {:notified, notification()})
+        end)
+
+      wait_until(fn -> reached?(checker, {:subscribe, subscriber}) end, timeout: 2_000)
+
+      send(check, :finish)
+      assert %{status: :healthy} = Task.await(asker)
+      send(subscriber, :report)
+      assert_receive {:notified, :none}
     end
   end
 
@@ -537,6 +609,25 @@ defmodule Arbor.MCP.Reliability.HealthCheckTest do
     assert %{status: :unhealthy, details: %{error: :timeout}} = HealthCheck.check_now(checker)
     assert_receive {:checking, check}
     refute Process.alive?(check)
+  end
+
+  defp notification do
+    receive do
+      {:health_status_changed, _old, _new, _metadata} = notification -> notification
+    after
+      0 -> :none
+    end
+  end
+
+  # Whether the checker has taken `request` from its caller: done, or put
+  # behind the check in progress.
+  defp reached?(checker, {action, subscriber} = request) do
+    state = :sys.get_state(checker)
+    deferred = Enum.any?(Map.get(state, :deferred, []), &match?({^request, _from}, &1))
+    subscribed = MapSet.member?(state.subscribers, subscriber)
+
+    deferred or (action == :subscribe and subscribed) or
+      (action == :unsubscribe and not subscribed)
   end
 
   # Helper functions
