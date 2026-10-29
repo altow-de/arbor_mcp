@@ -164,6 +164,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JWE, derives shared secrets or exports password-encrypted keys, and MRTR
   request state is sealed with `:crypto` directly and checks the tag length.
   The floor keeps applications' dependency graphs off the affected releases.
+- **BREAKING:** a legacy Streamable HTTP request that gets 404 for the
+  client's session now fails with
+  `%Arbor.MCP.Error.TransportError{reason: {:session_expired, {:http_error, 404, body}}}`
+  instead of `reason: {:http_error, 404, body}`, and the client starts a new
+  session (see Fixed). A request still in flight when that happens fails
+  with the same error, and one in flight when the session's reopened GET
+  stream gets 404 fails with `{:session_expired, {:sse_error, {:http_error, 404}}}`
+  instead of a `:connection_error` (`"Transport closed: ..."`). Code that
+  matched `{:http_error, 404, _}` to restart the client can match
+  `{:session_expired, _}`, or drop the workaround. `delivery_outcome/1`
+  still reports `:unknown`: the server answered, and a proxy's 404 looks the
+  same. Other 404s, every modern (2026-07-28) one included, keep
+  `{:http_error, 404, body}`.
 
 ### Fixed
 
@@ -564,6 +577,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asynchronous requests that the gateway settles in its own loop. Each
   request's later steps still wait for its own answers, so results, batch
   arrays and errors keep their order.
+- A legacy Streamable HTTP client kept its `Mcp-Session-Id` after the server
+  ended the session, by restarting for example (#181). Every request then got
+  `404 Session not found` and the client stayed `:ready`, even with
+  `reconnect: true`; with the GET stream on, it recovered only once that
+  stream's reopened GET got the 404 too. The 2025-03-26 to 2025-11-25
+  revisions say a client that gets 404 for a request carrying its session id
+  MUST start a new session with an `initialize` that carries none. The
+  request that got the 404, a POST, a notification or the reopened GET, now
+  fails with `{:session_expired, detail}` (see Changed) and is not sent
+  again, since a tool call may not be safe to repeat, and every request still
+  in flight on the session fails with it too. The client then closes the
+  transport as for a lost connection, its `reliability:` components
+  included, and reconnects under `:reconnect_backoff` with an `initialize`
+  that carries no session id, not even a configured `:session_id`. With
+  `reconnect: false` it goes `:disconnected`. Modern (2026-07-28)
+  connections have no session and are unchanged. Reported by Harper04.
 
 ## [2.0.0-rc.6] — 2026-10-26
 

@@ -795,6 +795,12 @@ defmodule Arbor.MCP.Client.ConnectionManager do
         Process.sleep(100)
         receive_loop(parent, transport_mod, transport_state)
 
+      {:error, {:session_expired, _detail} = reason} ->
+        # The server ended the legacy HTTP session this stream belongs to.
+        # That is no transport fault: the client starts a new session.
+        Lifetime.deliver(parent, {:transport_closed, reason})
+        :ok
+
       {:error, reason} ->
         Logger.error("Transport error in receive loop", reason: LogSummary.describe(reason))
         Lifetime.deliver(parent, {:transport_closed, reason})
@@ -845,6 +851,31 @@ defmodule Arbor.MCP.Client.ConnectionManager do
         error
     end
   end
+
+  @doc false
+  # The client options without the `:session_id` a legacy HTTP connection
+  # resumes, wherever a transport spec carries it, for a server that has
+  # ended that session: a new connection must start a session of its own.
+  @spec forget_session_id(keyword()) :: keyword()
+  def forget_session_id(opts) when is_list(opts) do
+    opts
+    |> Keyword.delete(:session_id)
+    |> update_present(:transport, &forget_spec_session_id/1)
+    |> update_present(:transports, fn
+      specs when is_list(specs) -> Enum.map(specs, &forget_spec_session_id/1)
+      other -> other
+    end)
+  end
+
+  defp update_present(opts, key, fun) do
+    if Keyword.has_key?(opts, key), do: Keyword.update!(opts, key, fun), else: opts
+  end
+
+  defp forget_spec_session_id({transport, spec_opts}) when is_list(spec_opts),
+    do: {transport, Keyword.delete(spec_opts, :session_id)}
+
+  defp forget_spec_session_id(spec) when is_list(spec), do: Keyword.delete(spec, :session_id)
+  defp forget_spec_session_id(spec), do: spec
 
   def prepare_transport_config(opts) do
     cond do
