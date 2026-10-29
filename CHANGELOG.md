@@ -126,13 +126,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `:handler_call_timeout` for the lookup and any walk after it through
     `Arbor.MCP.MessageProcessor`.
 
+  The server trusts the definition the callback returns: it must be the one
+  `tools/list` advertises for that name, with the same `inputSchema` and
+  every `x-mcp-header` annotation. One that leaves an annotation out lets
+  through requests the walk would reject. Only the handler can introduce
+  that mismatch, and `nil` is always safe.
+
   Handlers without the callback walk the list as before.
   `use Arbor.MCP.Server.DSL` defines the callback for the tools a module
-  declares, unless the module defines it, so a DSL server with `page_size:`
-  no longer pages for the check. `Arbor.MCP.Server.Context.current/0` is now
-  documented: on a Runtime, its `method` is `"tools/call"` while
-  `handle_list_tools/2` runs for the check. See the `handle_get_tool/2` docs
-  and "Modern Streamable HTTP headers" in `docs/CONFIGURATION.md`.
+  declares, unless the module defines it. It reads the same definitions as
+  the module's `tools/list` and returns `nil` for tools added with
+  `Arbor.MCP.Server.add_tool/3`, which are checked against their own
+  definitions. A DSL server with `page_size:` no longer pages for the check.
+
+  `Arbor.MCP.Server.Context.current/0` is now documented: on a Runtime, its
+  `method` is `"tools/call"` while `handle_list_tools/2` runs for the check.
+  See the `handle_get_tool/2` docs and "Modern Streamable HTTP headers" in
+  `docs/CONFIGURATION.md`.
 
 ### Changed
 

@@ -15,7 +15,8 @@ defmodule Arbor.MCP.Server.HandleGetToolTest do
 
   alias Arbor.MCP.HttpPlug
   alias Arbor.MCP.MessageProcessor
-  alias Arbor.MCP.Server.Context
+  alias Arbor.MCP.Server
+  alias Arbor.MCP.Server.{Context, ResultNormalizer}
   alias Arbor.MCP.Test.RuntimeHTTPFixture
   alias Arbor.MCP.Transport.HTTP.RequestHeaders
 
@@ -123,6 +124,72 @@ defmodule Arbor.MCP.Server.HandleGetToolTest do
 
     @impl true
     def handle_get_tool(_name, state), do: {:ok, nil, state}
+  end
+
+  # A component whose tool the host imports.
+  defmodule SharedTools do
+    use Arbor.MCP.Server.Handler
+    use Arbor.MCP.Server.DSL, name: "get-tool-shared", version: "1.0.0"
+
+    tool "shared", "Imported from a component" do
+      input_schema(%{
+        type: "object",
+        properties: %{tenant: %{type: "string", "x-mcp-header": "Tenant"}}
+      })
+
+      run(fn _args, state -> {:ok, "shared", state} end)
+    end
+  end
+
+  # Several tools over three pages, most with annotations of each kind.
+  defmodule DSLManyServer do
+    use Arbor.MCP.Server.Handler
+
+    use Arbor.MCP.Server.DSL,
+      name: "get-tool-many",
+      version: "1.0.0",
+      page_size: 2,
+      components: [SharedTools]
+
+    tool "plain", "No annotations" do
+      param(:message, :string, required: true)
+      run(fn _args, state -> {:ok, "plain", state} end)
+    end
+
+    tool "routed", "A string annotation" do
+      input_schema(%{
+        type: "object",
+        properties: %{region: %{type: "string", "x-mcp-header": "Region"}}
+      })
+
+      run(fn _args, state -> {:ok, "routed", state} end)
+    end
+
+    tool "nested", "An annotation on a nested property" do
+      input_schema(%{
+        type: "object",
+        properties: %{
+          target: %{
+            type: "object",
+            properties: %{zone: %{type: "string", "x-mcp-header": "Zone"}}
+          }
+        }
+      })
+
+      run(fn _args, state -> {:ok, "nested", state} end)
+    end
+
+    tool "limited", "Integer and boolean annotations" do
+      input_schema(%{
+        type: "object",
+        properties: %{
+          limit: %{type: "integer", "x-mcp-header": "Limit"},
+          dry_run: %{type: "boolean", "x-mcp-header": "Dry-Run"}
+        }
+      })
+
+      run(fn _args, state -> {:ok, "limited", state} end)
+    end
   end
 
   defmodule DSLWithoutTools do
@@ -403,12 +470,14 @@ defmodule Arbor.MCP.Server.HandleGetToolTest do
 
   describe "DSL servers" do
     setup do
-      :erlang.trace_pattern({DSLServer, :handle_list_tools, 2}, true, [:call_count])
-      :erlang.trace_pattern({DSLOwnLookupServer, :handle_list_tools, 2}, true, [:call_count])
+      traced = [DSLServer, DSLOwnLookupServer, DSLManyServer]
+
+      for module <- traced,
+          do: :erlang.trace_pattern({module, :handle_list_tools, 2}, true, [:call_count])
 
       on_exit(fn ->
-        :erlang.trace_pattern({DSLServer, :handle_list_tools, 2}, false, [:call_count])
-        :erlang.trace_pattern({DSLOwnLookupServer, :handle_list_tools, 2}, false, [:call_count])
+        for module <- traced,
+            do: :erlang.trace_pattern({module, :handle_list_tools, 2}, false, [:call_count])
       end)
     end
 
@@ -445,21 +514,155 @@ defmodule Arbor.MCP.Server.HandleGetToolTest do
       assert :erlang.trace_info({DSLOwnLookupServer, :handle_list_tools, 2}, :call_count) ==
                {:call_count, 2}
     end
+
+    test "return exactly the definitions their tools/list pages hold" do
+      listed = raw_pages(DSLManyServer, nil)
+
+      assert Enum.map(listed, & &1.name) == ["shared", "plain", "routed", "nested", "limited"]
+
+      for definition <- listed do
+        assert {:ok, ^definition, :state} = DSLManyServer.handle_get_tool(definition.name, :state)
+      end
+
+      # And the entries a client lists over HTTP, page by page.
+      runtime = runtime(DSLManyServer)
+      wire = wire_tools(runtime, nil)
+
+      assert Enum.sort(Enum.map(wire, & &1["name"])) == Enum.sort(Enum.map(listed, & &1.name))
+
+      for entry <- wire do
+        {:ok, definition, :state} = DSLManyServer.handle_get_tool(entry["name"], :state)
+        assert ResultNormalizer.stringify_keys(definition) == entry
+      end
+    end
+
+    test "check every kind of annotation without paging through tools/list" do
+      runtime = runtime(DSLManyServer)
+
+      {:call_count, before} =
+        :erlang.trace_info({DSLManyServer, :handle_list_tools, 2}, :call_count)
+
+      nested = %{"target" => %{"zone" => "z1"}}
+      assert %{status: 400} = call_tool(runtime, "nested", nested, [{"mcp-param-zone", "z2"}])
+      assert %{status: 400} = call_tool(runtime, "nested", nested, [])
+      assert %{status: 200} = call_tool(runtime, "nested", nested, [{"mcp-param-zone", "z1"}])
+
+      limited = %{"limit" => 5, "dry_run" => true}
+      matching = [{"mcp-param-limit", "5"}, {"mcp-param-dry-run", "true"}]
+      assert %{status: 200} = call_tool(runtime, "limited", limited, matching)
+
+      assert %{status: 400} =
+               call_tool(runtime, "limited", limited, [
+                 {"mcp-param-limit", "5"},
+                 {"mcp-param-dry-run", "false"}
+               ])
+
+      tenant = %{"tenant" => "acme"}
+
+      assert %{status: 400} =
+               call_tool(runtime, "shared", tenant, [{"mcp-param-tenant", "other"}])
+
+      assert %{status: 200} = call_tool(runtime, "shared", tenant, [{"mcp-param-tenant", "acme"}])
+
+      assert :erlang.trace_info({DSLManyServer, :handle_list_tools, 2}, :call_count) ==
+               {:call_count, before}
+    end
+
+    test "leave a tool added with Server.add_tool/3 to its own definition" do
+      runtime = runtime(DSLServer)
+
+      zoned = %{
+        name: "zoned",
+        inputSchema: %{
+          type: "object",
+          properties: %{zone: %{type: "string", "x-mcp-header": "Zone"}}
+        }
+      }
+
+      :ok = Server.add_tool(runtime, zoned, fn _arguments -> Server.Result.text("zoned") end)
+
+      assert {:ok, nil, :state} = DSLServer.handle_get_tool("zoned", :state)
+      assert "zoned" in Enum.map(wire_tools(runtime, nil), & &1["name"])
+
+      arguments = %{"zone" => "a"}
+      assert %{status: 400} = call_tool(runtime, "zoned", arguments, [{"mcp-param-zone", "b"}])
+      assert %{status: 400} = call_tool(runtime, "zoned", arguments, [])
+      assert %{status: 200} = call_tool(runtime, "zoned", arguments, [{"mcp-param-zone", "a"}])
+    end
+
+    test "check a declared name that Server.add_tool/3 replaced against the replacement" do
+      runtime = runtime(DSLServer)
+
+      # The declared "routed" takes Mcp-Param-Region; its replacement takes
+      # Mcp-Param-Zone for the same argument.
+      replacement = %{
+        name: "routed",
+        inputSchema: %{
+          type: "object",
+          properties: %{region: %{type: "string", "x-mcp-header": "Zone"}}
+        }
+      }
+
+      :ok =
+        Server.add_tool(runtime, replacement, fn _arguments -> Server.Result.text("replaced") end)
+
+      [listed] = Enum.filter(wire_tools(runtime, nil), &(&1["name"] == "routed"))
+      assert listed["inputSchema"]["properties"]["region"]["x-mcp-header"] == "Zone"
+
+      arguments = %{"region" => "eu"}
+
+      assert %{status: 400} =
+               call_tool(runtime, "routed", arguments, [{"mcp-param-region", "eu"}])
+
+      assert %{status: 200} = call_tool(runtime, "routed", arguments, [{"mcp-param-zone", "eu"}])
+    end
   end
 
   # A modern tools/call for "routed" with region "eu", through a fresh
   # Runtime-mounted HttpPlug.
   defp post(handler, handler_args, headers, runtime_opts \\ []) do
-    runtime =
-      RuntimeHTTPFixture.start(
-        handler,
-        Keyword.merge(
-          [handler_args: [test_pid: self()] ++ handler_args, request_timeout_ms: 10_000],
-          runtime_opts
-        )
-      )
+    handler
+    |> runtime(handler_args, runtime_opts)
+    |> call_tool("routed", %{"region" => "eu"}, headers)
+  end
 
-    request = tools_call()
+  defp runtime(handler, handler_args \\ [], runtime_opts \\ []) do
+    RuntimeHTTPFixture.start(
+      handler,
+      Keyword.merge(
+        [handler_args: [test_pid: self()] ++ handler_args, request_timeout_ms: 10_000],
+        runtime_opts
+      )
+    )
+  end
+
+  defp call_tool(runtime, name, arguments, headers) do
+    rpc(runtime, "tools/call", %{"name" => name, "arguments" => arguments}, [
+      {"mcp-name", RequestHeaders.encode_value(name)} | headers
+    ])
+  end
+
+  # Every entry of a modern tools/list over HTTP, following nextCursor.
+  defp wire_tools(runtime, cursor) do
+    params = if cursor, do: %{"cursor" => cursor}, else: %{}
+    %{status: 200, body: %{"result" => result}} = rpc(runtime, "tools/list", params, [])
+
+    case result do
+      %{"nextCursor" => next} when is_binary(next) -> result["tools"] ++ wire_tools(runtime, next)
+      _last -> result["tools"]
+    end
+  end
+
+  # Every definition the handler's own tools/list pages hold.
+  defp raw_pages(module, cursor) do
+    case module.handle_list_tools(cursor, :state) do
+      {:ok, tools, nil, :state} -> tools
+      {:ok, tools, next, :state} -> tools ++ raw_pages(module, next)
+    end
+  end
+
+  defp rpc(runtime, method, params, headers) do
+    request = modern(method, params)
 
     conn =
       Enum.reduce(headers, conn(:post, "/", Jason.encode!(request)), fn {name, value}, conn ->
@@ -468,8 +671,7 @@ defmodule Arbor.MCP.Server.HandleGetToolTest do
       |> put_req_header("content-type", "application/json")
       |> put_req_header("accept", "application/json, text/event-stream")
       |> put_req_header("mcp-protocol-version", "2026-07-28")
-      |> put_req_header("mcp-method", "tools/call")
-      |> put_req_header("mcp-name", RequestHeaders.encode_value("routed"))
+      |> put_req_header("mcp-method", method)
       |> HttpPlug.call(HttpPlug.init(runtime: runtime, sse_mode: :oneshot))
 
     %{status: conn.status, body: Jason.decode!(conn.resp_body)}
@@ -488,19 +690,20 @@ defmodule Arbor.MCP.Server.HandleGetToolTest do
     })
   end
 
-  defp tools_call do
+  defp tools_call,
+    do: modern("tools/call", %{"name" => "routed", "arguments" => %{"region" => "eu"}})
+
+  defp modern(method, params) do
+    meta = %{
+      "io.modelcontextprotocol/protocolVersion" => "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities" => %{}
+    }
+
     %{
       "jsonrpc" => "2.0",
       "id" => 184,
-      "method" => "tools/call",
-      "params" => %{
-        "name" => "routed",
-        "arguments" => %{"region" => "eu"},
-        "_meta" => %{
-          "io.modelcontextprotocol/protocolVersion" => "2026-07-28",
-          "io.modelcontextprotocol/clientCapabilities" => %{}
-        }
-      }
+      "method" => method,
+      "params" => Map.put(params, "_meta", meta)
     }
   end
 end

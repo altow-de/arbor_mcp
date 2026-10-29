@@ -66,6 +66,14 @@ defmodule Arbor.MCP.Server.Handler do
   list for `"tools/call"` skips the check, so define `c:handle_get_tool/2`
   instead.
 
+  The server trusts the definition `c:handle_get_tool/2` returns and doesn't
+  compare it with the list. It must be the definition `tools/list`
+  advertises for that name, with the same `inputSchema` and every
+  `x-mcp-header` annotation; one without an annotation lets through
+  requests the walk would reject. Return `nil` when unsure: the server then
+  walks the list. The DSL's generated callback reads the same definitions
+  as its `tools/list`.
+
   ## Basic Example
 
   > #### Tip
@@ -447,12 +455,22 @@ defmodule Arbor.MCP.Server.Handler do
 
   Return:
 
-    * `{:ok, tool, state}` with the definition, as `c:handle_list_tools/2`
-      lists it. Its `name` must be `name`.
+    * `{:ok, tool, state}` with the definition. Its `name` must be `name`.
     * `{:ok, nil, state}` when this callback doesn't know the tool. The
       server then walks `c:handle_list_tools/2`, as it does without this
       callback, so `nil` never skips the check.
     * `{:error, reason, state}` when the definition can't be had.
+
+  > #### The server trusts the definition {: .warning}
+  >
+  > The definition must be the one `c:handle_list_tools/2` lists for that
+  > name, with the same `inputSchema` and every `x-mcp-header` annotation in
+  > it. The server checks the headers against it as given, and can't compare
+  > it with the list without the walk this callback saves. A definition that
+  > leaves out an annotation the list has lets a request through without
+  > that header, or with a wrong one, which the walk would reject with
+  > `-32020`. Only the handler can make that mistake, not a client.
+  > Returning `nil` is always safe.
 
   An error, an invalid reply, or a definition with another name fails the
   request closed with "Tool schema unavailable", the error a failed

@@ -1739,12 +1739,20 @@ def handle_get_tool(name, state) do
 end
 ```
 
+The server trusts that definition and doesn't compare it with the list, so
+it must be the one `tools/list` advertises for that name, with the same
+`inputSchema` and every `x-mcp-header` annotation. A definition that leaves an
+annotation out lets a request through without that header, or with a wrong
+value, which the walk would reject. Only the handler can introduce that
+mismatch, not a client, and returning `nil` is always safe. The DSL defines
+`handle_get_tool/2` for its declared tools, from the same definitions its
+`tools/list` pages through.
+
 `nil` means the callback doesn't know the tool, and the server then walks the
 list as before, so the check is never skipped. An `{:error, reason, state}`,
 an invalid reply, or a definition with another `name` fails the request with
 `-32020` "Tool schema unavailable", as a failed list page does; a raise or a
-timeout ends the request as it would during the walk. The DSL defines
-`handle_get_tool/2` for its declared tools. During the walk,
+timeout ends the request as it would during the walk. During the walk,
 `handle_list_tools/2` runs in the `tools/call` request's context, so
 `Arbor.MCP.Server.Context.current().method` is `"tools/call"` there and
 `"tools/list"` when a client lists. A list that leaves the tool out for

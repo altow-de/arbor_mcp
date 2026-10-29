@@ -110,11 +110,13 @@ end
 ```
 
 A module with tools also gets `handle_get_tool/2`, which returns a declared
-tool's definition by name and `nil` for any other name. A modern `tools/call`
-over HTTP checks its `Mcp-Param-*` headers against that definition, so the
-server doesn't page through `tools/list` for it, even with `page_size:`. A
-module that defines `handle_get_tool/2` itself keeps its own. See
-`c:Arbor.MCP.Server.Handler.handle_get_tool/2`.
+tool's definition by name, read from the same list `tools/list` pages
+through, and `nil` for any other name, such as a tool added with
+`Arbor.MCP.Server.add_tool/3`. A modern `tools/call` over HTTP checks its
+`Mcp-Param-*` headers against that definition, so the server doesn't page
+through `tools/list` for it, even with `page_size:`. A module that defines
+`handle_get_tool/2` itself keeps its own, and must return the definitions its
+`tools/list` advertises. See `c:Arbor.MCP.Server.Handler.handle_get_tool/2`.
 
 ### Param types
 
