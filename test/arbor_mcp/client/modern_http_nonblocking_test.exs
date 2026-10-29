@@ -142,6 +142,56 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
       do: handle_unauthorized(www_authenticate, scopes, state)
   end
 
+  defmodule RefusingProvider do
+    @moduledoc false
+    @behaviour Arbor.MCP.Authorization.Provider
+    @impl true
+    def init(opts), do: Provider.init(opts)
+    @impl true
+    def get_token(state), do: Provider.get_token(state)
+    @impl true
+    def handle_unauthorized(_www, _scopes, state), do: {:error, :provider_refused, state}
+    @impl true
+    def handle_forbidden(www, scopes, state), do: handle_unauthorized(www, scopes, state)
+  end
+
+  for {name, tool, provider, reason} <- [
+        {"Basic", "basic", nil, {:unauthorized, 401, "", ~s(Basic realm="mcp")}},
+        {"provider", "protected", RefusingProvider, {:authentication_failed, :provider_refused}},
+        {"OAuth", "bearer", nil, :oauth_failed}
+      ],
+      format <- [:map, :struct],
+      stream? <- [false, true] do
+    @tag :reauth_round6
+    test "#{name} refusal bypasses an always-retry policy in #{format} format (stream: #{stream?})" do
+      provider = unquote(provider)
+      opts = if provider, do: [auth_provider: {provider, test_pid: self()}], else: []
+      client = start_bypass_client(opts)
+
+      request_opts = [
+        timeout: 5_000,
+        format: unquote(format),
+        retry_policy: [max_attempts: 2, initial_delay: 0, should_retry?: fn _ -> true end]
+      ]
+
+      request_opts =
+        if unquote(stream?),
+          do: Keyword.put(request_opts, :progress_token, "round-six-refusal"),
+          else: request_opts
+
+      assert {:error, error} = Client.call_tool(client, unquote(tool), %{}, request_opts)
+
+      if unquote(Macro.escape(reason)) == :oauth_failed do
+        assert {:oauth_failed, _} = error.reason
+      else
+        assert error.reason == unquote(Macro.escape(reason))
+      end
+
+      assert_received {:posted, "tools/call"}
+      refute_received {:posted, "tools/call"}
+    end
+  end
+
   describe "requests through one client" do
     test "run at the same time, with or without a progress token" do
       client = start_client()
@@ -294,6 +344,31 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
       refute_received {:posted, "tools/call"}
     end
 
+    @tag :reauth_round5
+    test "a still-owned cancelled POST retires its rejected token without starting auth" do
+      transport = HTTP.put_oauth_token(modern_transport(), %{access_token: "rejected"}, ["read"])
+      state = %{client_state(transport) | pending_requests: %{}}
+      ref = make_ref()
+
+      challenge = %{
+        status: 401,
+        www_authenticate: "Basic",
+        scopes: [],
+        token: "rejected",
+        credential_generation: transport.credential_generation
+      }
+
+      assert {:noreply, state} =
+               Client.handle_info({:http_post_auth_challenge, self(), ref, challenge}, state)
+
+      assert_receive {:http_post_auth_result, ^ref, {:error, :stream_retired}}
+      assert state.transport_state.access_token == nil
+      assert state.transport_state.granted_scopes == []
+      refute List.keymember?(state.transport_state.headers, "Authorization", 0)
+      assert state.http_auth.worker == nil
+      assert state.http_auth.waiters == %{}
+    end
+
     test "without a provider, a challenge another request already answered gets its token" do
       ref = make_ref()
       state = client_state(%{modern_transport() | access_token: "obtained"})
@@ -302,7 +377,7 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
       assert {:noreply, ^state} =
                Client.handle_info({:http_post_auth_challenge, self(), ref, challenge}, state)
 
-      assert_received {:http_post_auth_result, ^ref, {:ok, "obtained"}}
+      assert_received {:http_post_auth_result, ^ref, {:ok, "obtained", _context}}
     end
 
     # Two requests sent with the "stale" token both get a 403 step-up. The
@@ -336,15 +411,17 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
       assert {:noreply, ^state} =
                Client.handle_info({:http_post_auth_challenge, self(), ref, challenge}, state)
 
-      assert_received {:http_post_auth_result, ^ref, {:ok, "stepped-up"}}
+      assert_received {:http_post_auth_result, ^ref, {:ok, "stepped-up", _context}}
       refute_received {:oauth_flow_started, ^flows}
 
       # A scope the first flow didn't get still needs a flow of its own.
       admin = %{challenge | www_authenticate: ~s(Bearer scope="admin"), scopes: ["admin"]}
 
-      assert {:noreply, _state} =
+      assert {:noreply, state} =
                Client.handle_info({:http_post_auth_challenge, self(), ref, admin}, state)
 
+      assert_receive {:http_inline_auth_result, _worker, _id, _result} = completed, 2_000
+      assert {:noreply, _state} = Client.handle_info(completed, state)
       assert_received {:http_post_auth_result, ^ref, {:error, {:oauth_failed, _reason}}}
       assert_received {:oauth_flow_started, ^flows}
     end
@@ -396,7 +473,7 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
       assert Agent.get(attempts, & &1) == 2
     end
 
-    test "on a legacy-era connection still hands its request back to be re-sent" do
+    test "on a legacy-era connection asks its client and preserves an unanswered challenge" do
       bypass = Bypass.open()
 
       Bypass.expect_once(bypass, "POST", "/mcp", fn conn ->
@@ -412,12 +489,17 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
       request = encoded_call(8)
 
       assert {:ok, _transport} = HTTP.send_async(request, transport)
+      assert_receive {:async_post_task, _monitor, task, 8}
 
-      assert_receive {:async_post_result, {:error, {:reauthenticate, ^request}},
-                      %{request_id: 8}},
+      assert_receive {:http_post_auth_challenge, ^task, ref, %{status: 401, token: nil}},
                      2_000
 
-      refute_received {:http_post_auth_challenge, _task, _ref, _challenge}
+      send(task, {:http_post_auth_result, ref, {:error, :no_credentials}})
+
+      assert_receive {:async_post_result,
+                      {:error, {:auth_refused, {:unauthorized, 401, "", _challenge}}},
+                      %{request_id: 8}},
+                     2_000
     end
   end
 
@@ -436,10 +518,21 @@ defmodule Arbor.MCP.Client.ModernHTTPNonblockingTest do
 
   # This test process stands in for the POST task.
   defp client_state(transport_state) do
+    transport_state =
+      if is_binary(transport_state.access_token) and transport_state.credential_generation == 0 do
+        HTTP.put_oauth_token(
+          transport_state,
+          %{access_token: transport_state.access_token},
+          transport_state.granted_scopes
+        )
+      else
+        transport_state
+      end
+
     %Client{
       transport_mod: HTTP,
       transport_state: transport_state,
-      pending_requests: %{},
+      pending_requests: %{1 => {{self(), make_ref()}, :single, "tools/call"}},
       pending_batches: %{},
       cancelled_requests: MapSet.new(),
       async_post_tasks: %{make_ref() => {self(), 1}}

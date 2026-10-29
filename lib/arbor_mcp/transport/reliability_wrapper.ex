@@ -168,6 +168,14 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
 
   @impl true
   def send_message(message, %__MODULE__{} = state) do
+    case send_message_with_state(message, state) do
+      {:error, reason, _latest_state} -> {:error, reason}
+      result -> result
+    end
+  end
+
+  @doc false
+  def send_message_with_state(message, %__MODULE__{} = state) do
     if state.config.circuit_breaker_enabled do
       CircuitBreaker.call(state.circuit_breaker_pid, fn ->
         execute_wrapped_operation(:send_message, [message, state.wrapped_state], state)
@@ -369,12 +377,31 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
   # Private functions
 
   defp execute_wrapped_operation(function, args, state) do
-    case apply(state.wrapped_module, function, args) do
+    result =
+      case {function, args} do
+        {:send_message, [message, wrapped_state]} ->
+          Arbor.MCP.Transport.send_message_with_state(
+            state.wrapped_module,
+            message,
+            wrapped_state
+          )
+
+        _other ->
+          apply(state.wrapped_module, function, args)
+      end
+
+    case result do
       {:ok, new_wrapped_state} ->
         {:ok, %{state | wrapped_state: new_wrapped_state}}
 
+      {:ok, new_wrapped_state, response} when function == :send_message ->
+        {:ok, %{state | wrapped_state: new_wrapped_state}, response}
+
       {:ok, result, new_wrapped_state} ->
         {:ok, result, %{state | wrapped_state: new_wrapped_state}}
+
+      {:error, reason, new_wrapped_state} ->
+        {:error, reason, %{state | wrapped_state: new_wrapped_state}}
 
       {:error, reason} = error ->
         Logger.debug("Transport operation failed",
