@@ -177,6 +177,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still reports `:unknown`: the server answered, and a proxy's 404 looks the
   same. Other 404s, every modern (2026-07-28) one included, keep
   `{:http_error, 404, body}`.
+- A legacy `initialize` that carries a configured `:session_id` and gets 404
+  for it no longer fails the connection. The server has ended that session,
+  so the client sends one more `initialize`, without the id, and starts a new
+  session, as the 2025-03-26 to 2025-11-25 revisions require. That second
+  `initialize` has its own `:handshake_timeout`, but never more than the
+  connection's deadline (`:establish_timeout`) has left, and its failure is
+  reported as before, so this happens at most once per connection attempt.
+  `start_link/1` now succeeds where it used to fail with a 404. A reconnect
+  after some other loss whose configured session the server has since ended,
+  which used to fail on every attempt, now connects. Once the configured
+  session has been replaced, later reconnects don't offer it again.
 
 ### Fixed
 

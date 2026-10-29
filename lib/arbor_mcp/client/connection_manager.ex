@@ -157,6 +157,7 @@ defmodule Arbor.MCP.Client.ConnectionManager do
         |> Map.put(:protocol_version, result["protocolVersion"])
         |> Map.put(:server_info, result["serverInfo"])
         |> Map.put(:server_instructions, result["instructions"])
+        |> forget_unkept_session(transport_mod, transport_state, final_transport_state)
 
       ConnectionScope.established()
       {:ok, new_state}
@@ -176,6 +177,20 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   defp check_deadline(deadline) do
     if Deadline.expired?(deadline), do: {:error, :establish_timeout}, else: :ok
   end
+
+  # A configured `:session_id` the new legacy connection didn't keep, because
+  # the server had ended it (see do_handshake/3), isn't offered again when the
+  # client reconnects.
+  defp forget_unkept_session(
+         %{transport_opts: transport_opts} = state,
+         HTTP,
+         %HTTP{session_id: configured},
+         %HTTP{protocol_era: :legacy, session_id: kept}
+       )
+       when is_binary(configured) and configured != kept and is_list(transport_opts),
+       do: %{state | transport_opts: forget_session_id(transport_opts)}
+
+  defp forget_unkept_session(state, _transport_mod, _opened, _established), do: state
 
   # A connection attempt that fails after the transport was opened must not
   # leave it behind: a spawned stdio server, or a port and reader linked to
@@ -1047,21 +1062,36 @@ defmodule Arbor.MCP.Client.ConnectionManager do
     handshake_timeout = handshake_timeout(opts)
     establish_deadline = Deadline.on_transport(transport_mod, transport_state)
 
-    exchange_deadline =
-      Deadline.earliest(
-        Deadline.after_ms(handshake_timeout),
-        Keyword.get(opts, :establish_deadline)
-      )
-
-    transport_state = Deadline.put_on_transport(transport_mod, transport_state, exchange_deadline)
-
     # The same capabilities a modern client sends with every request.
     capabilities = Keyword.get(opts, :capabilities, %{})
 
-    transport_mod
-    |> exchange_initialize(transport_state, protocol_version, capabilities, exchange_deadline)
+    exchange = fn state ->
+      exchange_deadline =
+        Deadline.earliest(
+          Deadline.after_ms(handshake_timeout),
+          Keyword.get(opts, :establish_deadline)
+        )
+
+      state = Deadline.put_on_transport(transport_mod, state, exchange_deadline)
+      exchange_initialize(transport_mod, state, protocol_version, capabilities, exchange_deadline)
+    end
+
+    transport_state
+    |> exchange.()
+    |> start_new_session(exchange)
     |> restore_deadline(transport_mod, establish_deadline)
   end
+
+  # An initialize that carried a configured `:session_id` the server has
+  # ended gets 404, and the client must then start a new session with an
+  # initialize that carries no session id (Session Management, 2025-03-26 and
+  # later). It sends that one at once, within the connection's deadline, and
+  # reports its failure as it is: it carries no session to expire, so this
+  # happens at most once.
+  defp start_new_session({:error, {:session_expired, _detail}, %HTTP{} = latest}, exchange),
+    do: exchange.(%{latest | session_id: nil})
+
+  defp start_new_session(result, _exchange), do: result
 
   defp exchange_initialize(
          transport_mod,

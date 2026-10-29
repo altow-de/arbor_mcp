@@ -172,8 +172,14 @@ Supported client options include:
 - `:protocol_mode` - `:legacy_only`, `:prefer_legacy`, `:prefer_modern`, or
   `:modern_only`; see the [Configuration Guide](CONFIGURATION.md#protocol-eras-and-modes).
 - `:use_sse` - enable the legacy Streamable HTTP GET stream, defaults to `true`.
-- `:session_id` - resume an existing streamable HTTP session. Once the server
-  has ended it (a 404), a reconnect starts a new session without it.
+- `:session_id` - resume an existing legacy Streamable HTTP session: the
+  client's `initialize` carries it. If the server answers that `initialize`
+  with 404 because it has ended the session, the client sends one more
+  `initialize`, without the id, and starts a new session. That `initialize`
+  gets its own `:handshake_timeout`, within what the connection's
+  `:establish_timeout` has left. If that one fails too, `start_link/1` or the
+  reconnect reports its failure. Once the server has ended the configured
+  session, no later reconnect offers it again.
 - `:protocol_version` - requested legacy revision, or a modern probe revision
   when the selected mode enables it.
 - `:timeout` - connect timeout.

@@ -75,6 +75,12 @@ defmodule Arbor.MCP.Transport.HTTP do
   Setting `use_sse: false` disables the legacy standalone GET stream. It does
   not disable a modern request-owned SSE response.
 
+  A server that has ended a session answers 404 to a request that carries it.
+  The client then starts a new session with an `initialize` that carries no
+  session id, as the legacy revisions require. When the 404 answers the
+  `initialize` that carried `:session_id`, the client sends that second
+  `initialize` at once. See "Streamable HTTP" in the transport guide.
+
   > #### Security Best Practices {: .warning}
   >
   > 1. **Always use HTTPS** in production

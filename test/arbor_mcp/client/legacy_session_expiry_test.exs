@@ -61,9 +61,12 @@ defmodule Arbor.MCP.Client.LegacySessionExpiryTest do
   setup do
     test = self()
     bypass = Bypass.open()
-    # Each initialize opens a new session; a request for any other session,
-    # an ended one included, gets the 404 a legacy server answers.
-    server = start_supervised!({Agent, fn -> %{generation: 0, live: nil} end})
+    # An initialize without a session id opens a new session, and one with
+    # the live session's id resumes it. A request for any other session, an
+    # ended one included, gets the 404 a legacy server answers. `new:` says
+    # how an initialize that opens a session is answered: `:open`, or
+    # `:unavailable` (503), or `:held` until the test releases it.
+    server = start_supervised!({Agent, fn -> %{generation: 0, live: nil, new: :open} end})
 
     Bypass.stub(bypass, "POST", "/mcp", fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
@@ -219,10 +222,13 @@ defmodule Arbor.MCP.Client.LegacySessionExpiryTest do
       await_handlers([new_stream])
     end
 
-    # A configured `:session_id` may be the session the server ended.
+    # A configured `:session_id` the server resumed is the session it ended.
     test "a configured session_id isn't sent with the new session's initialize",
          %{url: url, server: server} do
+      resume(server, "configured-session")
       client = start_client(url, reconnect: true, session_id: "configured-session")
+      assert_receive {:post, "initialize", "configured-session"}
+      assert_receive {:post, "notifications/initialized", "configured-session"}
       end_session(server)
 
       assert {:error, %TransportError{reason: {:session_expired, _detail}}} =
@@ -232,7 +238,42 @@ defmodule Arbor.MCP.Client.LegacySessionExpiryTest do
                      2_000
 
       assert_receive {:post, "initialize", nil}
-      assert_receive {:post, "notifications/initialized", "session-2"}
+      assert_receive {:post, "notifications/initialized", "session-1"}
+      refute_received {:post, "initialize", _session}
+    end
+
+    # The server ended the configured session while the client was away for
+    # another reason (here a lost connection), so the reconnect's initialize
+    # gets the 404: the client sends another without the id.
+    test "a reconnect starts a new session when the configured one has ended",
+         %{url: url, server: server} do
+      resume(server, "configured-session")
+      client = start_client(url, reconnect: true, session_id: "configured-session")
+      assert_receive {:post, "initialize", "configured-session"}
+      end_session(server)
+
+      send(client, {:transport_closed, :connection_lost})
+
+      assert_receive {:telemetry, [:arbor_mcp, :client, :reconnect, :success], ^client, _meta},
+                     2_000
+
+      assert_received {:post, "initialize", "configured-session"}
+      assert_received {:post, "initialize", nil}
+
+      refute_received {:telemetry, [:arbor_mcp, :client, :reconnect, :attempt], ^client,
+                       %{attempt: 2}}
+
+      assert {:ok, _tools} = Client.list_tools(client)
+      assert_receive {:post, "tools/list", "session-1"}
+
+      # The configured id is no longer offered to a later connection.
+      send(client, {:transport_closed, :connection_lost})
+
+      assert_receive {:telemetry, [:arbor_mcp, :client, :reconnect, :success], ^client, _meta},
+                     2_000
+
+      assert_received {:post, "initialize", nil}
+      refute_received {:post, "initialize", _session}
     end
 
     # The client keeps the circuit breaker and health check `reliability:`
@@ -272,6 +313,58 @@ defmodule Arbor.MCP.Client.LegacySessionExpiryTest do
       assert Process.alive?(new_checker) and new_checker != checker
       assert {:ok, _tools} = Client.list_tools(client)
       assert_receive {:post, "tools/list", "session-2"}
+    end
+  end
+
+  # start_link/1's initialize carries the configured id, and the server
+  # answers 404 for it: the client must start a new session instead.
+  describe "a configured session_id the server has ended" do
+    test "is replaced at start by a new session", %{url: url} do
+      client = start_client(url, reconnect: false, session_id: "ended-session")
+
+      assert_received {:post, "initialize", "ended-session"}
+      assert_received {:post, "initialize", nil}
+      assert_received {:post, "notifications/initialized", "session-1"}
+      refute_received {:post, "initialize", _session}
+
+      assert {:ok, _tools} = Client.list_tools(client)
+      assert_receive {:post, "tools/list", "session-1"}
+    end
+
+    test "is retried once, and the new session's failure is reported", %{
+      url: url,
+      server: server
+    } do
+      Process.flag(:trap_exit, true)
+      Agent.update(server, &%{&1 | new: :unavailable})
+
+      assert {:error, reason} = start(url, reconnect: false, session_id: "ended-session")
+      assert inspect(reason) =~ "503"
+      refute inspect(reason) =~ "session_expired"
+
+      assert_received {:post, "initialize", "ended-session"}
+      assert_received {:post, "initialize", nil}
+      refute_received {:post, "initialize", _session}
+    end
+
+    # The second initialize gets no more than the connection has left.
+    test "is retried within the establish deadline", %{url: url, server: server} do
+      Process.flag(:trap_exit, true)
+      Agent.update(server, &%{&1 | new: :held})
+      started = System.monotonic_time(:millisecond)
+
+      assert {:error, reason} =
+               start(url, reconnect: false, session_id: "ended-session", establish_timeout: 500)
+
+      elapsed = System.monotonic_time(:millisecond) - started
+      assert reason in [:establish_timeout, :handshake_timeout]
+      assert elapsed < 3_000
+
+      assert_received {:post, "initialize", "ended-session"}
+      assert_received {:post, "initialize", nil}
+      handler = receive_holding()
+      send(handler, :release)
+      await_handlers([handler])
     end
   end
 
@@ -396,6 +489,19 @@ defmodule Arbor.MCP.Client.LegacySessionExpiryTest do
   end
 
   defp start_client(url, opts) do
+    {:ok, client} = start(url, opts)
+    on_exit(fn -> stop(client) end)
+
+    # A test that configures a session checks the handshake itself.
+    unless Keyword.has_key?(opts, :session_id) do
+      assert_receive {:post, "initialize", nil}
+      assert_receive {:post, "notifications/initialized", "session-1"}
+    end
+
+    client
+  end
+
+  defp start(url, opts) do
     defaults = [
       transport: :http,
       url: url,
@@ -407,16 +513,11 @@ defmodule Arbor.MCP.Client.LegacySessionExpiryTest do
       reconnect_backoff: [initial: 10, max: 10, multiplier: 1]
     ]
 
-    {:ok, client} = Client.start_link(Keyword.merge(defaults, opts))
-    on_exit(fn -> stop(client) end)
-
-    configured = Keyword.get(opts, :session_id)
-    assert_receive {:post, "initialize", ^configured}
-    assert_receive {:post, "notifications/initialized", "session-1"}
-    client
+    Client.start_link(Keyword.merge(defaults, opts))
   end
 
   defp end_session(server), do: Agent.update(server, &%{&1 | live: nil})
+  defp resume(server, session), do: Agent.update(server, &%{&1 | live: session})
 
   defp live?(server, session),
     do: is_binary(session) and Agent.get(server, & &1.live) == session
@@ -424,28 +525,51 @@ defmodule Arbor.MCP.Client.LegacySessionExpiryTest do
   defp session_header(conn),
     do: conn |> Plug.Conn.get_req_header("mcp-session-id") |> List.first()
 
-  # initialize opens a new session, whatever session the request carried.
-  defp answer(conn, %{"method" => "initialize", "id" => id}, _session, server, _test) do
-    session =
-      Agent.get_and_update(server, fn state ->
-        generation = state.generation + 1
-        session = "session-#{generation}"
-        {session, %{state | generation: generation, live: session}}
-      end)
+  defp answer(conn, %{"method" => "initialize", "id" => id}, session, server, test) do
+    case initialize_session(server, session) do
+      {:ok, session} ->
+        result = %{
+          "protocolVersion" => @version,
+          "capabilities" => %{"tools" => %{}},
+          "serverInfo" => %{"name" => "session-ending", "version" => "1"}
+        }
 
-    result = %{
-      "protocolVersion" => @version,
-      "capabilities" => %{"tools" => %{}},
-      "serverInfo" => %{"name" => "session-ending", "version" => "1"}
-    }
+        conn
+        |> Plug.Conn.put_resp_header("mcp-session-id", session)
+        |> json(%{"jsonrpc" => "2.0", "id" => id, "result" => result})
 
-    conn
-    |> Plug.Conn.put_resp_header("mcp-session-id", session)
-    |> json(%{"jsonrpc" => "2.0", "id" => id, "result" => result})
+      :not_found ->
+        not_found(conn)
+
+      :unavailable ->
+        Plug.Conn.resp(conn, 503, "unavailable")
+
+      :held ->
+        Process.flag(:trap_exit, true)
+        send(test, {:holding, self()})
+        hold_until_released()
+        Plug.Conn.resp(conn, 503, "unavailable")
+    end
   end
 
   defp answer(conn, message, session, server, test) do
     if live?(server, session), do: serve(conn, message, test), else: not_found(conn)
+  end
+
+  defp initialize_session(server, nil) do
+    Agent.get_and_update(server, fn
+      %{new: :open} = state ->
+        generation = state.generation + 1
+        session = "session-#{generation}"
+        {{:ok, session}, %{state | generation: generation, live: session}}
+
+      %{new: refusal} = state ->
+        {refusal, state}
+    end)
+  end
+
+  defp initialize_session(server, session) do
+    if live?(server, session), do: {:ok, session}, else: :not_found
   end
 
   # tools/call holds until the test releases it, or the client closes its
