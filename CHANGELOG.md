@@ -104,6 +104,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An elicitation whose validation ran out of time was reported as invalid
+  params. On a busy server, a handler that returned a valid elicitation in an
+  `input_required` result could make the client get `-32602 "Invalid MRTR
+  input request"`, with nothing to say it was a timeout. That validation now
+  gets at most 1 s and never more than the request itself has left, rather
+  than a fresh second. Running out of time is now an internal error
+  (`-32603 "MRTR input request validation timed out"`, data `type`
+  `"elicitation_validation_timeout"` with the `inputRequestId` and `method`).
+  The same applies on the legacy bridge. `Arbor.MCP.Server.elicit/3`, over
+  HTTP and over the handler server, now returns `{:error, :timeout}` for it,
+  as it does when the client is too slow. Params that break the
+  ElicitRequest schema are still `-32602` and
+  `{:error, :invalid_elicitation_params}`. Reported by
+  arnavsharma2077-a11y.
 - A client that stopped because the process that started it exited could
   skip closing its transport, log a Task crash
   (`** (stop) :client_generation_retired`) and report
