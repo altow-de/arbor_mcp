@@ -16,6 +16,7 @@ defmodule Arbor.MCP.Client.ProgressToTest do
   alias Arbor.MCP.Server.{Context, HandlerServer, Runtime}
 
   @key :binary.copy(<<9>>, 32)
+  @answers %{"name" => %{"action" => "accept", "content" => %{"name" => "Tom"}}}
   @fixture Path.expand("../../../priv/test/progress_stdio_server.exs", __DIR__)
   @project_root Path.expand("../../..", __DIR__)
   @form %{"elicitation" => %{"form" => %{}}}
@@ -654,16 +655,15 @@ defmodule Arbor.MCP.Client.ProgressToTest do
 
       assert {:input_required, _round} = Task.await(round)
 
-      # Reserved for a continuation until the round's deadline, then held back
-      # for the cleanup grace.
-      %{"left" => {from, until}} = :sys.get_state(client).progress_tombstones
-      assert from > System.monotonic_time(:millisecond)
-      assert until - from == 1_000
+      # Reserved for a continuation until the round's deadline, and held
+      # back for the cleanup grace after it.
+      %{"left" => %{until: until}} = :sys.get_state(client).progress_reservations
+      assert until > System.monotonic_time(:millisecond)
 
       # Nothing continued it by then: a request that reuses the token now
       # gets no connection-level progress for it.
       :ok =
-        Arbor.MCP.TestHelpers.wait_until(fn -> System.monotonic_time(:millisecond) >= from end,
+        Arbor.MCP.TestHelpers.wait_until(fn -> System.monotonic_time(:millisecond) >= until end,
           timeout: 2_000
         )
 
@@ -711,6 +711,205 @@ defmodule Arbor.MCP.Client.ProgressToTest do
       message = Jason.encode!(Map.put(progress_message("far", 1), "jsonrpc", "2.0"))
       RequestHandler.parse_transport_message(message, state)
       assert_received {:arbor_mcp_progress, _client, "far", %{"progress" => 1}}
+    end
+
+    test "a manual continuation that omits progress_to gets the round's target back" do
+      client = scripted()
+      test_pid = self()
+      first = spawn_link(fn -> forward_to(test_pid, "first") end)
+
+      id = await_round(client, progress_to: first, progress_token: "c", request_state: "rs-1")
+
+      continuation =
+        start_call(client,
+          mrtr: :manual,
+          progress_token: "c",
+          input_responses: @answers,
+          request_state: "rs-1",
+          timeout: 5_000
+        )
+
+      assert_receive {:wire, %{"id" => next_id, "params" => %{"requestState" => "rs-1"}}}
+      refute next_id == id
+
+      # On either route.
+      progress(client, "c", 2)
+
+      assert_receive {:forwarded, "first",
+                      {:arbor_mcp_progress, ^client, "c", %{"progress" => 2}}}
+
+      state = :sys.get_state(client)
+      RequestHandler.handle_request_stream_message(next_id, progress_message("c", 3), state)
+
+      assert_receive {:forwarded, "first",
+                      {:arbor_mcp_progress, _client, "c", %{"progress" => 3}}}
+
+      respond(client, next_id)
+      assert {:ok, _result} = Task.await(continuation)
+    end
+
+    test "a manual continuation that names its own progress_to target uses it" do
+      client = scripted()
+      test_pid = self()
+      first = spawn_link(fn -> forward_to(test_pid, "first") end)
+      second = spawn_link(fn -> forward_to(test_pid, "second") end)
+
+      _id = await_round(client, progress_to: first, progress_token: "o", request_state: "rs-1")
+
+      continuation =
+        start_call(client,
+          mrtr: :manual,
+          progress_to: second,
+          progress_token: "o",
+          input_responses: @answers,
+          request_state: "rs-1",
+          timeout: 5_000
+        )
+
+      assert_receive {:wire, %{"id" => next_id, "params" => %{"requestState" => "rs-1"}}}
+      progress(client, "o", 2)
+      assert_receive {:forwarded, "second", {:arbor_mcp_progress, ^client, "o", _params}}
+      refute_received {:forwarded, "first", _message}
+
+      respond(client, next_id)
+      assert {:ok, _result} = Task.await(continuation)
+    end
+
+    test "only the round's own continuation can claim its reserved token" do
+      client = scripted()
+      test_pid = self()
+      round_target = spawn_link(fn -> forward_to(test_pid, "round") end)
+      other_target = spawn_link(fn -> forward_to(test_pid, "other") end)
+
+      _id =
+        await_round(client, progress_to: round_target, progress_token: "t", request_state: "rs-A")
+
+      # An unrelated call, and a continuation presenting another round's
+      # state, start, but get none of the round's late progress.
+      for {name, opts} <- [
+            {"other", []},
+            {"steps",
+             [mrtr: :manual, input_responses: @answers, request_state: "rs-X", timeout: 5_000]}
+          ] do
+        call =
+          Task.async(fn ->
+            Client.call_tool(
+              client,
+              name,
+              %{},
+              [progress_to: other_target, progress_token: "t"] ++ opts
+            )
+          end)
+
+        assert_receive {:wire, %{"id" => id, "method" => "tools/call"}}
+        progress(client, "t", 1)
+        _state = :sys.get_state(client)
+        refute_received {:forwarded, _target, _message}
+
+        respond(client, id)
+        assert {:ok, _result} = Task.await(call)
+      end
+    end
+
+    test "an input_required round's reservation never ends an earlier request's tombstone" do
+      client = scripted()
+      test_pid = self()
+      old_target = spawn_link(fn -> forward_to(test_pid, "old") end)
+      new_target = spawn_link(fn -> forward_to(test_pid, "new") end)
+
+      # A settles, so its token is tombstoned for the cleanup grace.
+      old = start_call(client, progress_to: old_target, progress_token: "r")
+      assert_receive {:wire, %{"id" => old_id}}
+      respond(client, old_id)
+      assert {:ok, _result} = Task.await(old)
+
+      # B reuses the token, returns input_required within the grace, and its
+      # continuation claims B's reservation.
+      _id =
+        await_round(client, progress_to: new_target, progress_token: "r", request_state: "rs-B")
+
+      continuation =
+        start_call(client,
+          mrtr: :manual,
+          progress_token: "r",
+          input_responses: @answers,
+          request_state: "rs-B",
+          timeout: 5_000
+        )
+
+      assert_receive {:wire, %{"id" => next_id, "params" => %{"requestState" => "rs-B"}}}
+
+      # A's late progress still reaches no target while A's tombstone lasts.
+      progress(client, "r", 9)
+      _state = :sys.get_state(client)
+      refute_received {:forwarded, _target, _message}
+
+      # Once it has gone, B's continuation gets its own progress.
+      :sys.replace_state(client, &%{&1 | progress_tombstones: %{}})
+      progress(client, "r", 1)
+      assert_receive {:forwarded, "new", {:arbor_mcp_progress, ^client, "r", %{"progress" => 1}}}
+
+      respond(client, next_id)
+      assert {:ok, _result} = Task.await(continuation)
+    end
+
+    # The client monitors a target's caller whatever cancel_on_caller_exit
+    # says. A pid on a node this VM isn't connected to stands in for a
+    # remote caller whose node connection is lost: its monitor fires with
+    # :noconnection.
+    test "a remote caller that can't be reached stops getting progress" do
+      client = scripted()
+
+      meta = %{
+        timeout: 30_000,
+        deadline: System.monotonic_time(:millisecond) + 30_000,
+        progress_to: self(),
+        cancel_on_caller_exit: false,
+        cache_mode: :bypass
+      }
+
+      params = %{"name" => "steps", "arguments" => %{}, "_meta" => %{"progressToken" => "far"}}
+
+      send(
+        client,
+        {:"$gen_call", {remote_pid(), make_ref()}, {:request, "tools/call", params, meta}}
+      )
+
+      assert_receive {:wire, %{"id" => id, "method" => "tools/call"}}
+
+      state = :sys.get_state(client)
+      assert Map.has_key?(state.pending_requests, id)
+      assert %{pid: nil} = state.progress_targets[id]
+
+      progress(client, "far", 1)
+      _state = :sys.get_state(client)
+      refute_received {:arbor_mcp_progress, _client, _token, _params}
+    end
+
+    test "a local caller that exits without cancelling stops getting progress" do
+      client = scripted()
+      test_pid = self()
+      target = spawn_link(fn -> forward_to(test_pid, "kept") end)
+
+      call =
+        start_call(client,
+          progress_to: target,
+          progress_token: "kept",
+          cancel_on_caller_exit: false
+        )
+
+      assert_receive {:wire, %{"id" => id, "method" => "tools/call"}}
+      ref = Process.monitor(call.pid)
+      Task.shutdown(call, :brutal_kill)
+      assert_receive {:DOWN, ^ref, :process, _pid, _reason}
+
+      state = :sys.get_state(client)
+      assert Map.has_key?(state.pending_requests, id)
+      assert %{pid: nil} = state.progress_targets[id]
+
+      progress(client, "kept", 1)
+      _state = :sys.get_state(client)
+      refute_received {:forwarded, _target, _message}
     end
 
     test "each request's progress goes only to its own target" do
@@ -887,6 +1086,33 @@ defmodule Arbor.MCP.Client.ProgressToTest do
   defp remote_pid do
     node = "remote@nowhere"
     :erlang.binary_to_term(<<131, 88, 119, byte_size(node), node::binary, 1::32, 0::32, 1::32>>)
+  end
+
+  # A manual round of "steps" that the scripted server answers with
+  # input_required and `request_state`; returns the round's request id.
+  defp await_round(client, opts) do
+    {request_state, opts} = Keyword.pop!(opts, :request_state)
+    round = start_call(client, [mrtr: :manual, timeout: 5_000] ++ opts)
+    assert_receive {:wire, %{"id" => id, "method" => "tools/call"}}
+
+    result = %{
+      "resultType" => "input_required",
+      "inputRequests" => %{
+        "name" => %{
+          "method" => "elicitation/create",
+          "params" => %{"message" => "Name?", "requestedSchema" => %{"type" => "object"}}
+        }
+      },
+      "requestState" => request_state
+    }
+
+    send(
+      client,
+      {:transport_message, Jason.encode!(%{"jsonrpc" => "2.0", "id" => id, "result" => result})}
+    )
+
+    assert {:input_required, %{request_state: ^request_state}} = Task.await(round)
+    id
   end
 
   defp start_call(client, opts) do

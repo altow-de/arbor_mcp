@@ -122,11 +122,14 @@ defmodule Arbor.MCP.Client do
     # Progress tokens of pending requests, mapped to their request ids, so a
     # connection-level notifications/progress reaches the request it reports on.
     progress_requests: %{},
-    # Requests made with progress_to:, mapped to the process that also gets
-    # their progress, and the tokens of recently settled requests that no
-    # target may receive progress for yet (see RequestHandler).
+    # progress_to: bookkeeping (see RequestHandler): the pending requests'
+    # targets, the tokens no target may receive progress for yet, the tokens
+    # input_required rounds keep for their continuations, and the monitors
+    # on the targets' callers.
     progress_targets: %{},
     progress_tombstones: %{},
+    progress_reservations: %{},
+    progress_monitors: %{},
     # Requests made with reset_timeout_on_progress, mapped to the timer that
     # runs out if they go that long without progress: {timer, tag, ms}.
     progress_timeouts: %{},
@@ -1896,7 +1899,7 @@ defmodule Arbor.MCP.Client do
 
     NotificationListener.close_all(state.notification_listeners, :disconnected)
     reset_notification_worker(state)
-    state = RequestHandler.forget_callers(state)
+    state = state |> RequestHandler.forget_callers() |> RequestHandler.reset_progress()
 
     # Update state to disconnected. The manual_disconnect flag ensures a
     # late {:transport_closed, _} message does not trigger auto-reconnection.
@@ -1910,8 +1913,6 @@ defmodule Arbor.MCP.Client do
         pending_requests: %{},
         pending_batches: %{},
         cancelled_requests: MapSet.new(),
-        progress_targets: %{},
-        progress_tombstones: %{},
         receiver_task: nil,
         health_check_ref: nil,
         health_check_id: nil,
@@ -2347,6 +2348,17 @@ defmodule Arbor.MCP.Client do
   def handle_info({:DOWN, ref, :process, _caller, _reason}, %{caller_monitors: monitors} = state)
       when is_map(monitors) and is_map_key(monitors, ref) do
     {:noreply, caller_exited(ref, state)}
+  end
+
+  # The caller of a request with a progress_to target went down, here or on
+  # another node, or its node's connection was lost: the target gets nothing
+  # more. The request settles as it would (see cancel_on_caller_exit).
+  def handle_info(
+        {:DOWN, ref, :process, _caller, _reason},
+        %{progress_monitors: monitors} = state
+      )
+      when is_map(monitors) and is_map_key(monitors, ref) do
+    {:noreply, RequestHandler.progress_caller_down(ref, state)}
   end
 
   def handle_info(
@@ -3214,7 +3226,7 @@ defmodule Arbor.MCP.Client do
     state = retire_callback_work(state)
     state = retire_links(state)
     reply_pending_with_close_error(reason, state)
-    state = RequestHandler.forget_callers(state)
+    state = state |> RequestHandler.forget_callers() |> RequestHandler.reset_progress()
     notify_subscription_processes(state, {:client_subscription_disconnected, reason})
 
     :telemetry.execute(
@@ -3249,8 +3261,6 @@ defmodule Arbor.MCP.Client do
         pending_requests: %{},
         pending_batches: %{},
         cancelled_requests: MapSet.new(),
-        progress_targets: %{},
-        progress_tombstones: %{},
         health_check_ref: nil,
         health_check_id: nil,
         async_post_tasks: %{},

@@ -96,9 +96,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     or a cancellation. A request's target gets only that request's progress.
     The token of a request that settled less than a second ago reaches no
     target, so a late notification can't reach a newer request that reuses
-    it. Use connection-unique tokens. An `input_required` round's token stays
-    reserved for the next round until the round's deadline, so MRTR
-    continuations keep their progress.
+    it. Use connection-unique tokens. An `input_required` round's token and
+    target stay reserved until the round's deadline for its own
+    continuation, the request that presents the round's `request_state`.
+    The continuation gets the target back even if it doesn't repeat
+    `progress_to:`.
+  - Delivery stops when the caller goes down, local or remote, whether or
+    not the request is cancelled: the client monitors the caller of every
+    request with a target, and a lost node connection stops delivery too.
   - A dead target misses the updates without failing the request.
 
   See "Progress to another process" in `docs/PROTOCOL_GUIDE.md`.

@@ -438,6 +438,13 @@ end
   deadline on its own clock, so a caller on another node gets its progress
   whatever that node's clock says. Progress that arrives later, as late
   notifications on stdio or legacy HTTP can, isn't sent.
+- **Delivery stops when the caller goes down,** whether or not
+  `cancel_on_caller_exit:` cancels the request: the client monitors the
+  caller of every request with a target. That works for a caller on another
+  node too. If the connection to the caller's node is lost, the monitor
+  fires with `:noconnection` and delivery stops, even though the caller may
+  still be running there. A target on another node gets its updates by plain
+  message, so updates sent while its node is unreachable are lost.
 - **A request's target gets only that request's progress.** A message on a
   modern request stream that names another request's token is dropped. After
   a request settles, its token is held back for a second, the client's
@@ -445,12 +452,23 @@ end
   a late notification can't reach a newer request that reuses the token.
   Such a newer request gets its progress at its target only once that
   second has passed.
-- **An `input_required` round doesn't settle its call.** Its token stays
-  reserved until the round's deadline, or the client's default timeout when
-  the round had none, for the next round to reuse: an automatic one, or a
-  manual one that passes the same `:progress_token`. The next round's
-  progress arrives as usual. If no round continues it by then, the token is
-  held back for a second from that point, as for any settled request.
+- **An `input_required` round doesn't settle its call.** Its token and
+  target stay reserved until the round's deadline, or the client's default
+  timeout when the round had none, for the round's own continuation.
+  - **Who can claim it:** a request with the same method and name that
+    presents the `request_state` the round returned, or, if the server
+    returned none, answers the same input request ids. Automatic MRTR's
+    rounds do this by themselves. A manual continuation claims it with
+    `request_state:` and the same `:progress_token`.
+  - **What a claim gets:** the round's target, unless the continuation
+    names its own `progress_to:`.
+  - **Anyone else:** any other request with the token starts as usual, but
+    its target gets nothing while the reservation lasts. Neither does a
+    continuation that comes after the round's deadline.
+  - **Expiry:** once the round's deadline has passed, the token is held back
+    for a second more, as for a settled request.
+  - **Tombstones still apply:** a claim never ends a hold left by an earlier
+    request that used the token.
 - **Use tokens that are unique on the connection.** The client's generated
   tokens are. A gateway that forwards downstream requests shouldn't reuse
   downstream tokens upstream, since different downstream clients may pick

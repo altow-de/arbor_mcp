@@ -1443,104 +1443,193 @@ defmodule Arbor.MCP.Client.RequestHandler do
   # chose, alongside the client handler, but only while that request is
   # pending for its caller, and never to another request's target.
   #
-  # - `progress_targets` maps a pending request's id to its target, its own
-  #   progress token, its caller and the caller's deadline. The entry is made
-  #   once the request is pending, and dropped by settle_progress/2, through
-  #   drop_pending/2 or handle_pending_response, when the caller has its
-  #   answer (a result, an error, a timeout, a cancellation) or has exited,
-  #   or with every other when the connection goes (the client's disconnect
-  #   and teardown clear the map).
-  # - `progress_tombstones` holds the tokens of settled requests, each with
-  #   the window `{from, until}` in which it is held back. Connection-level
-  #   progress names its request only by token, and a settled request's late
-  #   notification (legacy HTTP can send one on the GET stream after the
-  #   POST's response) would otherwise reach a newer request that reuses the
-  #   token. While a token is held back, connection-level progress naming it
-  #   reaches no target. Client-generated tokens are unique and never meet
-  #   one.
-  #   - A request that settles holds its token back at once, for the
-  #     cleanup grace.
-  #   - An input_required round doesn't settle its call: the next round,
-  #     automatic or manual, carries the same token. Its token is reserved
-  #     for that continuation until the round's deadline, and only then held
-  #     back for the grace. A continuation that arrives first takes the
-  #     reservation, so its progress is delivered.
-  # - Deadlines are on this node's clock: a remote caller's monotonic time
-  #   can't be compared with it.
-  defp remember_progress_target(
-         state,
-         id,
-         request,
-         {caller, _tag},
-         deadline,
-         %{progress_to: pid} = meta
-       )
-       when is_pid(pid) and is_pid(caller) do
-    token = get_in(request, ["params", "_meta", "progressToken"])
+  # - `progress_targets` maps each pending request that carries a progress
+  #   token to its token, its target (nil when it has none), its caller and
+  #   the caller's deadline (on this node's clock, see request_send_context/3),
+  #   the monitor on its caller, and its round, {method, name}. The entry is
+  #   made once the request is pending, and dropped by settle_progress/3,
+  #   through drop_pending/2 or handle_pending_response, when the caller has
+  #   its answer (a result, an error, a timeout, a cancellation). A caller
+  #   that goes down, on this node or another (a lost node connection is
+  #   :noconnection), loses its target at once (progress_caller_down/2).
+  # - `progress_tombstones` maps the token of a settled request to when it
+  #   stops being held back, the cleanup grace from its settling. Connection-
+  #   level progress names its request only by token, and a settled request's
+  #   late notification (legacy HTTP can send one on the GET stream after the
+  #   POST's response) would otherwise reach a newer request that reuses it.
+  # - `progress_reservations` maps the token of an input_required round to
+  #   the round's identity (method, name and the requestState it returned,
+  #   or its input request ids), its target and its deadline. The round
+  #   doesn't settle its call: the continuation carries the same token, and a
+  #   continuation that presents that identity, automatic or manual, claims
+  #   the reservation and gets the target back unless it names its own. Any
+  #   other request with the token is held back like a reuse.
+  # - A token is held back while it is tombstoned or reserved, a reservation
+  #   until the grace after its deadline. Then connection-level progress
+  #   naming it reaches no target. A claim takes only the reservation, never
+  #   a tombstone, and a reservation never replaces one. Client-generated
+  #   tokens are unique and never meet either.
+  defp remember_progress_target(state, id, request, {caller, _tag}, deadline, meta)
+       when is_pid(caller) do
+    case get_in(request, ["params", "_meta", "progressToken"]) do
+      nil ->
+        state
 
-    target = %{
-      pid: pid,
-      token: token,
-      caller: caller,
-      deadline: local_deadline(caller, deadline, meta)
-    }
+      token ->
+        state = prune_settled_targets(state)
+        {reserved, state} = claim_reservation(state, token, request)
+        pid = Map.get(meta, :progress_to) || reserved
+        monitor = if is_pid(pid), do: Process.monitor(caller)
 
-    # Settling drops each entry; a request settled on a path that doesn't
-    # is dropped here, so the map never outgrows the pending requests.
-    live =
-      Map.filter(progress_targets(state), fn {request_id, _target} ->
-        Map.has_key?(state.pending_requests, request_id)
-      end)
+        target = %{
+          pid: pid,
+          token: token,
+          caller: caller,
+          deadline: deadline,
+          monitor: monitor,
+          round: mrtr_round(request)
+        }
 
-    state
-    |> Map.put(:progress_targets, Map.put(live, id, target))
-    |> take_reservation(token)
+        state
+        |> Map.put(:progress_targets, Map.put(progress_targets(state), id, target))
+        |> put_progress_monitor(monitor, id)
+    end
   end
 
   defp remember_progress_target(state, _id, _request, _from, _deadline, _meta), do: state
 
-  # A local caller's deadline is on this clock already. A remote caller's
-  # relative timeout counts from now, as legacy_request_cutoff/3 does.
-  defp local_deadline(caller, deadline, _meta) when node(caller) == node(), do: deadline
-  defp local_deadline(_caller, _deadline, meta), do: remote_relative_deadline(meta)
+  # Settling drops each entry; a request settled on a path that doesn't is
+  # dropped here, so the map never outgrows the pending requests.
+  defp prune_settled_targets(state) do
+    {settled, live} =
+      Map.split_with(progress_targets(state), fn {request_id, _target} ->
+        not Map.has_key?(state.pending_requests, request_id)
+      end)
 
-  # The continuation of an input_required round takes the token's
-  # reservation; a token already held back stays held back.
-  defp take_reservation(state, token) do
-    now = now()
+    Enum.reduce(settled, Map.put(state, :progress_targets, live), fn {_id, target}, acc ->
+      forget_progress_monitor(acc, target.monitor)
+    end)
+  end
 
-    case Map.get(Map.get(state, :progress_tombstones) || %{}, token) do
-      {from, _until} when from > now ->
-        Map.update!(state, :progress_tombstones, &Map.delete(&1, token))
+  defp mrtr_round(%{"method" => method, "params" => params}) when is_map(params),
+    do: {method, params["name"] || params["uri"]}
 
-      _held_or_none ->
-        state
+  defp mrtr_round(%{"method" => method}), do: {method, nil}
+
+  # What a continuation must present: the requestState the round returned,
+  # or, when it returned none, the ids of the input requests it answers.
+  defp continuation(%{"requestState" => request_state}) when is_binary(request_state),
+    do: {:state, :crypto.hash(:sha256, request_state)}
+
+  defp continuation(%{"inputResponses" => responses}) when is_map(responses),
+    do: {:inputs, responses |> Map.keys() |> Enum.sort()}
+
+  defp continuation(_params), do: nil
+
+  defp round_continuation(%{"requestState" => request_state}) when is_binary(request_state),
+    do: {:state, :crypto.hash(:sha256, request_state)}
+
+  defp round_continuation(result),
+    do: {:inputs, result |> Map.get("inputRequests", %{}) |> Map.keys() |> Enum.sort()}
+
+  defp claim_reservation(state, token, request) do
+    reservations = progress_reservations(state)
+    identity = {mrtr_round(request), continuation(Map.get(request, "params") || %{})}
+
+    case Map.get(reservations, token) do
+      %{identity: ^identity, pid: pid} = reservation
+      when not is_map_key(reservation, :contested) ->
+        if elem(identity, 1) != nil and now() < reservation.until,
+          do: {pid, Map.put(state, :progress_reservations, Map.delete(reservations, token))},
+          else: {nil, state}
+
+      _none_or_another ->
+        {nil, state}
     end
   end
 
   @doc false
   # The caller of request `id` has its answer, `response` if the server sent
-  # one: its progress reaches no target from now on, and its token is held
-  # back, at once, or from the round's deadline if the answer is an
-  # input_required round whose continuation will carry the token.
+  # one: its progress reaches no target from now on. Its token is held back
+  # for the grace, or reserved for the continuation if the answer is an
+  # input_required round.
   @spec settle_progress(map(), term(), term()) :: map()
   def settle_progress(state, id, response \\ nil) do
     {target, targets} = Map.pop(progress_targets(state), id)
-    state = Map.put(state, :progress_targets, targets)
 
-    case (target && target.token) || request_token(state, id) do
-      nil -> state
-      token -> tombstone_token(state, token, id, hold_from(response, target, state))
+    state =
+      state
+      |> Map.put(:progress_targets, targets)
+      |> forget_progress_monitor(target && target.monitor)
+
+    case {target, (target && target.token) || request_token(state, id)} do
+      {_target, nil} -> state
+      {%{} = target, token} -> settle_token(state, token, id, target, response)
+      {nil, token} -> tombstone_token(state, token, id)
     end
   end
 
-  defp hold_from({:ok, result}, target, state) do
+  defp settle_token(state, token, id, target, {:ok, result}) do
     if MRTR.input_required?(result),
-      do: (target && target.deadline) || now() + (state.default_timeout || 5_000),
-      else: now()
+      do: reserve_token(state, token, id, target, result),
+      else: tombstone_token(state, token, id)
   end
 
-  defp hold_from(_response, _target, _state), do: now()
+  defp settle_token(state, token, id, _target, _response), do: tombstone_token(state, token, id)
+
+  # Two rounds that reserve one token at once can't tell their continuations
+  # apart: neither may claim it, and both stay held back.
+  defp reserve_token(state, token, id, target, result) do
+    now = now()
+    until = target.deadline || now + (state.default_timeout || 5_000)
+
+    reservation = %{
+      identity: {target.round, round_continuation(result)},
+      pid: target.pid,
+      until: until
+    }
+
+    reservations =
+      progress_reservations(state)
+      |> Map.filter(fn {_token, held} -> held.until + @caller_timeout_grace > now end)
+
+    reservations =
+      case Map.get(reservations, token) do
+        nil ->
+          Map.put(reservations, token, reservation)
+
+        held ->
+          contested = %{reservation | until: max(held.until, until)}
+          Map.put(reservations, token, Map.put(contested, :contested, true))
+      end
+
+    state
+    |> Map.put(:progress_reservations, reservations)
+    |> forget_progress_request(token, id)
+  end
+
+  defp tombstone_token(state, token, id) do
+    now = now()
+
+    tombstones =
+      (Map.get(state, :progress_tombstones) || %{})
+      |> Map.filter(fn {_token, until} -> until > now end)
+      |> Map.update(token, now + @caller_timeout_grace, &max(&1, now + @caller_timeout_grace))
+
+    state
+    |> Map.put(:progress_tombstones, tombstones)
+    |> forget_progress_request(token, id)
+  end
+
+  defp forget_progress_request(state, token, id) do
+    requests =
+      case Map.get(state, :progress_requests) || %{} do
+        %{^token => ^id} = requests -> Map.delete(requests, token)
+        requests -> requests
+      end
+
+    Map.put(state, :progress_requests, requests)
+  end
 
   defp request_token(state, id) do
     Enum.find_value(Map.get(state, :progress_requests) || %{}, fn
@@ -1549,34 +1638,65 @@ defmodule Arbor.MCP.Client.RequestHandler do
     end)
   end
 
-  defp tombstone_token(state, token, id, from) do
+  # Tombstones first: a claimed reservation doesn't end a tombstone.
+  defp held_back?(state, token) do
     now = now()
 
-    tombstones =
-      (Map.get(state, :progress_tombstones) || %{})
-      |> Map.filter(fn {_token, {_from, until}} -> until > now end)
-      |> Map.put(token, {from, from + @caller_timeout_grace})
+    case Map.get(Map.get(state, :progress_tombstones) || %{}, token) do
+      until when is_integer(until) and until > now ->
+        true
 
-    requests =
-      case Map.get(state, :progress_requests) || %{} do
-        %{^token => ^id} = requests -> Map.delete(requests, token)
-        requests -> requests
-      end
-
-    state
-    |> Map.put(:progress_tombstones, tombstones)
-    |> Map.put(:progress_requests, requests)
+      _none ->
+        case Map.get(progress_reservations(state), token) do
+          %{until: until} -> now < until + @caller_timeout_grace
+          nil -> false
+        end
+    end
   end
 
-  defp tombstoned?(state, token) do
-    case Map.get(Map.get(state, :progress_tombstones) || %{}, token) do
-      {from, until} ->
-        now = now()
-        from <= now and now < until
+  @doc false
+  # The caller of a request with a target went down, or its node's
+  # connection was lost (:noconnection): the target gets nothing more, while
+  # the request itself settles as it would.
+  @spec progress_caller_down(reference(), map()) :: map()
+  def progress_caller_down(monitor, state) do
+    {id, monitors} = Map.pop(progress_monitors(state), monitor)
+    state = Map.put(state, :progress_monitors, monitors)
+
+    case Map.get(progress_targets(state), id) do
+      %{} = target ->
+        targets = Map.put(progress_targets(state), id, %{target | pid: nil, monitor: nil})
+        Map.put(state, :progress_targets, targets)
 
       nil ->
-        false
+        state
     end
+  end
+
+  @doc false
+  # The connection went with its requests: no target, reservation or
+  # tombstone outlives it.
+  @spec reset_progress(map()) :: map()
+  def reset_progress(state) do
+    state |> progress_monitors() |> Map.keys() |> Enum.each(&Process.demonitor(&1, [:flush]))
+
+    state
+    |> Map.put(:progress_targets, %{})
+    |> Map.put(:progress_tombstones, %{})
+    |> Map.put(:progress_reservations, %{})
+    |> Map.put(:progress_monitors, %{})
+  end
+
+  defp put_progress_monitor(state, nil, _id), do: state
+
+  defp put_progress_monitor(state, monitor, id),
+    do: Map.put(state, :progress_monitors, Map.put(progress_monitors(state), monitor, id))
+
+  defp forget_progress_monitor(state, nil), do: state
+
+  defp forget_progress_monitor(state, monitor) do
+    Process.demonitor(monitor, [:flush])
+    Map.put(state, :progress_monitors, Map.delete(progress_monitors(state), monitor))
   end
 
   # `route` is :stream for a modern request stream, which carries only its
@@ -1585,9 +1705,12 @@ defmodule Arbor.MCP.Client.RequestHandler do
     token = Map.get(params, "progressToken")
 
     case Map.get(progress_targets(state), request_id) do
-      %{token: ^token} = target ->
+      %{token: ^token, pid: pid} = target when is_pid(pid) ->
         if deliverable?(route, target, request_id, state),
-          do: send(target.pid, {:arbor_mcp_progress, self(), token, params})
+          do: send(pid, {:arbor_mcp_progress, self(), token, params})
+
+      %{token: ^token} ->
+        :ok
 
       %{} ->
         Logger.debug("Request stream progress named another request's token")
@@ -1603,12 +1726,16 @@ defmodule Arbor.MCP.Client.RequestHandler do
     Map.has_key?(state.pending_requests, request_id) and
       not Deadline.expired?(target.deadline) and
       caller_alive?(target.caller) and
-      not (route == :connection and tombstoned?(state, target.token))
+      not (route == :connection and held_back?(state, target.token))
   end
 
-  # Liveness can only be asked on the caller's own node.
+  # A local caller's death is seen at once; a remote one's through the
+  # monitor on it (progress_caller_down/2).
   defp caller_alive?(caller) when node(caller) == node(), do: Process.alive?(caller)
   defp caller_alive?(_remote), do: true
+
+  defp progress_reservations(state), do: Map.get(state, :progress_reservations) || %{}
+  defp progress_monitors(state), do: Map.get(state, :progress_monitors) || %{}
 
   defp progress_targets(state), do: Map.get(state, :progress_targets) || %{}
 
