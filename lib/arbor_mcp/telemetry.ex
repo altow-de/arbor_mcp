@@ -37,7 +37,9 @@ defmodule Arbor.MCP.Telemetry do
   * `[:arbor_mcp, :client, :era, :fallback]` - Modern probe fell back to legacy
   * `[:arbor_mcp, :client, :era, :downgrade_attempt]` - A pinned modern endpoint was observed as legacy
   * `[:arbor_mcp, :client, :era, :unsupported_version_retry]` - Discovery retried a supported modern version
-  * `[:arbor_mcp, :client, :mrtr, :round | :failure]` - MRTR progress or bounded failure class
+  * `[:arbor_mcp, :client, :mrtr, :round | :failure]` - MRTR progress or bounded failure class;
+    `mode` is `:auto` when the client handler answered the round and `:manual`
+    when it was handed to the caller (`mrtr: :manual`)
   * `[:arbor_mcp, :client, :subscription, :reconnect]` - Subscription reconnect scheduled/completed
   * `[:arbor_mcp, :client, :http, :request, :retry]` - Ambiguous HTTP stream reissue
 

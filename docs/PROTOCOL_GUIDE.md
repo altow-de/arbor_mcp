@@ -102,6 +102,34 @@ connection. The raw
 `%{"method" => "elicitation/create", "params" => %{"message" => ...,
 "requestedSchema" => ...}}` map is equivalent to `Arbor.MCP.Server.elicit/1`.
 
+A client that forwards the call for another client, such as a gateway, lets
+that client answer instead. With `mrtr: :manual` the round comes back as
+`{:input_required, %{input_requests: requests, request_state: state, meta: meta}}`,
+and `input_responses:` and `request_state:` continue the call; with
+`client_capabilities:` the request declares the other client's capabilities:
+
+```elixir
+{:input_required, %{input_requests: requests, request_state: state}} =
+  Arbor.MCP.Client.call_tool(client, "onboard", %{},
+    mrtr: :manual,
+    client_capabilities: downstream_capabilities
+  )
+
+answers = ask_downstream(requests)
+
+{:ok, result} =
+  Arbor.MCP.Client.call_tool(client, "onboard", %{},
+    mrtr: :manual,
+    client_capabilities: downstream_capabilities,
+    input_responses: answers,
+    request_state: state
+  )
+```
+
+Each round repeats the arguments, capabilities and progress token, so
+`reset_timeout_on_progress: true` needs an explicit `:progress_token` here. See
+[Forwarding clients](CONFIGURATION.md#forwarding-clients-mcp-2026-07-28).
+
 ### URL mode
 
 URL mode sends the user to a page instead of a form. Advertise

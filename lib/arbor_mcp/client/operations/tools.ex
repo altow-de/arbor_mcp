@@ -73,6 +73,10 @@ defmodule Arbor.MCP.Client.Operations.Tools do
     result must carry `structuredContent` that conforms to it, or the call
     returns `{:error, %Arbor.MCP.Error.ValidationError{field: :structured_content}}`.
     `isError` results aren't checked.
+  - `:mrtr`, `:input_responses`, `:request_state`, `:client_capabilities` -
+    for a client that forwards the call for another client, which answers
+    each MCP 2026-07-28 MRTR round itself; see "Forwarding a call" under
+    `Arbor.MCP.Client.call_tool/4`
 
   ## Examples
 
@@ -93,7 +97,7 @@ defmodule Arbor.MCP.Client.Operations.Tools do
           Types.tool_name(),
           Types.tool_arguments(),
           Types.request_opts_or_timeout()
-        ) :: Types.mcp_response()
+        ) :: Types.mrtr_response()
   def call_tool(client, tool_name, arguments, timeout_or_opts \\ 30_000)
 
   def call_tool(client, tool_name, arguments, timeout) when is_integer(timeout) do
