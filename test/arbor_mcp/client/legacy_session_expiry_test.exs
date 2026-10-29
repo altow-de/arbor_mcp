@@ -65,8 +65,14 @@ defmodule Arbor.MCP.Client.LegacySessionExpiryTest do
     # the live session's id resumes it. A request for any other session, an
     # ended one included, gets the 404 a legacy server answers. `new:` says
     # how an initialize that opens a session is answered: `:open`, or
-    # `:unavailable` (503), or `:held` until the test releases it.
-    server = start_supervised!({Agent, fn -> %{generation: 0, live: nil, new: :open} end})
+    # `:unavailable` (503), or `:held` until the test releases it. One that
+    # offers a revision outside `accepts:` is rejected with -32602, and
+    # `discover:` `{:unsupported, versions}` answers server/discover with a
+    # -32022 that lists them (nil: the 404 of a server without it).
+    server =
+      start_supervised!(
+        {Agent, fn -> %{generation: 0, live: nil, new: :open, accepts: :any, discover: nil} end}
+      )
 
     Bypass.stub(bypass, "POST", "/mcp", fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
@@ -368,6 +374,85 @@ defmodule Arbor.MCP.Client.LegacySessionExpiryTest do
     end
   end
 
+  # Each connection attempt offers an ended configured session once, whatever
+  # else the attempt goes on to try.
+  describe "a configured session_id the server has ended, while the era is negotiated" do
+    # Under :prefer_legacy the session-free initialize can be rejected for
+    # its revision. The client then probes and initializes again with a
+    # revision the server lists; that initialize must not offer the ended
+    # session again.
+    test "is offered once across a prefer_legacy version retry", %{url: url, server: server} do
+      Agent.update(
+        server,
+        &%{&1 | accepts: ["2025-06-18"], discover: {:unsupported, ["2025-06-18"]}}
+      )
+
+      client =
+        start_client(url,
+          reconnect: false,
+          protocol_mode: :prefer_legacy,
+          session_id: "ended-session"
+        )
+
+      assert {:ok, "2025-06-18"} = Client.negotiated_version(client)
+
+      assert posts() == [
+               {"initialize", "ended-session"},
+               {"initialize", nil},
+               {"server/discover", nil},
+               {"initialize", nil},
+               {"notifications/initialized", "session-1"}
+             ]
+
+      assert_received {:initialize, "ended-session", "2025-11-25"}
+      assert_received {:initialize, nil, "2025-11-25"}
+      assert_received {:initialize, nil, "2025-06-18"}
+    end
+
+    test "is offered once under prefer_modern's legacy fallback", %{url: url, server: server} do
+      Agent.update(
+        server,
+        &%{&1 | accepts: ["2025-06-18"], discover: {:unsupported, ["2025-06-18"]}}
+      )
+
+      client =
+        start_client(url,
+          reconnect: false,
+          protocol_mode: :prefer_modern,
+          session_id: "ended-session"
+        )
+
+      assert {:ok, "2025-06-18"} = Client.negotiated_version(client)
+
+      assert posts() == [
+               {"server/discover", nil},
+               {"initialize", "ended-session"},
+               {"initialize", nil},
+               {"notifications/initialized", "session-1"}
+             ]
+    end
+
+    test "is offered once when prefer_modern's fallback fails", %{url: url, server: server} do
+      Process.flag(:trap_exit, true)
+      Agent.update(server, &%{&1 | accepts: [], discover: {:unsupported, ["2025-06-18"]}})
+
+      assert {:error, reason} =
+               start(url,
+                 reconnect: false,
+                 protocol_mode: :prefer_modern,
+                 session_id: "ended-session"
+               )
+
+      assert inspect(reason) =~ "era_probe_and_initialize_failed"
+
+      assert posts() == [
+               {"server/discover", nil},
+               {"initialize", "ended-session"},
+               {"initialize", nil}
+             ]
+    end
+  end
+
   test "with reconnect: false the client disconnects instead", %{url: url, server: server} do
     client = start_client(url, reconnect: false)
     end_session(server)
@@ -525,11 +610,14 @@ defmodule Arbor.MCP.Client.LegacySessionExpiryTest do
   defp session_header(conn),
     do: conn |> Plug.Conn.get_req_header("mcp-session-id") |> List.first()
 
-  defp answer(conn, %{"method" => "initialize", "id" => id}, session, server, test) do
-    case initialize_session(server, session) do
+  defp answer(conn, %{"method" => "initialize", "id" => id} = message, session, server, test) do
+    version = get_in(message, ["params", "protocolVersion"])
+    send(test, {:initialize, session, version})
+
+    case initialize_session(server, session, version) do
       {:ok, session} ->
         result = %{
-          "protocolVersion" => @version,
+          "protocolVersion" => version,
           "capabilities" => %{"tools" => %{}},
           "serverInfo" => %{"name" => "session-ending", "version" => "1"}
         }
@@ -537,6 +625,17 @@ defmodule Arbor.MCP.Client.LegacySessionExpiryTest do
         conn
         |> Plug.Conn.put_resp_header("mcp-session-id", session)
         |> json(%{"jsonrpc" => "2.0", "id" => id, "result" => result})
+
+      {:unsupported_version, supported} ->
+        error = %{
+          "code" => -32_602,
+          "message" => "Unsupported protocol version",
+          "data" => %{"supported" => supported, "requested" => version}
+        }
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(400, Jason.encode!(%{"jsonrpc" => "2.0", "id" => id, "error" => error}))
 
       :not_found ->
         not_found(conn)
@@ -552,24 +651,58 @@ defmodule Arbor.MCP.Client.LegacySessionExpiryTest do
     end
   end
 
+  defp answer(conn, %{"method" => "server/discover", "id" => id}, _session, server, _test) do
+    case Agent.get(server, & &1.discover) do
+      {:unsupported, supported} ->
+        error = %{
+          "code" => -32_022,
+          "message" => "Unsupported protocol version",
+          "data" => %{"supported" => supported, "requested" => "2026-07-28"}
+        }
+
+        json(conn, %{"jsonrpc" => "2.0", "id" => id, "error" => error})
+
+      nil ->
+        not_found(conn)
+    end
+  end
+
   defp answer(conn, message, session, server, test) do
     if live?(server, session), do: serve(conn, message, test), else: not_found(conn)
   end
 
-  defp initialize_session(server, nil) do
+  defp initialize_session(server, nil, version) do
     Agent.get_and_update(server, fn
+      %{accepts: accepts} = state when is_list(accepts) ->
+        if version in accepts,
+          do: open_session(state),
+          else: {{:unsupported_version, accepts}, state}
+
       %{new: :open} = state ->
-        generation = state.generation + 1
-        session = "session-#{generation}"
-        {{:ok, session}, %{state | generation: generation, live: session}}
+        open_session(state)
 
       %{new: refusal} = state ->
         {refusal, state}
     end)
   end
 
-  defp initialize_session(server, session) do
+  defp initialize_session(server, session, _version) do
     if live?(server, session), do: {:ok, session}, else: :not_found
+  end
+
+  defp open_session(state) do
+    generation = state.generation + 1
+    session = "session-#{generation}"
+    {{:ok, session}, %{state | generation: generation, live: session}}
+  end
+
+  # The posts the server has received so far, in order, as {method, session}.
+  defp posts(acc \\ []) do
+    receive do
+      {:post, method, session} -> posts([{method, session} | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
   end
 
   # tools/call holds until the test releases it, or the client closes its

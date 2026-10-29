@@ -178,7 +178,9 @@ Supported client options include:
   `initialize`, without the id, and starts a new session. That `initialize`
   gets its own `:handshake_timeout`, within what the connection's
   `:establish_timeout` has left. If that one fails too, `start_link/1` or the
-  reconnect reports its failure. Once the server has ended the configured
+  reconnect reports its failure. A connection attempt offers the ended
+  session once, even when it goes on to initialize again (a `:prefer_legacy`
+  retry with another revision), and once the server has ended the configured
   session, no later reconnect offers it again.
 - `:protocol_version` - requested legacy revision, or a modern probe revision
   when the selected mode enables it.

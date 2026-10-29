@@ -183,8 +183,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session, as the 2025-03-26 to 2025-11-25 revisions require. That second
   `initialize` has its own `:handshake_timeout`, but never more than the
   connection's deadline (`:establish_timeout`) has left, and its failure is
-  reported as before, so this happens at most once per connection attempt.
-  `start_link/1` now succeeds where it used to fail with a 404. A reconnect
+  reported as before. No later `initialize` in the same connection attempt
+  offers the ended session again, including the one `:prefer_legacy` retries
+  with a revision the modern probe named, so this happens at most once per
+  attempt. `start_link/1` now succeeds where it used to fail with a 404. A reconnect
   after some other loss whose configured session the server has since ended,
   which used to fail on every attempt, now connects. Once the configured
   session has been replaced, later reconnects don't offer it again.

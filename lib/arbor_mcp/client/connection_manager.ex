@@ -235,9 +235,10 @@ defmodule Arbor.MCP.Client.ConnectionManager do
     ConnectionScope.closed(HTTP, attempt, result)
 
     # Restore the connection snapshot after ending the failed session, but
-    # never roll back credentials acquired or rejected during that attempt.
-    Map.merge(
-      snapshot,
+    # never roll back credentials acquired or rejected during that attempt,
+    # nor bring back a configured session the server has ended.
+    snapshot
+    |> Map.merge(
       Map.take(attempt, [
         :access_token,
         :credential_generation,
@@ -245,9 +246,11 @@ defmodule Arbor.MCP.Client.ConnectionManager do
         :auth_completed,
         :auth_provider_state,
         :granted_scopes,
-        :headers
+        :headers,
+        :configured_session_ended
       ])
     )
+    |> without_ended_session()
   end
 
   defp abandon_legacy_attempt(ReliabilityWrapper, snapshot, attempt) do
@@ -1077,6 +1080,7 @@ defmodule Arbor.MCP.Client.ConnectionManager do
     end
 
     transport_state
+    |> without_ended_session()
     |> exchange.()
     |> start_new_session(exchange)
     |> restore_deadline(transport_mod, establish_deadline)
@@ -1086,12 +1090,19 @@ defmodule Arbor.MCP.Client.ConnectionManager do
   # ended gets 404, and the client must then start a new session with an
   # initialize that carries no session id (Session Management, 2025-03-26 and
   # later). It sends that one at once, within the connection's deadline, and
-  # reports its failure as it is: it carries no session to expire, so this
-  # happens at most once.
+  # reports its failure as it is. The connection remembers that the session
+  # ended, so no later initialize in the same attempt (a version retry after
+  # the modern probe, say) offers it again, and this happens at most once per
+  # attempt.
   defp start_new_session({:error, {:session_expired, _detail}, %HTTP{} = latest}, exchange),
-    do: exchange.(%{latest | session_id: nil})
+    do: exchange.(%{latest | session_id: nil, configured_session_ended: true})
 
   defp start_new_session(result, _exchange), do: result
+
+  defp without_ended_session(%HTTP{configured_session_ended: true} = state),
+    do: %{state | session_id: nil}
+
+  defp without_ended_session(state), do: state
 
   defp exchange_initialize(
          transport_mod,

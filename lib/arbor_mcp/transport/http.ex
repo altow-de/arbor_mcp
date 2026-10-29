@@ -157,7 +157,11 @@ defmodule Arbor.MCP.Transport.HTTP do
     # The circuit breaker and health check a client's `reliability:` option
     # started, as a ReliabilityWrapper with no wrapped state, or nil (see
     # attach_reliability/2).
-    reliability: nil
+    reliability: nil,
+    # Whether the server answered 404 for the session id this connection was
+    # opened with (a configured `:session_id`): no initialize on this
+    # connection offers it again (see Arbor.MCP.Client.ConnectionManager).
+    configured_session_ended: false
   ]
 
   @type t :: %__MODULE__{
@@ -188,7 +192,8 @@ defmodule Arbor.MCP.Transport.HTTP do
           allowed_private_hosts: [String.t()],
           deadline: integer() | nil,
           granted_scopes: [String.t()],
-          reliability: ReliabilityWrapper.t() | nil
+          reliability: ReliabilityWrapper.t() | nil,
+          configured_session_ended: boolean()
         }
 
   @default_endpoint "/mcp/v1"
