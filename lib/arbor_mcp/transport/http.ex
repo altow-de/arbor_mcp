@@ -314,7 +314,12 @@ defmodule Arbor.MCP.Transport.HTTP do
     # SSE is deferred until after the first successful POST (which provides
     # the session ID needed for the GET SSE stream).
     with {:ok, {auth_provider, auth_provider_state}} <- provider,
-         state = %{state | auth_provider: auth_provider, auth_provider_state: auth_provider_state},
+         state =
+           provider_owns_authorization(%{
+             state
+             | auth_provider: auth_provider,
+               auth_provider_state: auth_provider_state
+           }),
          :ok <- validate_security(state),
          :ok <- TargetPolicy.validate_options(network_policy_options(state)) do
       if use_sse do
@@ -873,15 +878,33 @@ defmodule Arbor.MCP.Transport.HTTP do
      drop_provider_token(state)}
   end
 
-  # Drops the token the provider gave, and only that: requests go out
-  # without an Authorization header. Its credential generation stays, so a
-  # token the provider returns later with its state unchanged is still known
-  # for the one it was, and refused if the server rejected it; a request
-  # sent meanwhile presents no generation (see presented_generation/1).
-  defp drop_provider_token(%{access_token: nil} = state), do: state
-
+  # Drops the provider's token: requests go out without an Authorization
+  # header, whatever the transport held. Its credential generation stays, so
+  # a token the provider returns later with its state unchanged is still
+  # known for the one it was, and refused if the server rejected it; a
+  # request sent meanwhile presents no generation (see presented_generation/1).
   defp drop_provider_token(state),
     do: %{state | access_token: nil, headers: Headers.delete(state.headers, "authorization")}
+
+  # The provider owns the Authorization header, as it owns every other auth
+  # concern (see Arbor.MCP.Authorization.Provider): each request carries
+  # what get_token/1 gives, or no Authorization header, and never one
+  # configured through :headers or :security. So no request is credited to a
+  # credential the provider never gave, and a 401 to one retires none of its.
+  defp provider_owns_authorization(%{auth_provider: nil} = state), do: state
+
+  defp provider_owns_authorization(state) do
+    if Headers.get(state.headers, "authorization") do
+      Logger.warning(
+        "HTTP auth provider #{inspect(state.auth_provider)} supplies the Authorization " <>
+          "header; the one configured through :headers or :security is not sent"
+      )
+
+      %{state | headers: Headers.delete(state.headers, "authorization"), credential_generation: 0}
+    else
+      state
+    end
+  end
 
   @doc false
   # Whether `reason` is a refusal apply_provider_token/1 made before anything
@@ -1113,11 +1136,17 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   # The generation of the credential a request sent with `state` presents,
-  # which a 401 to it retires: none (0) when the request carries no
-  # Authorization header. A request sent after the provider's token was
-  # dropped presents nothing, so its 401 says nothing about that token, and
-  # the transport still knows which generation the token had (see
-  # apply_provider_token/1).
+  # which a 401 to it retires: none (0) when it carries no credential. Under
+  # an auth provider that means none of the provider's tokens (see
+  # provider_owns_authorization/1): a request sent after the provider's
+  # token was dropped presents nothing, so its 401 says nothing about that
+  # token, and the transport still knows which generation the token had
+  # (see apply_provider_token/1). Without one, it is the credential the
+  # Authorization header carries, configured or from the OAuth flow.
+  defp presented_generation(%{auth_provider: provider, access_token: nil})
+       when not is_nil(provider),
+       do: 0
+
   defp presented_generation(state) do
     if Headers.get(state.headers, "authorization"),
       do: state.credential_generation,

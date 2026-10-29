@@ -92,6 +92,25 @@ defmodule Arbor.MCP.Client.HTTPProviderTokenTest do
     def handle_forbidden(_www, _scopes, state), do: {:error, :forbidden, state}
   end
 
+  # Has no token until the server's 401 makes it authenticate, as the OAuth
+  # provider before its first flow.
+  defmodule PreAuthProvider do
+    @moduledoc false
+    @behaviour Arbor.MCP.Authorization.Provider
+
+    @impl true
+    def init(_config), do: {:ok, %{token: nil}}
+
+    @impl true
+    def get_token(state), do: {:ok, state.token, state}
+
+    @impl true
+    def handle_unauthorized(_www, _scopes, state), do: {:ok, "fresh", %{state | token: "fresh"}}
+
+    @impl true
+    def handle_forbidden(www, scopes, state), do: handle_unauthorized(www, scopes, state)
+  end
+
   @modes [
     legacy_only: :legacy,
     prefer_legacy: :legacy,
@@ -384,6 +403,122 @@ defmodule Arbor.MCP.Client.HTTPProviderTokenTest do
     end
   end
 
+  # The provider owns the Authorization header: one configured through
+  # :headers or :security is dropped when the transport connects, so a
+  # request carries the provider's token or none, never the configured one,
+  # and a 401 to a request without the provider's token retires none of its.
+  describe "an Authorization header configured alongside a provider" do
+    setup do
+      bypass = Bypass.open()
+      owner = self()
+
+      # Refuses a request without credentials, answers any other.
+      Bypass.stub(bypass, "POST", "/mcp", fn conn ->
+        auth = Plug.Conn.get_req_header(conn, "authorization")
+        send(owner, {:posted, auth})
+
+        if auth == [] do
+          conn
+          |> Plug.Conn.put_resp_header("www-authenticate", ~s(Bearer realm="mcp"))
+          |> Plug.Conn.resp(401, "")
+        else
+          result = %{"resultType" => "complete", "content" => []}
+
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.resp(
+            200,
+            Jason.encode!(%{"jsonrpc" => "2.0", "id" => 1, "result" => result})
+          )
+        end
+      end)
+
+      %{url: "http://127.0.0.1:#{bypass.port}/mcp"}
+    end
+
+    for {source, configured} <- [
+          headers: [headers: [{"Authorization", "Bearer configured-s3cret"}]],
+          security: [security: %{auth: {:bearer, "configured-s3cret"}}]
+        ] do
+      test "set through :#{source} is dropped at connect, and the provider's token sent", %{
+        url: url
+      } do
+        script = start_supervised!({Agent, fn -> {:token, "A"} end}, id: make_ref())
+
+        {transport, log} =
+          with_log(fn ->
+            connect_with(
+              url,
+              {ScriptedProvider, script: script},
+              unquote(Macro.escape(configured))
+            )
+          end)
+
+        assert Arbor.MCP.Internal.Headers.get(transport.headers, "authorization") == nil
+        assert transport.credential_generation == 0
+        assert log =~ "supplies the Authorization header"
+        refute log =~ "s3cret"
+
+        assert {:ok, %HTTP{}, _data} = HTTP.send_authenticated(@request, transport)
+        assert_received {:posted, ["Bearer A"]}
+      end
+
+      test "set through :#{source} isn't sent when the provider has no token", %{url: url} do
+        script = start_supervised!({Agent, fn -> :none end}, id: make_ref())
+
+        transport =
+          connect_with(url, {ScriptedProvider, script: script}, unquote(Macro.escape(configured)))
+
+        assert {:error, :unauthorized, after_401} = HTTP.send_authenticated(@request, transport)
+        assert_received {:posted, []}
+        # The 401 was to no credential of the provider's.
+        assert after_401.rejected_generation == 0
+      end
+
+      test "set through :#{source} isn't sent after a provider error", %{url: url} do
+        script = start_supervised!({Agent, fn -> {:error, :expired} end}, id: make_ref())
+
+        transport =
+          connect_with(url, {ScriptedProvider, script: script}, unquote(Macro.escape(configured)))
+
+        assert {:error,
+                {:auth_refused, {:auth_provider_token_failed, ScriptedProvider, :expired}},
+                refused} = HTTP.send_authenticated(@request, transport)
+
+        refute_received {:posted, _auth}
+
+        set(script, :none)
+        assert {:error, :unauthorized, _state} = HTTP.send_authenticated(@request, refused)
+        assert_received {:posted, []}
+      end
+
+      test "set through :#{source} leaves the provider's pre-auth request tokenless", %{url: url} do
+        transport = connect_with(url, {PreAuthProvider, []}, unquote(Macro.escape(configured)))
+
+        # The tokenless request draws the 401 that starts the provider's flow.
+        assert {:ok, %HTTP{access_token: "fresh"}, _data} =
+                 HTTP.send_authenticated(@request, transport)
+
+        assert_received {:posted, []}
+        assert_received {:posted, ["Bearer fresh"]}
+        refute_received {:posted, _auth}
+      end
+    end
+
+    test "is still sent without a provider", %{url: url} do
+      {:ok, transport} =
+        HTTP.connect(
+          url: url,
+          use_sse: false,
+          headers: [{"Authorization", "Bearer configured"}]
+        )
+
+      transport = HTTP.settle_protocol_era(transport, :modern, "2026-07-28")
+      assert {:ok, %HTTP{}, _data} = HTTP.send_authenticated(@request, transport)
+      assert_received {:posted, ["Bearer configured"]}
+    end
+  end
+
   # A request refused before it was sent was never an upstream failure.
   describe "with reliability:" do
     @strict [circuit_breaker: [failure_threshold: 1, reset_timeout: 60_000]]
@@ -462,6 +597,13 @@ defmodule Arbor.MCP.Client.HTTPProviderTokenTest do
   end
 
   defp set(script, value), do: Agent.update(script, fn _ -> value end)
+
+  defp connect_with(url, provider, configured) do
+    {:ok, transport} =
+      HTTP.connect([url: url, use_sse: false, auth_provider: provider] ++ configured)
+
+    HTTP.settle_protocol_era(transport, :modern, "2026-07-28")
+  end
 
   # The server rejects the provider's token A, and the provider then gives
   # an error or no token. The transport drops A but keeps its generation.

@@ -187,11 +187,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{:ok, nil, state}` now sends the request without an `Authorization`
   header; it used to keep the earlier token. Dropping a token doesn't
   forget it: a token the server rejected is still refused, as not sent, if
-  the provider returns it again with its state unchanged. Requests that
-  went out with a
-  stale token before now fail, so a provider that would rather let the
-  server decide should return a token, as the built-in OAuth provider does
-  when a refresh fails. A request refused this way, or for carrying a
+  the provider returns it again with its state unchanged. With an
+  `:auth_provider`, an `Authorization` header set through `:headers` or
+  `:security` is now dropped at connect, with a warning: the provider owns
+  that header, so a request carries its token or none. The configured
+  header used to go out until the provider's first token replaced it, and
+  again whenever the provider had none, the OAuth provider's first,
+  pre-auth request included. Requests that went out with a stale token
+  before now fail, so a provider that would rather let the server decide
+  should return a token, as the built-in OAuth provider does when a refresh
+  fails. A request refused this way, or for carrying a
   credential the server already rejected, never counts as a `reliability:`
   circuit-breaker failure, and the rejected-credential refusal is now
   reported as `:not_sent` too.

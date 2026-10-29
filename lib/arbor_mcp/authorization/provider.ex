@@ -50,6 +50,11 @@ defmodule Arbor.MCP.Authorization.Provider do
         url: "https://api.example.com/mcp",
         auth_provider: {MyAuthProvider, api_key: "sk-..."}
       )
+
+  The provider owns the `Authorization` header. An `Authorization` header set
+  through the transport's `:headers` or `:security` options is dropped when the
+  transport connects, with a warning, so each request carries the token
+  `c:get_token/1` gives for it, or no `Authorization` header at all.
   """
 
   @type state :: any()
