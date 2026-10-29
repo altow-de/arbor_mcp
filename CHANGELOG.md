@@ -110,6 +110,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Pre-registered OAuth client secrets are issuer-bound by default.** There
+  is no opt-out. This breaks HTTP auth and `DiscoveryFlow.execute/1` that
+  still set only `client_id` / `client_secret` (the 1.x aliases) and omit
+  `credential_issuer`, and it also breaks a `credential_issuer` that differs
+  from the discovered issuer by a trailing slash, path, or case. The error
+  is `{:pre_registered_credential_issuer_required, discovered_issuer}` when
+  the key is missing, or
+  `{:pre_registered_credential_issuer_mismatch, [expected: ..., actual: ...]}`
+  when it does not match byte-for-byte. Trailing slashes are **not**
+  normalized. The fix is to set `credential_issuer` to the exact
+  authorization-server issuer (the same value already required for the
+  explicit `{:pre_registered, ...}` strategy and for MCP `2026-07-28`). See
+  [Issuer-bound credential persistence](docs/CONFIGURATION.md#issuer-bound-credential-persistence).
 - **BREAKING:** an OAuth `Arbor.MCP.HttpPlug` mount no longer uses a token's
   `client_id` as the principal when the token has no `sub`. A token
   introspection response (RFC 7662) may leave `sub` out, so every user of one
@@ -154,6 +167,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A pre-registered client secret configured through the legacy
+  `client_id` / `client_secret` aliases was not bound to an issuer under the
+  default legacy protocol (`2025-11-25`). Attacker-controlled authorization
+  server metadata could therefore receive the secret after a transform.
+  `Arbor.MCP.Authorization.RegistrationPolicy` and
+  `Arbor.MCP.Authorization.DiscoveryFlow` now require `credential_issuer`
+  for every pre-registered secret, on every protocol version, and refuse to
+  resolve or send the secret to any other origin. A missing key fails with
+  `{:pre_registered_credential_issuer_required, discovered_issuer}`; a
+  trailing-slash, case, or other textual difference fails with
+  `{:pre_registered_credential_issuer_mismatch, details}`. Set
+  `credential_issuer` to the exact issuer. Trailing slashes are not
+  normalized.
 - A request or disconnect from a caller on another node used that node's
   monotonic deadline as if it were the client's own. Two nodes' monotonic
   clocks are unrelated, so a caller whose clock trailed by a minute got an
