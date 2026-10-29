@@ -51,6 +51,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Probe and handshake receive failures retain refreshed authentication state
+  during fallback and cleanup. Synchronous HTTP state-bearing failures stay
+  internal; public transport `send_message/2` errors remain `{:error, reason}`.
+- Synchronous client HTTP failures retain updated credentials and rejection state
+  through notifications, server-request replies, batches, and establishment.
+  Cached provider tokens cannot gain a fresh generation without acquisition
+  evidence or be reused after rejection. HTTP 401/403 responses are handled
+  from their headers even when their bodies exceed response limits; non-auth
+  responses retain their existing byte limits.
+- HTTP authentication retires rejected credential generations on every 401,
+  including the response that exhausts POST or stream retries and synchronous
+  authenticated sends. Provider refreshes receive a new generation even when
+  bearer bytes repeat, so delayed pre-refresh challenges reuse the refreshed
+  credential instead of starting authentication again.
+- HTTP credentials and their requests now carry monotonic generations, with
+  a fixed-size rejection high-water mark to prevent stale auth results from
+  restoring retired credentials. Auth refusals retain their retry marker until
+  public error formatting, including with explicit retry predicates. A refused
+  subscription reopen emits its documented closed event and cancels reconnect
+  timers after the subscription has previously acknowledged.
+- A 401 joining an inline OAuth step-up immediately retires the rejected shared
+  token. A narrower replacement grant updates its token and scopes, while a
+  delayed 401 cannot invalidate newer credentials. Definitive HTTP auth and
+  OAuth refusals now terminate subscriptions and request retries without
+  reopening streams or starting further auth flows.
+- A partial inline OAuth step-up grant no longer replaces shared credentials
+  with fewer scopes. Only compatible waiters receive that grant; a waiter
+  whose own flow omits required scopes fails definitively with
+  `{:oauth_failed, :insufficient_scope}` without another flow or POST retry.
+  Full superset grants and authentication after a 401 still update credentials.
+- Concurrent inline OAuth scope step-ups now wait for tokens covering their own
+  scopes, with separate serialized flows when needed. Challenged scopes are
+  passed to the inline flow with credentials. Retained HTTP health pings can
+  authenticate within their health-check interval and settle their responses
+  without triggering an unnecessary reconnect.
+- Inline HTTP OAuth now runs in one monitored worker per client, so stalled
+  discovery or authorization leaves the client responsive. Concurrent
+  challenges share the flow with independent request deadlines; cancellation
+  and reconnect retire the worker and its waiters. Legacy authenticated
+  retries use the current session id and connection headers. A request stream
+  definitively refused by HTTP auth or a failed OAuth flow reports the same
+  error as an ordinary POST without replaying the operation.
+- Provider-less legacy Streamable HTTP POSTs now authenticate through the
+  client and retry from their own task with the stream consumer intact. Server
+  requests (such as `ping`), progress and log notifications on the retried SSE
+  response are handled while it remains open. Concurrent challenges share
+  the resulting token, authentication waits respect the request deadline,
+  and cancelled requests are not re-sent.
+  Modern request streams opened for progress or logging also use inline OAuth
+  when no auth provider is configured.
 - Over modern (2026-07-28) Streamable HTTP, a client without an
   `:auth_provider` that got a 401 or 403 sent the request again from the
   client process. That POST held the client until the server answered it:
