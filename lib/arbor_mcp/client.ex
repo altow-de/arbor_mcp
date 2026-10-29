@@ -1499,6 +1499,10 @@ defmodule Arbor.MCP.Client do
   defp normalize_connection_error({:cleanup_failed, _reason, {:error, _}} = reason),
     do: {:transport_connect_failed, reason}
 
+  # Its reason is already free of the provider's config.
+  defp normalize_connection_error({:auth_provider_init_failed, _provider, _reason} = reason),
+    do: {:transport_connect_failed, reason}
+
   defp normalize_connection_error(:connection_refused) do
     {:transport_connect_failed, :connection_refused}
   end
