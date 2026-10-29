@@ -110,6 +110,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING:** an OAuth `Arbor.MCP.HttpPlug` mount no longer uses a token's
+  `client_id` as the principal when the token has no `sub`. A token
+  introspection response (RFC 7662) may leave `sub` out, so every user of one
+  OAuth client shared a principal, and with it MRTR `requestState` binding,
+  separate modern cancellations (whose request ids are small client-chosen
+  integers), legacy session ownership, stored tasks and subscription
+  authorization and limits. A validated token without `sub`, or with an empty
+  one, is now refused with `401 invalid_token`, and the refusal is logged
+  without token data. The new `client_principals: true` option is for an
+  authorization server that leaves `sub` out only of client-credentials
+  tokens: such a token then runs as `client:<client_id>`, a token with a
+  `username` but no `sub` is still refused, and the option reserves the
+  `client:` prefix, so a token whose `sub` (or verifier `principal_id` claim)
+  starts with `client:` is refused rather than sharing a client's principal.
+  Tokens with `sub` keep `sub` as their principal, unchanged, and a mount that
+  sets `:principal_id` to a value or resolver is not affected. A literal
+  `principal_id: nil` still counts as unset, so it follows these token rules;
+  to run without a principal on purpose, use a resolver that returns `nil`.
+  A principal that was a bare `client_id` becomes `client:<client_id>` with
+  the option, so MRTR `requestState` issued before the upgrade no longer
+  resumes (the client starts the request again), its legacy sessions answer
+  `404` (the client initializes again), and tasks stored under it are no
+  longer found.
 - A modern (2026-07-28) request whose caller exits while it is in flight is
   now cancelled upstream by default: a `Task` running a call that is killed,
   or a process that crashes mid-call, no longer leaves the server working on
