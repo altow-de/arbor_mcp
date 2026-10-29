@@ -1547,12 +1547,21 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
   defp state_identity(_request_state, _limits), do: nil
 
+  # The ids count only within the request's limits, by number and by total
+  # size, and only their digest is kept, as for a requestState.
   defp inputs_identity(ids, limits) when is_map(ids) and not is_struct(ids) do
     count = map_size(ids)
+    max_count = limit(limits, :max_input_requests, MRTR.max_input_requests([]))
+    max_bytes = limit(limits, :max_mrtr_bytes, MRTR.max_bytes([]))
 
-    if count > 0 and count <= limit(limits, :max_input_requests, MRTR.max_input_requests([])) do
-      keys = Map.keys(ids)
-      if Enum.all?(keys, &is_binary/1), do: {:inputs, Enum.sort(keys)}
+    with true <- count > 0 and count <= max_count,
+         keys = Map.keys(ids),
+         true <- Enum.all?(keys, &is_binary/1),
+         true <- Enum.reduce(keys, 0, &(byte_size(&1) + &2)) <= max_bytes do
+      digest = :crypto.hash(:sha256, Enum.map(Enum.sort(keys), &[<<byte_size(&1)::32>>, &1]))
+      {:inputs, digest}
+    else
+      _unusable -> nil
     end
   end
 
@@ -1668,23 +1677,34 @@ defmodule Arbor.MCP.Client.RequestHandler do
   # One timer sweeps expired tombstones and reservations, so a burst that
   # no request follows still leaves nothing behind. It is armed for the
   # earliest expiry, and moved earlier when a new entry expires sooner.
+  #
+  # Each arming tags its message with a fresh ref, and only the message with
+  # the current ref sweeps. A timer whose message was already queued when it
+  # was cancelled, or one left from before a reconnect (reset_progress/1
+  # clears the ref), can't sweep again or arm a second timer.
   defp arm_progress_sweep(state, at) do
     case Map.get(state, :progress_sweep) do
-      {_timer, armed_at} when armed_at <= at ->
+      {_timer, armed_at, _ref} when armed_at <= at ->
         state
 
       armed ->
         if armed, do: Process.cancel_timer(elem(armed, 0))
-        timer = Process.send_after(self(), :progress_sweep, max(at - now(), 0) + 1)
-        Map.put(state, :progress_sweep, {timer, at})
+        ref = make_ref()
+        timer = Process.send_after(self(), {:progress_sweep, ref}, max(at - now(), 0) + 1)
+        Map.put(state, :progress_sweep, {timer, at, ref})
     end
   end
 
   @doc false
-  # The sweep timer fired: drop what has expired, and arm it again for the
-  # earliest of what remains.
-  @spec sweep_progress(map()) :: map()
-  def sweep_progress(state) do
+  # A sweep timer fired. Only the current one drops what has expired and
+  # arms again for the earliest of what remains; any other is stale.
+  @spec sweep_progress(map(), reference()) :: map()
+  def sweep_progress(%{progress_sweep: {_timer, _at, ref}} = state, ref),
+    do: sweep_progress(state)
+
+  def sweep_progress(state, _stale_ref), do: state
+
+  defp sweep_progress(state) do
     now = now()
 
     tombstones =
@@ -1771,7 +1791,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
     state |> progress_monitors() |> Map.keys() |> Enum.each(&Process.demonitor(&1, [:flush]))
 
     case Map.get(state, :progress_sweep) do
-      {timer, _at} -> Process.cancel_timer(timer)
+      {timer, _at, _ref} -> Process.cancel_timer(timer)
       nil -> :ok
     end
 

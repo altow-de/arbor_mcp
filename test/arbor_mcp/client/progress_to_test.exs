@@ -1031,6 +1031,158 @@ defmodule Arbor.MCP.Client.ProgressToTest do
       assert :sys.get_state(client).progress_sweep == nil
     end
 
+    test "input request ids over the byte limit are neither kept nor reserved" do
+      client = scripted()
+      request = %{"method" => "roots/list", "params" => %{}}
+      ids = for n <- 1..2, into: %{}, do: {"#{n}" <> String.duplicate("i", 256 * 1024), request}
+
+      call =
+        start_call(client,
+          mrtr: :manual,
+          progress_to: self(),
+          progress_token: "ids",
+          max_mrtr_bytes: 128,
+          timeout: 5_000
+        )
+
+      assert_receive {:wire, %{"id" => id}}
+      respond_with(client, id, %{"resultType" => "input_required", "inputRequests" => ids})
+      assert {:error, %ProtocolError{message: "MRTR byte limit exceeded"}} = Task.await(call)
+
+      state = :sys.get_state(client)
+      refute Map.has_key?(state.progress_reservations, "ids")
+      assert Map.has_key?(state.progress_tombstones, "ids")
+    end
+
+    test "a round without requestState is reserved by a digest of its ids, which its continuation matches" do
+      client = scripted()
+      test_pid = self()
+      target = spawn_link(fn -> forward_to(test_pid, "ids") end)
+      request = %{"method" => "elicitation/create", "params" => %{"message" => "?"}}
+
+      round =
+        start_call(client,
+          mrtr: :manual,
+          progress_to: target,
+          progress_token: "d",
+          timeout: 5_000
+        )
+
+      assert_receive {:wire, %{"id" => id}}
+
+      respond_with(client, id, %{
+        "resultType" => "input_required",
+        "inputRequests" => %{"b" => request, "a" => request}
+      })
+
+      assert {:input_required, %{request_state: nil}} = Task.await(round)
+
+      %{"d" => %{identity: {_round, {:inputs, digest}}}} =
+        :sys.get_state(client).progress_reservations
+
+      assert is_binary(digest) and byte_size(digest) == 32
+
+      decline = %{"action" => "decline"}
+
+      continuation =
+        start_call(client,
+          mrtr: :manual,
+          progress_token: "d",
+          input_responses: %{"a" => decline, "b" => decline},
+          timeout: 5_000
+        )
+
+      assert_receive {:wire, %{"id" => next_id, "params" => %{"inputResponses" => _responses}}}
+      progress(client, "d", 1)
+      assert_receive {:forwarded, "ids", {:arbor_mcp_progress, ^client, "d", %{"progress" => 1}}}
+
+      respond(client, next_id)
+      assert {:ok, _result} = Task.await(continuation)
+    end
+
+    # The reviewer's race. The sweep timer (T1) fires, and its message is
+    # queued while the client handles a late input_required answer whose
+    # cutoff has already passed. Moving the timer earlier can't cancel T1, so
+    # both messages arrive. Only the current one may sweep and arm again;
+    # otherwise a second timer is left that reset_progress/1 doesn't cancel.
+    test "a sweep queued before its timer moved neither sweeps nor arms a second timer" do
+      client = scripted()
+
+      # F: a reservation that outlasts the race, so each sweep arms again.
+      _f =
+        await_round(client,
+          progress_to: self(),
+          progress_token: "f",
+          request_state: "rs-f",
+          timeout: 3_000
+        )
+
+      # Y: a round whose caller times out before its answer comes.
+      y =
+        start_call(client,
+          mrtr: :manual,
+          progress_to: self(),
+          progress_token: "y",
+          cancel_on_caller_exit: false,
+          timeout: 50
+        )
+
+      assert_receive {:wire, %{"id" => y_id}}
+      assert {:error, :timeout} = Task.await(y)
+
+      # E: a settled request, whose tombstone arms the timer soonest.
+      e = start_call(client, progress_to: self(), progress_token: "e")
+      assert_receive {:wire, %{"id" => e_id}}
+      respond(client, e_id)
+      assert {:ok, _result} = Task.await(e)
+      t1 = elem(:sys.get_state(client).progress_sweep, 0)
+
+      # Y's late answer is queued first, then T1 fires and queues its sweep.
+      :ok = :sys.suspend(client)
+      respond_with(client, y_id, input_required_result("rs-y"))
+      :ok = Arbor.MCP.TestHelpers.wait_until(fn -> Process.read_timer(t1) == false end)
+      :ok = :sys.resume(client)
+
+      state = :sys.get_state(client)
+      %{"f" => %{until: f_until}} = state.progress_reservations
+      assert state.progress_sweep != nil
+
+      # A reconnect resets the bookkeeping. No timer may outlive it.
+      :sys.replace_state(client, &RequestHandler.reset_progress/1)
+      :erlang.trace(client, true, [:receive])
+
+      :ok =
+        Arbor.MCP.TestHelpers.wait_until(
+          fn -> System.monotonic_time(:millisecond) > f_until + 1_200 end,
+          timeout: 10_000
+        )
+
+      _state = :sys.get_state(client)
+      :erlang.trace(client, false, [:receive])
+      refute Enum.any?(traced_messages(client), &sweep?/1)
+    end
+
+    test "a sweep message from before a reconnect does nothing" do
+      client = scripted()
+      _id = await_round(client, progress_to: self(), progress_token: "old", request_state: "rs-o")
+      {_timer, _at, old_ref} = :sys.get_state(client).progress_sweep
+
+      # The reconnect's teardown, then a new connection's hold.
+      :sys.replace_state(client, &RequestHandler.reset_progress/1)
+      call = start_call(client, progress_to: self(), progress_token: "new")
+      assert_receive {:wire, %{"id" => id}}
+      respond(client, id)
+      assert {:ok, _result} = Task.await(call)
+
+      before = :sys.get_state(client)
+      send(client, {:progress_sweep, old_ref})
+      after_stale = :sys.get_state(client)
+
+      assert after_stale.progress_sweep == before.progress_sweep
+      assert after_stale.progress_tombstones == before.progress_tombstones
+      assert after_stale.progress_reservations == before.progress_reservations
+    end
+
     test "each request's progress goes only to its own target" do
       client = scripted()
       test_pid = self()
@@ -1230,6 +1382,18 @@ defmodule Arbor.MCP.Client.ProgressToTest do
       "requestState" => request_state
     }
   end
+
+  defp traced_messages(client, acc \\ []) do
+    receive do
+      {:trace, ^client, :receive, message} -> traced_messages(client, [message | acc])
+    after
+      0 -> acc
+    end
+  end
+
+  defp sweep?(:progress_sweep), do: true
+  defp sweep?({:progress_sweep, _ref}), do: true
+  defp sweep?(_message), do: false
 
   defp respond_with(client, id, result) do
     message = %{"jsonrpc" => "2.0", "id" => id, "result" => result}

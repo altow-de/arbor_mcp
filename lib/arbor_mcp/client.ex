@@ -2554,7 +2554,8 @@ defmodule Arbor.MCP.Client do
   # A request made with reset_timeout_on_progress went its timeout without
   # progress, and times out as it would at its deadline.
   # Expired progress_to tombstones and reservations (see RequestHandler).
-  def handle_info(:progress_sweep, state), do: {:noreply, RequestHandler.sweep_progress(state)}
+  def handle_info({:progress_sweep, ref}, state),
+    do: {:noreply, RequestHandler.sweep_progress(state, ref)}
 
   def handle_info({:progress_timeout, request_id, tag}, state) do
     case RequestHandler.progress_timed_out(request_id, tag, state) do
