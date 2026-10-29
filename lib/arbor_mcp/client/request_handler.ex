@@ -7,7 +7,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
   """
 
   require Logger
-  alias Arbor.MCP.Client.{ConnectionScope, Lifetime}
+  alias Arbor.MCP.Client.{ConnectionScope, HTTPAuth, Lifetime}
   alias Arbor.MCP.Client.{Deadline, InputDispatcher, MRTR, NotificationListener, ResponseCache}
   alias Arbor.MCP.Error
   alias Arbor.MCP.Internal.{Maps, Protocol, RequestParams, VersionRegistry}
@@ -153,6 +153,10 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
             {:error, reason} ->
               {:reply, {:error, reason}, state}
+
+            {:error, reason, updated_state} ->
+              error = if HTTPAuth.refused?(reason), do: {:stream_error, reason}, else: reason
+              {:reply, {:error, error}, updated_state}
           end
 
         {:error, reason} ->
@@ -220,12 +224,29 @@ defmodule Arbor.MCP.Client.RequestHandler do
   defp retryable_subscription_stream_close?(:invalid_stream_message), do: false
   defp retryable_subscription_stream_close?(:response_id_mismatch), do: false
   defp retryable_subscription_stream_close?(:final_response_required), do: false
-  defp retryable_subscription_stream_close?(_reason), do: true
+  defp retryable_subscription_stream_close?(reason), do: not HTTPAuth.refused?(reason)
 
   defp send_built_request(method, params, id, from, state, timeout_meta) do
-    case build_request(method, params, id, state) do
+    request_opts = [
+      client_capabilities: Map.get(timeout_meta, :client_capabilities),
+      modern_options: Map.get(timeout_meta, :modern_options, [])
+    ]
+
+    case build_request(method, params, id, state, request_opts) do
       {:ok, request} ->
         send_request(request, method, id, from, state, timeout_meta)
+
+      # Decided here, against the era the connection settled on, so the check
+      # and the request it guards see the same state.
+      {:error, {:modern_only_option, option}} ->
+        {:reply,
+         {:error,
+          Error.validation_error(
+            option,
+            nil,
+            "requires MCP 2026-07-28, but the connection settled on " <>
+              (state.protocol_version || "no protocol revision")
+          )}, state}
 
       {:error, reason} ->
         {:reply,
@@ -244,10 +265,9 @@ defmodule Arbor.MCP.Client.RequestHandler do
            transport_state: %HTTP{protocol_era: :modern} = transport_state
          } = state
        ) do
-    with {:ok, encoded} <- encode_for_transport(HTTP, request),
-         {:ok, transport_state} <-
-           HTTP.open_stream(encoded, transport_state, self(), stream_kind: :subscription) do
-      {:ok, %{state | transport_state: transport_state}}
+    with {:ok, encoded} <- encode_for_transport(HTTP, request) do
+      HTTP.open_stream(encoded, transport_state, self(), stream_kind: :subscription)
+      |> transport_result(state)
     end
   end
 
@@ -318,7 +338,14 @@ defmodule Arbor.MCP.Client.RequestHandler do
         updated_state = start_progress_timeout(id, meta, updated_state)
         pending_requests = Map.put(updated_state.pending_requests, id, {from, :single, method})
         new_state = %{updated_state | pending_requests: pending_requests}
-        {:noreply, remember_progress_token(request, id, new_state)}
+
+        # Watched only now: an HTTP POST task registers itself with a message
+        # this process sent itself during the send, so a :DOWN of the caller
+        # always comes after it, and the task can be found to close.
+        {:noreply,
+         request
+         |> remember_progress_token(id, new_state)
+         |> watch_caller({:request, id}, from, Map.get(meta, :cancel_on_caller_exit))}
 
       {:error, :not_connected} ->
         {:reply, {:error, :not_connected}, state}
@@ -331,13 +358,17 @@ defmodule Arbor.MCP.Client.RequestHandler do
         {:reply, {:error, not_sent_error(:caller_gone, state)}, state}
 
       {:error, reason} ->
-        if Deadline.expired?(deadline) do
-          # The caller's own timeout: it may already have reported one.
-          {:reply, {:error, :timeout}, state}
-        else
-          {:reply, {:error, send_failure(reason, state)}, state}
-        end
+        request_send_error(reason, state, deadline)
+
+      {:error, reason, updated_state} ->
+        request_send_error(reason, updated_state, deadline)
     end
+  end
+
+  defp request_send_error(reason, state, deadline) do
+    if Deadline.expired?(deadline),
+      do: {:reply, {:error, :timeout}, state},
+      else: {:reply, {:error, send_failure(reason, state)}, state}
   end
 
   defp request_send_context(from, state, meta) do
@@ -548,6 +579,9 @@ defmodule Arbor.MCP.Client.RequestHandler do
       {:ok, updated_state} ->
         {:ok, put_transport_deadline(updated_state, previous)}
 
+      {:error, reason, updated_state} ->
+        {:error, reason, put_transport_deadline(updated_state, previous)}
+
       error ->
         error
     end
@@ -588,17 +622,15 @@ defmodule Arbor.MCP.Client.RequestHandler do
   # Each request POSTs from its own task, so one slow request does not hold
   # the client: other requests and server messages proceed meanwhile.
   defp send_http_request(request, state) do
-    with {:ok, encoded} <- encode_for_transport(HTTP, request),
-         {:ok, transport_state} <- HTTP.send_async(encoded, state.transport_state) do
-      {:ok, %{state | transport_state: transport_state}}
+    with {:ok, encoded} <- encode_for_transport(HTTP, request) do
+      HTTP.send_async(encoded, state.transport_state) |> transport_result(state)
     end
   end
 
   defp open_request_stream(request, state, transport_state) do
-    with {:ok, encoded} <- encode_for_transport(HTTP, request),
-         {:ok, transport_state} <-
-           HTTP.open_stream(encoded, transport_state, self(), stream_kind: :request) do
-      {:ok, %{state | transport_state: transport_state}}
+    with {:ok, encoded} <- encode_for_transport(HTTP, request) do
+      HTTP.open_stream(encoded, transport_state, self(), stream_kind: :request)
+      |> transport_result(state)
     end
   end
 
@@ -774,15 +806,18 @@ defmodule Arbor.MCP.Client.RequestHandler do
         {:noreply, new_state}
 
       {:error, reason} ->
-        response =
-          {:error,
-           %{
-             type: :transport_error,
-             message: "Failed to send batch request: #{inspect(reason)}"
-           }}
+        batch_send_error(reason, state)
 
-        {:reply, response, state}
+      {:error, reason, updated_state} ->
+        batch_send_error(reason, updated_state)
     end
+  end
+
+  defp batch_send_error(reason, state) do
+    {:reply,
+     {:error,
+      %{type: :transport_error, message: "Failed to send batch request: #{inspect(reason)}"}},
+     state}
   end
 
   defp send_batch(requests, batch_id, from, %{transport_mod: LegacySSE} = state, meta) do
@@ -807,7 +842,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
     connection is already proven alive
   - `{:error, reason}` - the ping could not be sent
   """
-  @spec send_ping(map()) :: {:ok, term() | nil, map()} | {:error, any()}
+  @spec send_ping(map()) :: {:ok, term() | nil, map()} | {:error, any()} | {:error, any(), map()}
   def send_ping(state) do
     id = Protocol.generate_id()
 
@@ -815,13 +850,19 @@ defmodule Arbor.MCP.Client.RequestHandler do
       if VersionRegistry.modern?(state.protocol_version), do: "server/discover", else: "ping"
 
     with {:ok, request} <- build_request(method, %{}, id, state) do
-      case send_message(request, state) do
+      case send_health_request(request, state) do
         {:ok, updated_state, _response_data} -> {:ok, nil, updated_state}
         {:ok, updated_state} -> {:ok, id, updated_state}
         {:error, reason} -> {:error, reason}
+        {:error, reason, updated_state} -> {:error, reason, updated_state}
       end
     end
   end
+
+  defp send_health_request(request, %{transport_mod: HTTP, transport_state: %HTTP{}} = state),
+    do: send_http_request(request, state)
+
+  defp send_health_request(request, state), do: send_message(request, state)
 
   @doc """
   Parses a message from the transport.
@@ -894,17 +935,13 @@ defmodule Arbor.MCP.Client.RequestHandler do
             error = request_stream_error(reason)
 
             GenServer.reply(from, {:error, error})
-
-            {:noreply,
-             %{state | pending_requests: Map.delete(state.pending_requests, request_id)}}
+            {:noreply, drop_pending(state, request_id)}
 
           {from, :single} ->
             error = request_stream_error(reason)
 
             GenServer.reply(from, {:error, error})
-
-            {:noreply,
-             %{state | pending_requests: Map.delete(state.pending_requests, request_id)}}
+            {:noreply, drop_pending(state, request_id)}
 
           _not_pending ->
             {:noreply, state}
@@ -957,6 +994,12 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
   def close_request_stream(_request_id, state), do: state
 
+  defp request_stream_error({:auth_refused, _reason} = refusal),
+    do: send_error(refusal, %{transport_mod: HTTP})
+
+  defp request_stream_error({:oauth_failed, _reason} = reason),
+    do: send_error(reason, %{transport_mod: HTTP})
+
   defp request_stream_error(reason) do
     if ambiguous_stream_break?(reason) do
       %Error.TransportError{
@@ -984,7 +1027,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
             ],
        do: false
 
-  defp ambiguous_stream_break?(_reason), do: true
+  defp ambiguous_stream_break?(reason), do: not HTTPAuth.refused?(reason)
 
   @doc """
   Handles a batch of responses from the transport.
@@ -1008,9 +1051,10 @@ defmodule Arbor.MCP.Client.RequestHandler do
   def handle_post_response(response_data, request_id, state) do
     case Protocol.parse_message(response_data) do
       {kind, payload, _echoed_id} when kind in [:result, :error] ->
-        if pending_single?(state.pending_requests, request_id),
-          do: handle_single_response({kind, payload, request_id}, state),
-          else: {:noreply, state}
+        if pending_single?(state.pending_requests, request_id) or
+             Map.get(state, :health_check_id) == request_id,
+           do: handle_single_response({kind, payload, request_id}, state),
+           else: {:noreply, state}
 
       _other ->
         parse_transport_message(response_data, state)
@@ -1171,6 +1215,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
           |> remember_tool_schemas(method, response_id, response_data)
           |> cache_result(response_id, response_data)
           |> cancel_progress_timeout(response_id)
+          |> forget_caller({:request, response_id})
 
         {:ok, {from, :single}} ->
           :telemetry.execute(
@@ -1181,7 +1226,11 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
           GenServer.reply(from, response_data)
           new_pending_requests = Map.delete(pending_requests, response_id)
-          %{state | pending_requests: new_pending_requests}
+
+          forget_caller(
+            %{state | pending_requests: new_pending_requests},
+            {:request, response_id}
+          )
 
         {:ok, {:batch, batch_id}} ->
           handle_batch_response_item(response_data, response_id, batch_id, state)
@@ -1439,6 +1488,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
          {:ok, state} <- send_http_request(notification, state) do
       state
     else
+      {:error, _reason, updated_state} -> updated_state
       _not_sent -> state
     end
   end
@@ -1472,12 +1522,16 @@ defmodule Arbor.MCP.Client.RequestHandler do
         {:noreply, state}
 
       {:error, reason} ->
-        Logger.error("Failed to send notification",
-          reason_shape: LogSummary.describe(reason)
-        )
+        notification_send_error(reason, state)
 
-        {:noreply, state}
+      {:error, reason, updated_state} ->
+        notification_send_error(reason, updated_state)
     end
+  end
+
+  defp notification_send_error(reason, state) do
+    Logger.error("Failed to send notification", reason_shape: LogSummary.describe(reason))
+    {:noreply, state}
   end
 
   @doc """
@@ -1491,21 +1545,26 @@ defmodule Arbor.MCP.Client.RequestHandler do
       {:error, :not_connected}
     else
       with {:ok, outbound_message} <- encode_for_transport(transport_mod, message) do
-        case transport_mod.send_message(outbound_message, transport_state) do
-          {:ok, new_transport_state, response_data} ->
-            # Non-SSE HTTP returns response immediately
-            {:ok, %{state | transport_state: new_transport_state}, response_data}
-
-          {:ok, new_transport_state} ->
-            # SSE and other streaming transports return 2-tuple
-            {:ok, %{state | transport_state: new_transport_state}}
-
-          {:error, reason} ->
-            {:error, reason}
-        end
+        Arbor.MCP.Transport.send_message_with_state(
+          transport_mod,
+          outbound_message,
+          transport_state
+        )
+        |> transport_result(state)
       end
     end
   end
+
+  defp transport_result({:ok, transport, response}, state),
+    do: {:ok, %{state | transport_state: transport}, response}
+
+  defp transport_result({:ok, transport}, state),
+    do: {:ok, %{state | transport_state: transport}}
+
+  defp transport_result({:error, reason, transport}, state),
+    do: {:error, reason, %{state | transport_state: transport}}
+
+  defp transport_result(result, _state), do: result
 
   defp encode_for_transport(Arbor.MCP.Transport.Local, message), do: {:ok, message}
   defp encode_for_transport(_transport_mod, message), do: Protocol.encode_to_string(message)
@@ -1523,8 +1582,8 @@ defmodule Arbor.MCP.Client.RequestHandler do
     |> Maps.put_present("id", id)
   end
 
-  defp build_request(method, params, id, state) do
-    with {:ok, params} <- RequestParams.for_request(params || %{}, state) do
+  defp build_request(method, params, id, state, opts \\ []) do
+    with {:ok, params} <- RequestParams.for_request(params || %{}, state, opts) do
       {:ok, build_request(method, params, id)}
     end
   end
@@ -1988,14 +2047,12 @@ defmodule Arbor.MCP.Client.RequestHandler do
         {from, :single, _method} ->
           # Reply with cancelled error and remove from pending
           GenServer.reply(from, {:error, :cancelled})
-          new_pending = Map.delete(state.pending_requests, request_id)
-          {:noreply, %{updated_state | pending_requests: new_pending}}
+          {:noreply, drop_pending(updated_state, request_id)}
 
         {from, :single} ->
           # Reply with cancelled error and remove from pending
           GenServer.reply(from, {:error, :cancelled})
-          new_pending = Map.delete(state.pending_requests, request_id)
-          {:noreply, %{updated_state | pending_requests: new_pending}}
+          {:noreply, drop_pending(updated_state, request_id)}
 
         _ ->
           # Other types of requests (batch, etc.)
@@ -2089,7 +2146,10 @@ defmodule Arbor.MCP.Client.RequestHandler do
         end)
 
       tasks = Map.put(state.mrtr_tasks || %{}, pid, {ref, from, scope_ref})
-      {:noreply, %{state | mrtr_tasks: tasks}}
+      state = %{state | mrtr_tasks: tasks}
+
+      {:noreply,
+       watch_caller(state, {:mrtr, pid}, from, Keyword.get(opts, :cancel_on_caller_exit))}
     else
       {:reply,
        {:error,
@@ -2108,7 +2168,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
       {{ref, from, _scope_ref}, tasks} ->
         Process.demonitor(ref, [:flush])
-        state = %{state | mrtr_tasks: tasks}
+        state = forget_caller(%{state | mrtr_tasks: tasks}, {:mrtr, task_pid})
 
         case outcome do
           {:ok, responses, new_handler_state} ->
@@ -2129,6 +2189,8 @@ defmodule Arbor.MCP.Client.RequestHandler do
         {:noreply, state}
 
       {{_ref, from, _scope_ref}, tasks} ->
+        state = forget_caller(state, {:mrtr, task_pid})
+
         Logger.error("MRTR input handler task exited",
           reason_shape: LogSummary.describe(reason)
         )
@@ -2158,8 +2220,135 @@ defmodule Arbor.MCP.Client.RequestHandler do
       Process.demonitor(ref, [:flush])
     end)
 
-    {:noreply, %{state | mrtr_tasks: Map.new(remaining)}}
+    state =
+      Enum.reduce(cancelled, %{state | mrtr_tasks: Map.new(remaining)}, fn {pid, _task}, acc ->
+        forget_caller(acc, {:mrtr, pid})
+      end)
+
+    {:noreply, state}
   end
+
+  @doc false
+  # The caller of an MRTR round exited while the client handler was still
+  # answering its input requests: nobody will send the answers, so the
+  # handler is stopped, as at the caller's timeout.
+  @spec stop_mrtr_fulfillment(pid(), map()) :: map()
+  def stop_mrtr_fulfillment(task_pid, state) do
+    case Map.pop(state.mrtr_tasks || %{}, task_pid) do
+      {{ref, _from, _scope_ref}, tasks} ->
+        Process.exit(task_pid, :kill)
+        Process.demonitor(ref, [:flush])
+        %{state | mrtr_tasks: tasks}
+
+      {nil, _tasks} ->
+        state
+    end
+  end
+
+  # Cancel on caller exit.
+  #
+  # A request whose caller exits while it is in flight is cancelled upstream
+  # (see Arbor.MCP.Client's :DOWN handling), and so is an MRTR round whose
+  # input the client handler is still answering. Each such request or
+  # fulfilment holds one monitor on its caller: `caller_watches` maps
+  # {:request, id} or {:mrtr, task_pid} to it, and `caller_monitors` maps it
+  # back. A watch is dropped, and its monitor with it, as soon as what it
+  # watched settles: every path that removes a pending request goes through
+  # drop_pending/2, and every end of an MRTR fulfilment calls
+  # forget_caller/2. Adding a watch also prunes any left behind, as a
+  # backstop only.
+
+  @doc false
+  # On for every modern request unless the caller turned it off; on a legacy
+  # connection only when the caller asked for it, since there it sends
+  # `notifications/cancelled`, which a legacy peer did not get before.
+  @spec cancel_on_caller_exit?(boolean() | nil, map()) :: boolean()
+  def cancel_on_caller_exit?(nil, state),
+    do: VersionRegistry.modern?(Map.get(state, :protocol_version))
+
+  def cancel_on_caller_exit?(option, _state), do: option == true
+
+  defp watch_caller(state, key, {caller, _tag}, option) when is_pid(caller) do
+    if cancel_on_caller_exit?(option, state) do
+      state = prune_caller_watches(state)
+      monitor = Process.monitor(caller)
+
+      state
+      |> Map.put(:caller_watches, Map.put(caller_watches(state), key, monitor))
+      |> Map.put(:caller_monitors, Map.put(caller_monitors(state), monitor, key))
+    else
+      state
+    end
+  end
+
+  defp watch_caller(state, _key, _from, _option), do: state
+
+  @doc false
+  # What a caller's monitor watched, {:request, id} or {:mrtr, task_pid}, now
+  # that the caller is down, or nil for a monitor that is no longer a watch.
+  @spec caller_exited(reference(), map()) :: {term(), map()}
+  def caller_exited(monitor, state) do
+    case Map.pop(caller_monitors(state), monitor) do
+      {nil, _monitors} ->
+        {nil, state}
+
+      {key, monitors} ->
+        state =
+          state
+          |> Map.put(:caller_monitors, monitors)
+          |> Map.put(:caller_watches, Map.delete(caller_watches(state), key))
+
+        {key, state}
+    end
+  end
+
+  @doc false
+  # Drops a request that settled, whichever way (a response, an error, a
+  # timeout, a cancellation, a failed send), and the watch on its caller with
+  # it, so no monitor outlives what it watched.
+  @spec drop_pending(map(), term()) :: map()
+  def drop_pending(state, request_id) do
+    state = %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+    forget_caller(state, {:request, request_id})
+  end
+
+  @doc false
+  @spec forget_caller(map(), term()) :: map()
+  def forget_caller(state, key) do
+    case Map.pop(caller_watches(state), key) do
+      {nil, _watches} ->
+        state
+
+      {monitor, watches} ->
+        Process.demonitor(monitor, [:flush])
+
+        state
+        |> Map.put(:caller_watches, watches)
+        |> Map.put(:caller_monitors, Map.delete(caller_monitors(state), monitor))
+    end
+  end
+
+  @doc false
+  # Drops every watch, for a connection that went away with its requests.
+  @spec forget_callers(map()) :: map()
+  def forget_callers(state) do
+    state |> caller_monitors() |> Map.keys() |> Enum.each(&Process.demonitor(&1, [:flush]))
+    state |> Map.put(:caller_watches, %{}) |> Map.put(:caller_monitors, %{})
+  end
+
+  defp prune_caller_watches(state) do
+    Enum.reduce(caller_watches(state), state, fn {key, _monitor}, acc ->
+      if still_in_flight?(acc, key), do: acc, else: forget_caller(acc, key)
+    end)
+  end
+
+  defp still_in_flight?(state, {:request, id}), do: Map.has_key?(state.pending_requests, id)
+
+  defp still_in_flight?(state, {:mrtr, pid}),
+    do: Map.has_key?(Map.get(state, :mrtr_tasks) || %{}, pid)
+
+  defp caller_watches(state), do: Map.get(state, :caller_watches) || %{}
+  defp caller_monitors(state), do: Map.get(state, :caller_monitors) || %{}
 
   defp normalize_mrtr_error(%Error.ProtocolError{} = error), do: error
 
@@ -2350,11 +2539,15 @@ defmodule Arbor.MCP.Client.RequestHandler do
         end
 
       {:error, reason} ->
-        Logger.error("Failed to send response to server",
-          reason_shape: LogSummary.describe(reason)
-        )
+        response_send_error(reason, state)
 
-        {:noreply, state}
+      {:error, reason, updated_state} ->
+        response_send_error(reason, updated_state)
     end
+  end
+
+  defp response_send_error(reason, state) do
+    Logger.error("Failed to send response to server", reason_shape: LogSummary.describe(reason))
+    {:noreply, state}
   end
 end
