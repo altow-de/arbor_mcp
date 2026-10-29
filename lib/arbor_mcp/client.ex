@@ -130,6 +130,7 @@ defmodule Arbor.MCP.Client do
     progress_tombstones: %{},
     progress_reservations: %{},
     progress_monitors: %{},
+    progress_sweep: nil,
     # Requests made with reset_timeout_on_progress, mapped to the timer that
     # runs out if they go that long without progress: {timer, tag, ms}.
     progress_timeouts: %{},
@@ -2552,6 +2553,9 @@ defmodule Arbor.MCP.Client do
   # that already completed find no pending entry and are ignored.
   # A request made with reset_timeout_on_progress went its timeout without
   # progress, and times out as it would at its deadline.
+  # Expired progress_to tombstones and reservations (see RequestHandler).
+  def handle_info(:progress_sweep, state), do: {:noreply, RequestHandler.sweep_progress(state)}
+
   def handle_info({:progress_timeout, request_id, tag}, state) do
     case RequestHandler.progress_timed_out(request_id, tag, state) do
       {:timed_out, state} -> handle_info({:request_timeout, request_id}, state)

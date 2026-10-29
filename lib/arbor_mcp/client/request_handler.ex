@@ -1477,7 +1477,8 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
       token ->
         state = prune_settled_targets(state)
-        {reserved, state} = claim_reservation(state, token, request)
+        limits = Map.take(meta, [:max_mrtr_bytes, :max_input_requests])
+        {reserved, state} = claim_reservation(state, token, request, limits)
         pid = Map.get(meta, :progress_to) || reserved
         monitor = if is_pid(pid), do: Process.monitor(caller)
 
@@ -1487,7 +1488,8 @@ defmodule Arbor.MCP.Client.RequestHandler do
           caller: caller,
           deadline: deadline,
           monitor: monitor,
-          round: mrtr_round(request)
+          round: mrtr_round(request),
+          limits: limits
         }
 
         state
@@ -1517,24 +1519,57 @@ defmodule Arbor.MCP.Client.RequestHandler do
   defp mrtr_round(%{"method" => method}), do: {method, nil}
 
   # What a continuation must present: the requestState the round returned,
-  # or, when it returned none, the ids of the input requests it answers.
-  defp continuation(%{"requestState" => request_state}) when is_binary(request_state),
-    do: {:state, :crypto.hash(:sha256, request_state)}
+  # or, when it returned none, the ids of the input requests it answers. Both
+  # sides come from outside the client process (the server's round, the
+  # caller's continuation), so every shape is handled, nothing larger than
+  # the request's own MRTR limits is hashed or listed, and anything else
+  # identifies no round.
+  defp continuation(%{"requestState" => request_state}, limits),
+    do: state_identity(request_state, limits)
 
-  defp continuation(%{"inputResponses" => responses}) when is_map(responses),
-    do: {:inputs, responses |> Map.keys() |> Enum.sort()}
+  defp continuation(%{"inputResponses" => responses}, limits),
+    do: inputs_identity(responses, limits)
 
-  defp continuation(_params), do: nil
+  defp continuation(_params, _limits), do: nil
 
-  defp round_continuation(%{"requestState" => request_state}) when is_binary(request_state),
-    do: {:state, :crypto.hash(:sha256, request_state)}
+  defp round_continuation(%{"requestState" => request_state}, limits),
+    do: state_identity(request_state, limits)
 
-  defp round_continuation(result),
-    do: {:inputs, result |> Map.get("inputRequests", %{}) |> Map.keys() |> Enum.sort()}
+  defp round_continuation(%{"inputRequests" => requests}, limits),
+    do: inputs_identity(requests, limits)
 
-  defp claim_reservation(state, token, request) do
+  defp round_continuation(_result, _limits), do: nil
+
+  defp state_identity(request_state, limits) when is_binary(request_state) do
+    if byte_size(request_state) <= limit(limits, :max_mrtr_bytes, MRTR.max_bytes([])),
+      do: {:state, :crypto.hash(:sha256, request_state)}
+  end
+
+  defp state_identity(_request_state, _limits), do: nil
+
+  defp inputs_identity(ids, limits) when is_map(ids) and not is_struct(ids) do
+    count = map_size(ids)
+
+    if count > 0 and count <= limit(limits, :max_input_requests, MRTR.max_input_requests([])) do
+      keys = Map.keys(ids)
+      if Enum.all?(keys, &is_binary/1), do: {:inputs, Enum.sort(keys)}
+    end
+  end
+
+  defp inputs_identity(_ids, _limits), do: nil
+
+  # The request's own limit, or MRTR's default when it set none or set
+  # something this process can't use.
+  defp limit(limits, key, default) do
+    case Map.get(limits, key) do
+      value when is_integer(value) and value >= 0 -> value
+      _unset -> default
+    end
+  end
+
+  defp claim_reservation(state, token, request, limits) do
     reservations = progress_reservations(state)
-    identity = {mrtr_round(request), continuation(Map.get(request, "params") || %{})}
+    identity = {mrtr_round(request), continuation(Map.get(request, "params") || %{}, limits)}
 
     case Map.get(reservations, token) do
       %{identity: ^identity, pid: pid} = reservation
@@ -1569,22 +1604,29 @@ defmodule Arbor.MCP.Client.RequestHandler do
     end
   end
 
+  # Only a round whose continuation can be told apart is reserved; any other
+  # input_required answer, malformed or over the request's limits, is held
+  # back like a settled request.
   defp settle_token(state, token, id, target, {:ok, result}) do
-    if MRTR.input_required?(result),
-      do: reserve_token(state, token, id, target, result),
-      else: tombstone_token(state, token, id)
+    with true <- MRTR.input_required?(result),
+         continuation when not is_nil(continuation) <-
+           round_continuation(result, Map.get(target, :limits, %{})) do
+      reserve_token(state, token, id, target, continuation)
+    else
+      _complete_or_unusable -> tombstone_token(state, token, id)
+    end
   end
 
   defp settle_token(state, token, id, _target, _response), do: tombstone_token(state, token, id)
 
   # Two rounds that reserve one token at once can't tell their continuations
   # apart: neither may claim it, and both stay held back.
-  defp reserve_token(state, token, id, target, result) do
+  defp reserve_token(state, token, id, target, continuation) do
     now = now()
     until = target.deadline || now + (state.default_timeout || 5_000)
 
     reservation = %{
-      identity: {target.round, round_continuation(result)},
+      identity: {target.round, continuation},
       pid: target.pid,
       until: until
     }
@@ -1606,6 +1648,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
     state
     |> Map.put(:progress_reservations, reservations)
     |> forget_progress_request(token, id)
+    |> arm_progress_sweep(until + @caller_timeout_grace)
   end
 
   defp tombstone_token(state, token, id) do
@@ -1619,6 +1662,53 @@ defmodule Arbor.MCP.Client.RequestHandler do
     state
     |> Map.put(:progress_tombstones, tombstones)
     |> forget_progress_request(token, id)
+    |> arm_progress_sweep(now + @caller_timeout_grace)
+  end
+
+  # One timer sweeps expired tombstones and reservations, so a burst that
+  # no request follows still leaves nothing behind. It is armed for the
+  # earliest expiry, and moved earlier when a new entry expires sooner.
+  defp arm_progress_sweep(state, at) do
+    case Map.get(state, :progress_sweep) do
+      {_timer, armed_at} when armed_at <= at ->
+        state
+
+      armed ->
+        if armed, do: Process.cancel_timer(elem(armed, 0))
+        timer = Process.send_after(self(), :progress_sweep, max(at - now(), 0) + 1)
+        Map.put(state, :progress_sweep, {timer, at})
+    end
+  end
+
+  @doc false
+  # The sweep timer fired: drop what has expired, and arm it again for the
+  # earliest of what remains.
+  @spec sweep_progress(map()) :: map()
+  def sweep_progress(state) do
+    now = now()
+
+    tombstones =
+      (Map.get(state, :progress_tombstones) || %{})
+      |> Map.filter(fn {_token, until} -> until > now end)
+
+    reservations =
+      progress_reservations(state)
+      |> Map.filter(fn {_token, held} -> held.until + @caller_timeout_grace > now end)
+
+    next =
+      Enum.min(
+        Map.values(tombstones) ++
+          Enum.map(reservations, fn {_token, held} -> held.until + @caller_timeout_grace end),
+        fn -> nil end
+      )
+
+    state =
+      state
+      |> Map.put(:progress_tombstones, tombstones)
+      |> Map.put(:progress_reservations, reservations)
+      |> Map.put(:progress_sweep, nil)
+
+    if next, do: arm_progress_sweep(state, next), else: state
   end
 
   defp forget_progress_request(state, token, id) do
@@ -1680,11 +1770,17 @@ defmodule Arbor.MCP.Client.RequestHandler do
   def reset_progress(state) do
     state |> progress_monitors() |> Map.keys() |> Enum.each(&Process.demonitor(&1, [:flush]))
 
+    case Map.get(state, :progress_sweep) do
+      {timer, _at} -> Process.cancel_timer(timer)
+      nil -> :ok
+    end
+
     state
     |> Map.put(:progress_targets, %{})
     |> Map.put(:progress_tombstones, %{})
     |> Map.put(:progress_reservations, %{})
     |> Map.put(:progress_monitors, %{})
+    |> Map.put(:progress_sweep, nil)
   end
 
   defp put_progress_monitor(state, nil, _id), do: state

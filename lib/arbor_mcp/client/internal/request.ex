@@ -57,6 +57,13 @@ defmodule Arbor.MCP.Client.Internal.Request do
     with :ok <- validate_http_stream_retry_mode(client, stream_retry_mode),
          {:ok, params, request_meta} <- ManualMRTR.prepare(method, params, opts) do
       {params, request_meta} = with_progress_to(params, request_meta, opts)
+      # The client process bounds the MRTR bookkeeping it keeps for progress
+      # by the request's own limits (see RequestHandler).
+      request_meta =
+        Map.merge(
+          request_meta,
+          Map.new(Keyword.take(opts, [:max_mrtr_bytes, :max_input_requests]))
+        )
 
       do_make_request(
         client,

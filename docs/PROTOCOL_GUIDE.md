@@ -426,12 +426,15 @@ end
 
 - **A token is added if the request has none,** as for
   `reset_timeout_on_progress`, since progress names its request only by
-  token. With `mrtr: :manual` on `tools/call`, `resources/read` or
-  `prompts/get`, pass `:progress_token` yourself and repeat it on every
-  round; without one the call returns a `ValidationError`, because a
-  generated token would differ between rounds. Under automatic MRTR every
-  round already shares the request's token, so each round's progress
-  arrives.
+  token. Under automatic MRTR every round already shares the request's
+  token, so each round's progress arrives.
+- **Manual MRTR needs an explicit token.** With `mrtr: :manual` on
+  `call_tool/4` or `get_prompt/4`, pass `:progress_token` yourself and
+  repeat it on every round. Without one, the call returns a
+  `ValidationError`, because a generated token would differ between rounds.
+  `read_resource/3` takes no progress token, so a manual read can't use
+  `progress_to:` or `reset_timeout_on_progress`. It returns the same
+  `ValidationError`.
 - **Delivery stops once the call returns,** with a result, an error, a
   timeout or a cancellation, even while the client is still cleaning up
   after a caller's own `:timeout`. The client measures the caller's
@@ -467,6 +470,12 @@ end
     continuation that comes after the round's deadline.
   - **Expiry:** once the round's deadline has passed, the token is held back
     for a second more, as for a settled request.
+  - **Limits:** a round that can't be identified within the request's own
+    MRTR limits reserves nothing. That covers a `requestState` over
+    `:max_mrtr_bytes`, or input requests over `:max_input_requests` or of
+    the wrong shape. Its token is held back like a settled request's. A
+    continuation whose `request_state:` is over its `:max_mrtr_bytes`
+    claims nothing.
   - **Tombstones still apply:** a claim never ends a hold left by an earlier
     request that used the token.
 - **Use tokens that are unique on the connection.** The client's generated

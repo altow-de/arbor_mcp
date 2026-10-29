@@ -12,7 +12,7 @@ defmodule Arbor.MCP.Client.ProgressToTest do
 
   alias Arbor.MCP.Client
   alias Arbor.MCP.Client.RequestHandler
-  alias Arbor.MCP.Error.ValidationError
+  alias Arbor.MCP.Error.{ProtocolError, ValidationError}
   alias Arbor.MCP.Server.{Context, HandlerServer, Runtime}
 
   @key :binary.copy(<<9>>, 32)
@@ -912,6 +912,125 @@ defmodule Arbor.MCP.Client.ProgressToTest do
       refute_received {:forwarded, _target, _message}
     end
 
+    test "a malformed input_required round neither crashes the client nor is reserved" do
+      client = scripted()
+      monitor = Process.monitor(client)
+
+      sibling = start_call(client, progress_to: self(), progress_token: "sibling")
+      assert_receive {:wire, %{"id" => sibling_id}}
+
+      bad =
+        start_call(client,
+          mrtr: :manual,
+          progress_to: self(),
+          progress_token: "bad",
+          timeout: 5_000
+        )
+
+      assert_receive {:wire, %{"id" => bad_id}}
+
+      respond_with(client, bad_id, %{"resultType" => "input_required", "inputRequests" => nil})
+
+      assert {:error, %ProtocolError{message: "inputRequests must be an object"}} =
+               Task.await(bad)
+
+      state = :sys.get_state(client)
+      refute Map.has_key?(state.progress_reservations, "bad")
+      assert Map.has_key?(state.progress_tombstones, "bad")
+
+      respond(client, sibling_id)
+      assert {:ok, _result} = Task.await(sibling)
+      refute_received {:DOWN, ^monitor, :process, _pid, _reason}
+    end
+
+    test "a requestState over the request's byte limit is neither hashed nor reserved" do
+      client = scripted()
+
+      call =
+        start_call(client,
+          mrtr: :manual,
+          progress_to: self(),
+          progress_token: "big",
+          max_mrtr_bytes: 128,
+          timeout: 5_000
+        )
+
+      assert_receive {:wire, %{"id" => id}}
+      respond_with(client, id, input_required_result(String.duplicate("s", 200)))
+      assert {:error, %ProtocolError{message: "MRTR byte limit exceeded"}} = Task.await(call)
+
+      state = :sys.get_state(client)
+      refute Map.has_key?(state.progress_reservations, "big")
+      assert Map.has_key?(state.progress_tombstones, "big")
+    end
+
+    test "a continuation whose request_state is over its byte limit claims nothing" do
+      client = scripted()
+      test_pid = self()
+      target = spawn_link(fn -> forward_to(test_pid, "round") end)
+      request_state = String.duplicate("r", 100)
+
+      _id =
+        await_round(client,
+          progress_to: target,
+          progress_token: "cap",
+          request_state: request_state
+        )
+
+      continuation =
+        start_call(client,
+          mrtr: :manual,
+          progress_token: "cap",
+          input_responses: %{"name" => %{"action" => "decline"}},
+          request_state: request_state,
+          max_mrtr_bytes: 64,
+          timeout: 5_000
+        )
+
+      assert_receive {:wire, %{"id" => next_id, "params" => %{"requestState" => ^request_state}}}
+      progress(client, "cap", 1)
+      _state = :sys.get_state(client)
+      refute_received {:forwarded, _target, _message}
+
+      respond(client, next_id)
+      assert {:ok, _result} = Task.await(continuation)
+    end
+
+    test "expired tombstones and reservations are swept even when no request follows" do
+      client = scripted()
+
+      for n <- 1..5 do
+        call = start_call(client, progress_to: self(), progress_token: "done-#{n}")
+        assert_receive {:wire, %{"id" => id}}
+        respond(client, id)
+        assert {:ok, _result} = Task.await(call)
+      end
+
+      for n <- 1..3 do
+        await_round(client,
+          progress_to: self(),
+          progress_token: "left-#{n}",
+          request_state: "rs-#{n}",
+          timeout: 300
+        )
+      end
+
+      state = :sys.get_state(client)
+      assert map_size(state.progress_tombstones) == 5
+      assert map_size(state.progress_reservations) == 3
+
+      :ok =
+        Arbor.MCP.TestHelpers.wait_until(
+          fn ->
+            state = :sys.get_state(client)
+            state.progress_tombstones == %{} and state.progress_reservations == %{}
+          end,
+          timeout: 5_000
+        )
+
+      assert :sys.get_state(client).progress_sweep == nil
+    end
+
     test "each request's progress goes only to its own target" do
       client = scripted()
       test_pid = self()
@@ -1092,10 +1211,15 @@ defmodule Arbor.MCP.Client.ProgressToTest do
   # input_required and `request_state`; returns the round's request id.
   defp await_round(client, opts) do
     {request_state, opts} = Keyword.pop!(opts, :request_state)
-    round = start_call(client, [mrtr: :manual, timeout: 5_000] ++ opts)
+    round = start_call(client, Keyword.merge([mrtr: :manual, timeout: 5_000], opts))
     assert_receive {:wire, %{"id" => id, "method" => "tools/call"}}
+    respond_with(client, id, input_required_result(request_state))
+    assert {:input_required, %{request_state: ^request_state}} = Task.await(round)
+    id
+  end
 
-    result = %{
+  defp input_required_result(request_state) do
+    %{
       "resultType" => "input_required",
       "inputRequests" => %{
         "name" => %{
@@ -1105,14 +1229,11 @@ defmodule Arbor.MCP.Client.ProgressToTest do
       },
       "requestState" => request_state
     }
+  end
 
-    send(
-      client,
-      {:transport_message, Jason.encode!(%{"jsonrpc" => "2.0", "id" => id, "result" => result})}
-    )
-
-    assert {:input_required, %{request_state: ^request_state}} = Task.await(round)
-    id
+  defp respond_with(client, id, result) do
+    message = %{"jsonrpc" => "2.0", "id" => id, "result" => result}
+    send(client, {:transport_message, Jason.encode!(message)})
   end
 
   defp start_call(client, opts) do
