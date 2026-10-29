@@ -35,7 +35,7 @@ defmodule Arbor.MCP.Transport.HTTPTrustStoreTest do
 
     capture_log(fn ->
       assert HTTP.send_message(message, state) ==
-               {:error, {:trust_store_unavailable, :no_certificates}, state}
+               {:error, {:trust_store_unavailable, :no_certificates}}
     end)
   end
 

@@ -19,7 +19,15 @@ defmodule Arbor.MCP.Client.SynchronousSendStateTest do
          }}
 
     @impl true
-    def send_message(body, %{phase: :initialized} = state) do
+    def send_message(body, state) do
+      case send_message_with_state(body, state) do
+        {:error, reason, _latest} -> {:error, reason}
+        result -> result
+      end
+    end
+
+    @doc false
+    def send_message_with_state(body, %{phase: :initialized} = state) do
       case Jason.decode!(body) do
         %{"method" => "initialize", "id" => id} ->
           result = %{
@@ -35,7 +43,7 @@ defmodule Arbor.MCP.Client.SynchronousSendStateTest do
       end
     end
 
-    def send_message(_body, state), do: {:error, :refused, %{state | retired: true}}
+    def send_message_with_state(_body, state), do: {:error, :refused, %{state | retired: true}}
     @impl true
     def receive_message(_state), do: {:error, :unexpected_receive}
     @impl true

@@ -51,7 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Synchronous HTTP failures now retain updated credentials and rejection state
+- Probe and handshake receive failures retain refreshed authentication state
+  during fallback and cleanup. Synchronous HTTP state-bearing failures stay
+  internal; public transport `send_message/2` errors remain `{:error, reason}`.
+- Synchronous client HTTP failures retain updated credentials and rejection state
   through notifications, server-request replies, batches, and establishment.
   Cached provider tokens cannot gain a fresh generation without acquisition
   evidence or be reused after rejection. HTTP 401/403 responses are handled

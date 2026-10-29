@@ -328,7 +328,17 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   @impl true
-  def send_message(message, %__MODULE__{use_sse: true, sse_pid: nil} = state) do
+  def send_message(message, %__MODULE__{} = state) do
+    case send_message_with_state(message, state) do
+      {:error, reason, _latest_state} -> {:error, reason}
+      result -> result
+    end
+  end
+
+  @doc false
+  @spec send_message_with_state(term(), t()) ::
+          {:ok, t()} | {:ok, t(), term()} | {:error, term(), t()}
+  def send_message_with_state(message, %__MODULE__{use_sse: true, sse_pid: nil} = state) do
     # SSE configured but not yet started (pre-initialization).
     # Handle synchronously like non-SSE mode, then start SSE if we get a session ID.
     case perform_and_maybe_auth(message, state) do
@@ -351,16 +361,16 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
-  def send_message(message, %__MODULE__{use_sse: false} = state) do
+  def send_message_with_state(message, %__MODULE__{use_sse: false} = state) do
     send_authenticated(message, state)
   end
 
-  def send_message(message, %__MODULE__{use_sse: true, sse_pid: sse_pid} = state)
+  def send_message_with_state(message, %__MODULE__{use_sse: true, sse_pid: sse_pid} = state)
       when is_pid(sse_pid),
       do: async_post(message, state)
 
   # SSE mode without active connection (pre-initialization) or fallback
-  def send_message(message, %__MODULE__{} = state) do
+  def send_message_with_state(message, %__MODULE__{} = state) do
     send_authenticated(message, state)
   end
 

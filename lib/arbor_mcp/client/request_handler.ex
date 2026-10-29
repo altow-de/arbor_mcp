@@ -1520,7 +1520,12 @@ defmodule Arbor.MCP.Client.RequestHandler do
       {:error, :not_connected}
     else
       with {:ok, outbound_message} <- encode_for_transport(transport_mod, message) do
-        transport_mod.send_message(outbound_message, transport_state) |> transport_result(state)
+        Arbor.MCP.Transport.send_message_with_state(
+          transport_mod,
+          outbound_message,
+          transport_state
+        )
+        |> transport_result(state)
       end
     end
   end

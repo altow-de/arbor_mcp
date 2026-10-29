@@ -114,14 +114,26 @@ defmodule Arbor.MCP.Transport do
   responses asynchronously (via `receive_message/1` or `subscribe/2`)
   should return the 2-tuple.
 
-  A failed send may return `{:error, reason, new_state}` to preserve state
-  changed during authentication or retirement. Callers must retain that state.
+  A failed send returns `{:error, reason}`.
   """
   @callback send_message(message(), state()) ::
               {:ok, state()}
               | {:ok, state(), response :: binary() | map()}
               | {:error, any()}
-              | {:error, any(), state()}
+
+  @doc false
+  # Built-in client sends retain authentication changes on failure. Custom
+  # transports need only implement the public behaviour's two-tuple error.
+  @spec send_message_with_state(module(), message(), state()) ::
+          {:ok, state()}
+          | {:ok, state(), term()}
+          | {:error, term()}
+          | {:error, term(), state()}
+  def send_message_with_state(transport_mod, message, state) do
+    if function_exported?(transport_mod, :send_message_with_state, 2),
+      do: transport_mod.send_message_with_state(message, state),
+      else: transport_mod.send_message(message, state)
+  end
 
   @doc """
   Receives a message from the transport.

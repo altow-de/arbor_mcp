@@ -12,6 +12,7 @@ defmodule Arbor.MCP.Client.EraProbe do
   alias Arbor.MCP.Internal.{Protocol, RequestParams, VersionInfo, VersionRegistry}
   alias Arbor.MCP.Protocol.ResultEnvelope
   alias Arbor.MCP.Server.Discover
+  alias Arbor.MCP.Transport
   alias Arbor.MCP.Transport.Local
   alias Arbor.RPC.JSONRPC
 
@@ -259,7 +260,7 @@ defmodule Arbor.MCP.Client.EraProbe do
   end
 
   defp send_and_receive(transport_mod, outbound, transport_state, deadline) do
-    case transport_mod.send_message(outbound, transport_state) do
+    case Transport.send_message_with_state(transport_mod, outbound, transport_state) do
       {:ok, updated_state, response} ->
         {:ok, response, updated_state}
 
@@ -302,9 +303,9 @@ defmodule Arbor.MCP.Client.EraProbe do
 
     case result do
       {:ok, response, updated_state} -> {:ok, response, updated_state}
-      {:error, {:timeout_error, reason}} -> {:error, {:probe_timeout, reason}}
-      {:error, :probe_timeout} -> {:error, {:probe_timeout, :timeout}}
-      {:error, reason} -> {:error, reason}
+      {:error, {:timeout_error, reason}} -> {:error, {:probe_timeout, reason}, transport_state}
+      {:error, :probe_timeout} -> {:error, {:probe_timeout, :timeout}, transport_state}
+      {:error, reason} -> {:error, reason, transport_state}
     end
   end
 
