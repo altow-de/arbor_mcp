@@ -961,12 +961,38 @@ defmodule Arbor.MCP.Client.RequestHandler do
   end
 
   @doc false
+  # Settles the circuit-breaker admissions of the POST tasks serving
+  # `request_id` (see HTTP.attach_reliability/2) without stopping them, in any
+  # era: the outcome the client decided (:failure at its timeout, :release at
+  # a cancellation or its caller's exit) wins over whatever a task would
+  # settle later, a late response or an auth wait the client woke included.
+  @spec settle_posts(map(), term(), :failure | :release) :: map()
+  def settle_posts(
+        %{transport_mod: HTTP, transport_state: %HTTP{} = transport} = state,
+        request_id,
+        outcome
+      ) do
+    for {_monitor, {pid, ^request_id}} <- state.async_post_tasks || %{},
+        do: HTTP.settle_post(transport, pid, outcome)
+
+    state
+  end
+
+  def settle_posts(state, _request_id, _outcome), do: state
+
+  @doc false
+  # `outcome` settles a stopped POST task's circuit-breaker admission (see
+  # HTTP.attach_reliability/2): `:failure` when the caller timed out,
+  # `:release` when it cancelled.
+  def close_request_stream(request_id, state, outcome \\ :release)
+
   def close_request_stream(
         request_id,
         %{
           transport_mod: HTTP,
           transport_state: %HTTP{protocol_era: :modern} = transport_state
-        } = state
+        } = state,
+        outcome
       ) do
     # Closing the connection is how modern HTTP cancels a request, whether
     # its response is a stream or a pending POST. The POST task is forgotten
@@ -978,6 +1004,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
     for {monitor, {pid, _id}} <- posts do
       Process.demonitor(monitor, [:flush])
+      HTTP.settle_post(transport_state, pid, outcome)
       Process.exit(pid, :kill)
     end
 
@@ -988,7 +1015,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
     }
   end
 
-  def close_request_stream(request_id, %{transport_mod: LegacySSE} = state) do
+  def close_request_stream(request_id, %{transport_mod: LegacySSE} = state, _outcome) do
     Enum.each(state.async_post_tasks, fn
       {_monitor, %{kind: :legacy_post, task_pid: pid, request_id: ^request_id} = entry} ->
         if entry.generation == Lifetime.current() do
@@ -1003,7 +1030,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
     state
   end
 
-  def close_request_stream(_request_id, state), do: state
+  def close_request_stream(_request_id, state, _outcome), do: state
 
   defp request_stream_error({:auth_refused, _reason} = refusal),
     do: send_error(refusal, %{transport_mod: HTTP})
