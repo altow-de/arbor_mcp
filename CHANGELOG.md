@@ -104,6 +104,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `Accept: application/json, text/event-stream;q` — a `q` parameter with no
+  value — and `q =1` / `q= 1`, whose whitespace around the equals sign
+  violates the weight grammar (RFC 9110 section 12.4.2: optional whitespace
+  surrounds the whole parameter, never the name, the equals sign or the
+  value), treated the range as quality 1, so a request that asked for
+  progress was answered with an event stream, and a legacy session GET opened
+  one, although the client named a weight it never spelled. A `q` parameter
+  — `Q`, either case, names it too — is now the weight only when it matches
+  that grammar exactly; any other spelling, bare, empty, misspaced, malformed
+  or quoted, makes its range unusable, so those requests get JSON and the GET
+  its existing refusal. A second `q` parameter makes the range unusable
+  whatever either value says, and optional whitespace is only SP and HTAB,
+  as RFC 9110 defines it: any other whitespace-like character, a no-break
+  space for instance, is part of the value it sits in and fails the grammar
+  (found and fixed on the 1.x line first, `ex_mcp` a2d8ccc, efa779e and
+  cc2a61c).
 - Probe and handshake receive failures retain refreshed authentication state
   during fallback and cleanup. Synchronous HTTP state-bearing failures stay
   internal; public transport `send_message/2` errors remain `{:error, reason}`.
