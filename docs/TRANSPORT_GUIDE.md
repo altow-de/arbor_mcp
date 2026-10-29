@@ -113,6 +113,25 @@ client keeps its session and opens the stream again with `Last-Event-ID`. A
 server that answers that GET with 405 no longer offers the stream, and the
 client carries on POST-only.
 
+A legacy server answers 404 to a request that carries a session it has ended,
+after a restart for example, and the client must then start a new session
+(Session Management, 2025-03-26 and later). The request that got the 404 fails
+with `%Arbor.MCP.Error.TransportError{reason: {:session_expired, detail}}`,
+where `detail` is `{:http_error, 404, body}` for a POST and
+`{:sse_error, {:http_error, 404}}` for the reopened GET stream. The client does
+not send it again, since a tool call may not be safe to repeat, and
+`Arbor.MCP.Client.delivery_outcome/1` reports `:unknown` for it, as for any
+error the server answered. Requests still in flight on the session fail with
+the same error. The client then closes the transport as for a lost
+connection: it sends the session DELETE and stops its `reliability:`
+components. It reconnects under `:reconnect_backoff`, with an `initialize`
+that carries no session id, so the server starts a new session; a configured
+`:session_id` is not used again. Requests made before the new session is
+ready get `{:error, :not_connected}`. With `reconnect: false` the client goes
+`:disconnected` instead. A 404 for a request without a session id, and every
+modern 404, stays `{:http_error, 404, body}`, since a 2026-07-28 connection
+has no session.
+
 A list change sent outside a callback, such as
 `Arbor.MCP.Server.notify_tools_changed(runtime)` or the `add_tool/3` family,
 isn't addressed to a session. It goes to every modern `subscriptions/listen`
@@ -153,7 +172,8 @@ Supported client options include:
 - `:protocol_mode` - `:legacy_only`, `:prefer_legacy`, `:prefer_modern`, or
   `:modern_only`; see the [Configuration Guide](CONFIGURATION.md#protocol-eras-and-modes).
 - `:use_sse` - enable the legacy Streamable HTTP GET stream, defaults to `true`.
-- `:session_id` - resume an existing streamable HTTP session.
+- `:session_id` - resume an existing streamable HTTP session. Once the server
+  has ended it (a 404), a reconnect starts a new session without it.
 - `:protocol_version` - requested legacy revision, or a modern probe revision
   when the selected mode enables it.
 - `:timeout` - connect timeout.
