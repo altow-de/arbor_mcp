@@ -604,7 +604,7 @@ defmodule Arbor.MCP.Transport.HTTP do
           Lifetime.deliver(
             parent,
             {:http_credential_rejected, :post, self(), extract_request_id(message),
-             state.credential_generation}
+             presented_generation(state)}
           )
         end
 
@@ -669,7 +669,7 @@ defmodule Arbor.MCP.Transport.HTTP do
       www_authenticate: www_auth,
       scopes: extract_scope_from_www_auth(www_auth),
       token: state.access_token,
-      credential_generation: state.credential_generation,
+      credential_generation: presented_generation(state),
       deadline: state.deadline
     }
 
@@ -829,9 +829,12 @@ defmodule Arbor.MCP.Transport.HTTP do
   # the provider gave before nor without one, and the transport drops that
   # token. The refusal is definitive, as a rejected credential's is, and its
   # reason is redacted as an init failure's is (see provider_call/1).
-  # `{:ok, nil, state}`, "no token yet", returns the transport to where it
-  # starts: the request goes out without an Authorization header, so the
-  # server's challenge can start the provider's flow.
+  # `{:ok, nil, state}`, "no token yet", sends the request without an
+  # Authorization header, so the server's challenge can start the
+  # provider's flow. A token counts as newly acquired only when the
+  # provider's state changed, or when it is the first: otherwise it keeps
+  # the generation of the provider's last token, even one dropped since, and
+  # is refused before it is sent if the server rejected that one.
   defp apply_provider_token(%{auth_provider: provider, auth_provider_state: ps} = state)
        when not is_nil(provider) do
     case provider_call(fn -> provider.get_token(ps) end) do
@@ -870,17 +873,15 @@ defmodule Arbor.MCP.Transport.HTTP do
      drop_provider_token(state)}
   end
 
-  # As before the provider's first token: no Authorization header, and no
-  # credential generation, so a challenge to a request sent without a token
-  # retires none of the provider's. What the server rejected stays rejected.
-  defp drop_provider_token(state) do
-    %{
-      state
-      | access_token: nil,
-        credential_generation: 0,
-        headers: Headers.delete(state.headers, "authorization")
-    }
-  end
+  # Drops the token the provider gave, and only that: requests go out
+  # without an Authorization header. Its credential generation stays, so a
+  # token the provider returns later with its state unchanged is still known
+  # for the one it was, and refused if the server rejected it; a request
+  # sent meanwhile presents no generation (see presented_generation/1).
+  defp drop_provider_token(%{access_token: nil} = state), do: state
+
+  defp drop_provider_token(state),
+    do: %{state | access_token: nil, headers: Headers.delete(state.headers, "authorization")}
 
   @doc false
   # Whether `reason` is a refusal apply_provider_token/1 made before anything
@@ -1107,8 +1108,20 @@ defmodule Arbor.MCP.Transport.HTTP do
 
   defp retire_response_credential(state, response) do
     if match?({:unauthorized, _}, extract_auth_status(response)),
-      do: retire_credential(state, state.credential_generation),
+      do: retire_credential(state, presented_generation(state)),
       else: state
+  end
+
+  # The generation of the credential a request sent with `state` presents,
+  # which a 401 to it retires: none (0) when the request carries no
+  # Authorization header. A request sent after the provider's token was
+  # dropped presents nothing, so its 401 says nothing about that token, and
+  # the transport still knows which generation the token had (see
+  # apply_provider_token/1).
+  defp presented_generation(state) do
+    if Headers.get(state.headers, "authorization"),
+      do: state.credential_generation,
+      else: 0
   end
 
   @doc false
@@ -1828,7 +1841,7 @@ defmodule Arbor.MCP.Transport.HTTP do
                parent: parent,
                request_id: request_id,
                deadline: state.deadline,
-               credential_generation: state.credential_generation,
+               credential_generation: presented_generation(state),
                url: url,
                headers: headers,
                body: message,

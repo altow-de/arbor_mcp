@@ -185,7 +185,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or exit `:throw` or `:exit`, and a return the callback doesn't allow
   (including a token that isn't a string) `:invalid_token_result`.
   `{:ok, nil, state}` now sends the request without an `Authorization`
-  header; it used to keep the earlier token. Requests that went out with a
+  header; it used to keep the earlier token. Dropping a token doesn't
+  forget it: a token the server rejected is still refused, as not sent, if
+  the provider returns it again with its state unchanged. Requests that
+  went out with a
   stale token before now fail, so a provider that would rather let the
   server decide should return a token, as the built-in OAuth provider does
   when a refresh fails. A request refused this way, or for carrying a

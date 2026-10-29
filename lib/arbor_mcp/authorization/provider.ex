@@ -97,6 +97,11 @@ defmodule Arbor.MCP.Authorization.Provider do
   throw or exit as `:throw` or `:exit`, and any other return as
   `:invalid_token_result`, since those may carry the provider's secrets.
 
+  A token is taken as newly acquired only when the provider's state changed
+  since its last token. A token the server rejected with a 401 is therefore
+  refused before it is sent if the provider returns it again with its state
+  unchanged, even after an error or `nil` in between.
+
   A provider that would rather let the server decide returns a token instead
   of an error. The built-in `Arbor.MCP.Authorization.Provider.OAuth` does: when
   a refresh fails, it returns the token it has, and a 401 then decides whether

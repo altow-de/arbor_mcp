@@ -19,7 +19,7 @@ defmodule Arbor.MCP.Client.HTTPProviderTokenTest do
   alias Arbor.MCP.Client
   alias Arbor.MCP.Error.TransportError
   alias Arbor.MCP.Server.Runtime
-  alias Arbor.MCP.Transport.ReliabilityWrapper
+  alias Arbor.MCP.Transport.{HTTP, ReliabilityWrapper}
 
   defmodule Handler do
     @moduledoc false
@@ -76,6 +76,8 @@ defmodule Arbor.MCP.Client.HTTPProviderTokenTest do
         :none -> {:ok, nil, state}
         {:error, reason} -> {:error, reason}
         {:ok, token} -> {:ok, token, state}
+        # A token the provider has just acquired: its state changes.
+        {:acquired, token} -> {:ok, token, Map.update(state, :acquisitions, 1, &(&1 + 1))}
         :raise -> raise ArgumentError, "s3cret-raised"
         :throw -> throw({:s3cret, "thrown"})
         :exit -> exit({:s3cret, "exited"})
@@ -280,6 +282,108 @@ defmodule Arbor.MCP.Client.HTTPProviderTokenTest do
     :ok = Client.disconnect(again)
   end
 
+  # The transport keeps the generation of the provider's last token after
+  # dropping it, so a token the server rejected, returned again with the
+  # provider's state unchanged, is still refused before it is sent; only a
+  # token the provider acquires anew gets past the rejection. A request sent
+  # without a token presents no generation, so its 401 retires none.
+  describe "a token the server rejected" do
+    @request Jason.encode!(%{"jsonrpc" => "2.0", "id" => 1, "method" => "tools/call"})
+
+    setup do
+      bypass = Bypass.open()
+      owner = self()
+      # The Authorization headers the server refuses; a request without one
+      # is refused too.
+      rejected = start_supervised!({Agent, fn -> MapSet.new(["Bearer A"]) end}, id: make_ref())
+
+      Bypass.stub(bypass, "POST", "/mcp", fn conn ->
+        auth = Plug.Conn.get_req_header(conn, "authorization")
+        send(owner, {:posted, auth})
+
+        refused = Agent.get(rejected, & &1)
+
+        if auth == [] or Enum.any?(auth, &MapSet.member?(refused, &1)) do
+          conn
+          |> Plug.Conn.put_resp_header("www-authenticate", ~s(Bearer realm="mcp"))
+          |> Plug.Conn.resp(401, "")
+        else
+          result = %{"resultType" => "complete", "content" => []}
+
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.resp(
+            200,
+            Jason.encode!(%{"jsonrpc" => "2.0", "id" => 1, "result" => result})
+          )
+        end
+      end)
+
+      script = start_supervised!({Agent, fn -> {:token, "A"} end}, id: make_ref())
+
+      {:ok, transport} =
+        HTTP.connect(
+          url: "http://127.0.0.1:#{bypass.port}/mcp",
+          use_sse: false,
+          auth_provider: {ScriptedProvider, script: script}
+        )
+
+      %{
+        transport: HTTP.settle_protocol_era(transport, :modern, "2026-07-28"),
+        script: script,
+        rejected: rejected
+      }
+    end
+
+    for clear <- [{:error, :expired}, :none], kind <- [:sync, :post, :request] do
+      test "stays refused after the provider gives #{inspect(clear)}, then it again (#{kind})",
+           context do
+        cleared = reject_then_clear(context, unquote(Macro.escape(clear)))
+
+        set(context.script, {:token, "A"})
+
+        assert {:error, {:auth_refused, {:authentication_failed, :rejected_credential}} = reason,
+                refused} = send_as(unquote(kind), cleared)
+
+        assert Client.delivery_outcome({:transport_error, reason}) == :not_sent
+        assert refused.rejected_generation == cleared.rejected_generation
+        refute_received {:posted, _auth}
+      end
+
+      test "is replaced by a token acquired after #{inspect(clear)} (#{kind})", context do
+        cleared = reject_then_clear(context, unquote(Macro.escape(clear)))
+
+        set(context.script, {:token, "A"})
+
+        assert {:error, {:auth_refused, {:authentication_failed, :rejected_credential}}, cleared} =
+                 HTTP.send_authenticated(@request, cleared)
+
+        set(context.script, {:acquired, "B"})
+        assert_sent(unquote(kind), cleared)
+        assert_received {:posted, ["Bearer B"]}
+        refute_received {:posted, _auth}
+      end
+    end
+
+    test "a 401 to a request sent without a token retires none of the provider's", context do
+      Agent.update(context.rejected, fn _ -> MapSet.new() end)
+
+      assert {:ok, %HTTP{} = accepted, _data} =
+               HTTP.send_authenticated(@request, context.transport)
+
+      assert_received {:posted, ["Bearer A"]}
+
+      set(context.script, :none)
+      assert {:error, :unauthorized, cleared} = HTTP.send_authenticated(@request, accepted)
+      assert_received {:posted, []}
+      assert cleared.rejected_generation == accepted.rejected_generation
+
+      set(context.script, {:token, "A"})
+      assert {:ok, %HTTP{}, _data} = HTTP.send_authenticated(@request, cleared)
+      assert_received {:posted, ["Bearer A"]}
+    end
+  end
+
   # A request refused before it was sent was never an upstream failure.
   describe "with reliability:" do
     @strict [circuit_breaker: [failure_threshold: 1, reset_timeout: 60_000]]
@@ -358,6 +462,62 @@ defmodule Arbor.MCP.Client.HTTPProviderTokenTest do
   end
 
   defp set(script, value), do: Agent.update(script, fn _ -> value end)
+
+  # The server rejects the provider's token A, and the provider then gives
+  # an error or no token. The transport drops A but keeps its generation.
+  defp reject_then_clear(%{transport: transport, script: script}, clear) do
+    assert {:error, :unauthorized, retired} = HTTP.send_authenticated(@request, transport)
+    assert_received {:posted, ["Bearer A"]}
+    assert retired.rejected_generation == retired.credential_generation
+
+    set(script, clear)
+    result = HTTP.send_authenticated(@request, retired)
+
+    cleared =
+      case clear do
+        {:error, reason} ->
+          assert {:error,
+                  {:auth_refused, {:auth_provider_token_failed, ScriptedProvider, ^reason}},
+                  cleared} = result
+
+          refute_received {:posted, _auth}
+          cleared
+
+        :none ->
+          assert {:error, :unauthorized, cleared} = result
+          assert_received {:posted, []}
+          cleared
+      end
+
+    assert cleared.access_token == nil
+    assert cleared.credential_generation == retired.credential_generation
+    assert cleared.rejected_generation == retired.rejected_generation
+    cleared
+  end
+
+  defp send_as(:sync, state), do: HTTP.send_authenticated(@request, state)
+  defp send_as(:post, state), do: HTTP.send_async(@request, state)
+
+  defp send_as(:request, state),
+    do: HTTP.open_stream(@request, state, self(), stream_kind: :request)
+
+  # Sends and waits for the request to finish, so no server handler outlives
+  # the test.
+  defp assert_sent(:sync, state),
+    do: assert({:ok, %HTTP{}, _data} = send_as(:sync, state))
+
+  defp assert_sent(:post, state) do
+    assert {:ok, %HTTP{}} = send_as(:post, state)
+    assert_receive {:async_post_task, _monitor, _task, 1}
+    assert_receive {:async_post_result, {:ok, _state, _data}, %{request_id: 1}}
+  end
+
+  defp assert_sent(:request, state) do
+    assert {:ok, %HTTP{modern_streams: %{1 => stream}}} = send_as(:request, state)
+    assert_receive {:modern_http_stream_message, ^stream, 1, %{"result" => _result}}
+    send(stream, {:modern_http_stream_ack, self(), 1})
+    assert_receive {:modern_http_stream_finished, ^stream, 1}
+  end
 
   defp flush_seen do
     receive do
