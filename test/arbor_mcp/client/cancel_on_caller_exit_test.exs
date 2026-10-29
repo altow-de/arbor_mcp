@@ -336,17 +336,26 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
           Client.call_tool(client, "hang", %{}, timeout: 5_000, cancel_on_caller_exit: true)
         end)
 
-      assert_receive {:hang_started, request_id}, 3_000
+      assert_receive {:hang_started, request_id, handler}, 3_000
+      handler_ref = Process.monitor(handler)
       kill(caller, caller_ref)
       assert_receive {:cancelled, %{"requestId" => ^request_id}}, 3_000
 
       {quiet, quiet_ref} =
         start_caller(fn -> Client.call_tool(client, "hang", %{}, timeout: 5_000) end)
 
-      assert_receive {:hang_started, quiet_id}, 3_000
+      assert_receive {:hang_started, quiet_id, quiet_handler}, 3_000
+      quiet_handler_ref = Process.monitor(quiet_handler)
       refute watched_by?(quiet, client)
       kill(quiet, quiet_ref)
       refute_received {:cancelled, %{"requestId" => ^quiet_id}}
+
+      # A legacy POST runs on after its cancellation; disconnecting closes
+      # both, and their handlers end before the test does (see
+      # await_handler/1).
+      stop(client)
+      await_handler(handler_ref)
+      await_handler(quiet_handler_ref)
     end
   end
 
@@ -420,24 +429,41 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
     assert_receive {:server_completed, "content"}, 3_000
   end
 
+  # The refresh is made on the caller's behalf: it is watched as the call
+  # is, so the call's opt-out covers it too.
   describe "a tools/call that refreshes tools/list after a header mismatch" do
-    # The refresh is made on the caller's behalf: it is watched as the call
-    # is, so the call's opt-out covers it too.
-    test "watches its caller as the call does" do
-      for {opts, watched?} <- [{[], true}, {[cancel_on_caller_exit: false], false}] do
-        client = start_header_mismatch_client()
+    test "has the refresh cancelled when its caller exits" do
+      client = start_header_mismatch_client()
 
-        {caller, caller_ref} =
-          start_caller(fn ->
-            Client.call_tool(client, "mismatch", %{}, [timeout: 5_000] ++ opts)
-          end)
+      {caller, caller_ref} =
+        start_caller(fn -> Client.call_tool(client, "mismatch", %{}, timeout: 5_000) end)
 
-        assert_receive {:refreshing, handler}, 3_000
-        assert watched_by?(caller, client) == watched?
+      assert_receive {:refreshing, handler}, 3_000
+      handler_ref = Process.monitor(handler)
+      assert watched_by?(caller, client)
+      kill(caller, caller_ref)
 
-        kill(caller, caller_ref)
-        send(handler, :release)
-      end
+      assert_receive :refresh_cancelled, 3_000
+      await_handler(handler_ref)
+    end
+
+    test "keeps the refresh running with cancel_on_caller_exit: false" do
+      client = start_header_mismatch_client()
+
+      {caller, caller_ref} =
+        start_caller(fn ->
+          Client.call_tool(client, "mismatch", %{}, timeout: 5_000, cancel_on_caller_exit: false)
+        end)
+
+      assert_receive {:refreshing, handler}, 3_000
+      handler_ref = Process.monitor(handler)
+      refute watched_by?(caller, client)
+      kill(caller, caller_ref)
+
+      send(handler, :release)
+      assert_receive :refresh_completed, 3_000
+      await_handler(handler_ref)
+      refute_received :refresh_cancelled
     end
   end
 
@@ -522,6 +548,15 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
   defp start_caller(fun) do
     test_pid = self()
     spawn_monitor(fn -> send(test_pid, {:caller_result, self(), fun.()}) end)
+  end
+
+  # A Bypass handler still running when its test ends leaves Bypass 2.1.0's
+  # instance to answer on_exit late, and it then crashes calling
+  # GenServer.stop(:normal); a few such crashes in a row stop the
+  # Bypass.Supervisor, and every later Bypass.open in the run fails. So a
+  # test waits for the handlers it started.
+  defp await_handler(handler_ref) do
+    assert_receive {:DOWN, ^handler_ref, :process, _handler, _reason}, 3_000
   end
 
   defp kill(caller, caller_ref) do
@@ -651,17 +686,26 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
           json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => discover_result()})
 
         %{"method" => "tools/list", "id" => id} ->
+          # A client that cancels the refresh closes its connection, and
+          # Cowboy then stops this handler. Trapping that, it ends normally,
+          # since Bypass re-raises a handler's exit when the test ends. It
+          # traps before it says it is ready, as the test may cancel at once.
+          Process.flag(:trap_exit, true)
           send(test_pid, {:refreshing, self()})
 
           receive do
-            :release -> :ok
-          after
-            5_000 -> :ok
-          end
+            :release ->
+              Agent.update(refreshed, fn _ -> true end)
+              send(test_pid, :refresh_completed)
+              result = %{"resultType" => "complete", "tools" => []}
+              json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => result})
 
-          Agent.update(refreshed, fn _ -> true end)
-          result = %{"resultType" => "complete", "tools" => []}
-          json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => result})
+            {:EXIT, _from, _reason} ->
+              send(test_pid, :refresh_cancelled)
+              conn
+          after
+            5_000 -> conn
+          end
 
         %{"method" => "tools/call", "id" => id} ->
           if Agent.get(refreshed, & &1) do
@@ -738,8 +782,9 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
   end
 
   defp legacy_respond(conn, %{"method" => "tools/call", "id" => id}, test_pid) do
-    send(test_pid, {:hang_started, id})
+    # Trapping first: the test may cancel as soon as it hears of this call.
     Process.flag(:trap_exit, true)
+    send(test_pid, {:hang_started, id, self()})
 
     receive do
       {:EXIT, _from, _reason} -> :ok
