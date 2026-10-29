@@ -686,12 +686,12 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
           json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => discover_result()})
 
         %{"method" => "tools/list", "id" => id} ->
-          send(test_pid, {:refreshing, self()})
-
           # A client that cancels the refresh closes its connection, and
           # Cowboy then stops this handler. Trapping that, it ends normally,
-          # since Bypass re-raises a handler's exit when the test ends.
+          # since Bypass re-raises a handler's exit when the test ends. It
+          # traps before it says it is ready, as the test may cancel at once.
           Process.flag(:trap_exit, true)
+          send(test_pid, {:refreshing, self()})
 
           receive do
             :release ->
@@ -782,8 +782,9 @@ defmodule Arbor.MCP.Client.CancelOnCallerExitTest do
   end
 
   defp legacy_respond(conn, %{"method" => "tools/call", "id" => id}, test_pid) do
-    send(test_pid, {:hang_started, id, self()})
+    # Trapping first: the test may cancel as soon as it hears of this call.
     Process.flag(:trap_exit, true)
+    send(test_pid, {:hang_started, id, self()})
 
     receive do
       {:EXIT, _from, _reason} -> :ok
