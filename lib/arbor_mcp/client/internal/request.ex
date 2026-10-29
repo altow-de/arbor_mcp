@@ -67,6 +67,11 @@ defmodule Arbor.MCP.Client.Internal.Request do
   end
 
   defp validate_options!(opts) do
+    # Absent or `nil` is the era's default (on for modern requests, off for
+    # legacy ones), as `nil` leaves the other forwarding options unset, so a
+    # gateway can pass options through unfiltered; `true` and `false` force
+    # it, and anything else raises.
+    validate_option!(opts, :cancel_on_caller_exit, [nil, true, false], "a boolean")
     validate_option!(opts, :format, [:map, :struct], ":map or :struct")
     validate_option!(opts, :cache_mode, [:use, :refresh, :bypass], ":use, :refresh or :bypass")
     validate_option!(opts, :reset_timeout_on_progress, [true, false], "a boolean")
@@ -104,9 +109,14 @@ defmodule Arbor.MCP.Client.Internal.Request do
     explicit_timeout = Keyword.get(opts, :timeout)
     retry_policy = Keyword.get(opts, :retry_policy, :use_default)
     scope_ref = make_ref()
+    # What the client process reads from each round's request besides its
+    # timeout (see RequestHandler.handle_request/5).
+    request_meta = %{cache_mode: Keyword.get(opts, :cache_mode, :use)}
 
     progress_timeout = progress_timeout(client, opts, default_timeout)
     params = if progress_timeout, do: ensure_progress_token(params), else: params
+    cancel_on_caller_exit = Keyword.get(opts, :cancel_on_caller_exit)
+    request_meta = Map.put(request_meta, :cancel_on_caller_exit, cancel_on_caller_exit)
 
     result =
       if explicit_timeout || progress_timeout do
@@ -118,7 +128,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
           scope_ref: scope_ref,
           stream_retry_mode: stream_retry_mode,
           progress_timeout: progress_timeout,
-          cache_mode: Keyword.get(opts, :cache_mode, :use)
+          request_meta: request_meta
         }
 
         do_mrtr_request(
@@ -132,14 +142,13 @@ defmodule Arbor.MCP.Client.Internal.Request do
           control
         )
       else
-        cache_mode = Keyword.get(opts, :cache_mode, :use)
-        first_operation = fn -> request_once(client, method, params, nil, cache_mode) end
+        first_operation = fn -> request_once(client, method, params, nil, request_meta) end
 
         retry_operation = fn ->
           deadline = started_at + fetch_default_timeout(client, default_timeout)
 
           with {:ok, remaining} <- remaining_timeout(deadline) do
-            request_once(client, method, params, remaining, cache_mode)
+            request_once(client, method, params, remaining, request_meta)
           end
         end
 
@@ -161,7 +170,7 @@ defmodule Arbor.MCP.Client.Internal.Request do
                 deadline: deadline,
                 scope_ref: scope_ref,
                 stream_retry_mode: stream_retry_mode,
-                cache_mode: cache_mode
+                request_meta: request_meta
               }
 
               continue_mrtr(
@@ -322,22 +331,23 @@ defmodule Arbor.MCP.Client.Internal.Request do
 
   # The absolute deadline travels with the request so the client does not
   # send it after the caller has given up (see RequestHandler.handle_request/5).
-  defp request_once(client, method, params, timeout, cache_mode) when is_integer(timeout) do
+  defp request_once(client, method, params, timeout, request_meta) when is_integer(timeout) do
     deadline = System.monotonic_time(:millisecond) + timeout
-    meta = %{timeout: timeout, deadline: deadline, cache_mode: cache_mode}
+    meta = Map.merge(request_meta, %{timeout: timeout, deadline: deadline})
     GenServer.call(client, {:request, method, params, meta}, timeout)
   catch
     :exit, {:timeout, _} -> {:error, :timeout}
   end
 
-  defp request_once(client, method, params, nil, cache_mode) do
-    meta = %{timeout: nil, cache_mode: cache_mode}
+  defp request_once(client, method, params, nil, request_meta) do
+    meta = Map.put(request_meta, :timeout, nil)
     GenServer.call(client, {:request, method, params, meta}, :infinity)
   end
 
   defp request_before(client, method, params, timeout, control) do
     meta =
-      %{timeout: timeout, deadline: control.deadline, cache_mode: control.cache_mode}
+      control.request_meta
+      |> Map.merge(%{timeout: timeout, deadline: control.deadline})
       |> then(fn meta ->
         if control[:progress_timeout],
           do: Map.put(meta, :progress_timeout, control.progress_timeout),

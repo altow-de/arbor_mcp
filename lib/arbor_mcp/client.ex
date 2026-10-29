@@ -150,6 +150,11 @@ defmodule Arbor.MCP.Client do
     # In-flight MRTR input fulfillment tasks. Each task may perform several
     # input callbacks sequentially while the client loop remains responsive.
     mrtr_tasks: %{},
+    # Callers watched so their exit cancels what they wait for (see
+    # RequestHandler.cancel_on_caller_exit?/2): {:request, id} or
+    # {:mrtr, task_pid} => monitor ref, and each monitor ref back to it.
+    caller_watches: %{},
+    caller_monitors: %{},
     # Modern long-lived subscription request id => Subscription process.
     subscriptions: %{},
     # Monitor ref => Subscription process. Monitors survive reconnects while
@@ -584,7 +589,9 @@ defmodule Arbor.MCP.Client do
   Limits must be positive finite integers. Ordinary request retries are disabled;
   the existing HTTP stream retry policy remains within the same total deadline.
   Cyclic cursors, malformed pages and exceeded limits return errors, without
-  reporting a partial list as complete. All list helpers use these same options.
+  reporting a partial list as complete. `:cancel_on_caller_exit` is passed to
+  every page request, so a caller that exits mid-walk cancels the page in
+  flight. All list helpers use these same options.
   """
   @spec all_tools(t(), keyword()) :: {:ok, [map()]} | {:error, term()}
   def all_tools(client, opts \\ []),
@@ -626,7 +633,10 @@ defmodule Arbor.MCP.Client do
   out, the client cancels it on the server, as the MCP spec asks: it sends
   `notifications/cancelled`, or over modern Streamable HTTP closes the
   request's connection. Servers no longer stop work on their own after 10 s,
-  so pass a `:timeout` that fits the tool.
+  so pass a `:timeout` that fits the tool. A modern call is also cancelled
+  when its caller exits mid-call; pass `cancel_on_caller_exit: false` to let
+  it finish, or `true` to cancel a legacy one too (see "Cancellation" in the
+  Protocol Guide).
 
   ## Options
 
@@ -670,6 +680,10 @@ defmodule Arbor.MCP.Client do
     or `{:error, error}` tuples, in the same order as the original requests.
   - `{:error, reason}` - If the batch request fails (e.g., timeout).
 
+  A batch takes only a timeout: it doesn't take `cancel_on_caller_exit:` and
+  isn't cancelled when its caller exits. JSON-RPC batching is a legacy
+  feature, removed from MCP in 2025-06-18.
+
   ## Example
 
       requests = [
@@ -689,6 +703,8 @@ defmodule Arbor.MCP.Client do
   Convenience alias for batch_request/3.
 
   Sends a batch of JSON-RPC requests. Available in protocol version 2025-03-26 only.
+  Like `batch_request/3`, it takes only a timeout and isn't cancelled when its
+  caller exits.
   """
   @spec send_batch(t(), [map()], timeout()) :: {:ok, [any()]} | {:error, any()}
   def send_batch(client, requests, timeout \\ 30_000) do
@@ -1795,6 +1811,7 @@ defmodule Arbor.MCP.Client do
 
     NotificationListener.close_all(state.notification_listeners, :disconnected)
     reset_notification_worker(state)
+    state = RequestHandler.forget_callers(state)
 
     # Update state to disconnected. The manual_disconnect flag ensures a
     # late {:transport_closed, _} message does not trigger auto-reconnection.
@@ -1890,14 +1907,12 @@ defmodule Arbor.MCP.Client do
       {from, :single, _method} ->
         # Reply with cancelled error and remove from pending
         GenServer.reply(from, {:error, :cancelled})
-        new_pending = Map.delete(state.pending_requests, request_id)
-        {:reply, :ok, prune_legacy_posts(%{updated_state | pending_requests: new_pending})}
+        {:reply, :ok, prune_legacy_posts(RequestHandler.drop_pending(updated_state, request_id))}
 
       {from, :single} ->
         # Reply with cancelled error and remove from pending
         GenServer.reply(from, {:error, :cancelled})
-        new_pending = Map.delete(state.pending_requests, request_id)
-        {:reply, :ok, prune_legacy_posts(%{updated_state | pending_requests: new_pending})}
+        {:reply, :ok, prune_legacy_posts(RequestHandler.drop_pending(updated_state, request_id))}
 
       _ ->
         # Other types of requests (batch, etc.) - just track as cancelled
@@ -2240,6 +2255,13 @@ defmodule Arbor.MCP.Client do
     end
   end
 
+  # The caller of an in-flight request, or of an MRTR round whose input the
+  # client handler is answering, exited. Nobody will read the result.
+  def handle_info({:DOWN, ref, :process, _caller, _reason}, %{caller_monitors: monitors} = state)
+      when is_map(monitors) and is_map_key(monitors, ref) do
+    {:noreply, caller_exited(ref, state)}
+  end
+
   def handle_info(
         {:DOWN, ref, :process, _subscriber, _reason},
         %{notification_listener_monitors: monitors} = state
@@ -2444,23 +2466,13 @@ defmodule Arbor.MCP.Client do
         GenServer.reply(from, {:error, :timeout})
 
         state = cancel_timed_out(request_id, state)
-
-        {:noreply,
-         prune_legacy_posts(%{
-           state
-           | pending_requests: Map.delete(state.pending_requests, request_id)
-         })}
+        {:noreply, prune_legacy_posts(RequestHandler.drop_pending(state, request_id))}
 
       {from, :single} ->
         GenServer.reply(from, {:error, :timeout})
 
         state = cancel_timed_out(request_id, state)
-
-        {:noreply,
-         prune_legacy_posts(%{
-           state
-           | pending_requests: Map.delete(state.pending_requests, request_id)
-         })}
+        {:noreply, prune_legacy_posts(RequestHandler.drop_pending(state, request_id))}
 
       {_from, :batch, _ids, _received} when state.transport_mod == LegacySSE ->
         state = RequestHandler.close_request_stream(request_id, state)
@@ -2627,11 +2639,11 @@ defmodule Arbor.MCP.Client do
       case Map.get(state.pending_requests, id) do
         {from, :single, _method} ->
           GenServer.reply(from, {:error, error})
-          %{state | pending_requests: Map.delete(state.pending_requests, id)}
+          RequestHandler.drop_pending(state, id)
 
         {from, :single} ->
           GenServer.reply(from, {:error, error})
-          %{state | pending_requests: Map.delete(state.pending_requests, id)}
+          RequestHandler.drop_pending(state, id)
 
         {from, :batch, ordered_ids, received} when is_map(received) ->
           # Preserve responses already delivered for this exact envelope. Its
@@ -2850,14 +2862,47 @@ defmodule Arbor.MCP.Client do
 
   # The spec asks a sender to cancel a request it stops waiting for, so the
   # server can stop the work; servers no longer cut it off after 10 s.
-  defp cancel_timed_out(request_id, state) do
-    case Protocol.encode_cancelled(request_id, "Request timed out") do
+  defp cancel_timed_out(request_id, state),
+    do: cancel_upstream(request_id, "Request timed out", state)
+
+  defp cancel_upstream(request_id, reason, state) do
+    case Protocol.encode_cancelled(request_id, reason) do
       {:ok, %{"method" => method, "params" => params}} ->
         cancel_on_wire(request_id, method, params, state)
 
       {:error, :cannot_cancel_initialize} ->
         RequestHandler.close_request_stream(request_id, state)
     end
+  end
+
+  defp caller_exited(monitor, state) do
+    case RequestHandler.caller_exited(monitor, state) do
+      {{:request, request_id}, state} -> cancel_for_exited_caller(request_id, state)
+      {{:mrtr, task_pid}, state} -> RequestHandler.stop_mrtr_fulfillment(task_pid, state)
+      {nil, state} -> state
+    end
+  end
+
+  # As at a timeout, but with no caller left to answer: the request is
+  # cancelled upstream (its stream or POST closed on modern HTTP,
+  # notifications/cancelled elsewhere) and dropped.
+  defp cancel_for_exited_caller(request_id, state) do
+    case Map.get(state.pending_requests, request_id) do
+      {_from, :single, method} -> drop_exited_caller_request(request_id, method, state)
+      {_from, :single} -> drop_exited_caller_request(request_id, nil, state)
+      _settled -> state
+    end
+  end
+
+  defp drop_exited_caller_request(request_id, method, state) do
+    :telemetry.execute(
+      [:arbor_mcp, :client, :request, :caller_exited],
+      %{},
+      %{method: method, request_id: request_id}
+    )
+
+    state = cancel_upstream(request_id, "Caller exited", state)
+    prune_legacy_posts(RequestHandler.drop_pending(state, request_id))
   end
 
   # A POST that failed at or after its caller's deadline is the caller's
@@ -2875,7 +2920,7 @@ defmodule Arbor.MCP.Client do
       _other -> :ok
     end
 
-    %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+    RequestHandler.drop_pending(state, request_id)
   end
 
   defp fail_async_post_request(state, request_id, reason, deadline \\ nil) do
@@ -2887,12 +2932,12 @@ defmodule Arbor.MCP.Client do
     case request_id && Map.get(state.pending_requests, request_id) do
       {from, :single, _method} ->
         GenServer.reply(from, {:error, error})
-        state = %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+        state = RequestHandler.drop_pending(state, request_id)
         if timed_out?, do: cancel_timed_out(request_id, state), else: state
 
       {from, :single} ->
         GenServer.reply(from, {:error, error})
-        state = %{state | pending_requests: Map.delete(state.pending_requests, request_id)}
+        state = RequestHandler.drop_pending(state, request_id)
         if timed_out?, do: cancel_timed_out(request_id, state), else: state
 
       _ ->
@@ -3073,6 +3118,7 @@ defmodule Arbor.MCP.Client do
     state = retire_callback_work(state)
     state = retire_links(state)
     reply_pending_with_close_error(reason, state)
+    state = RequestHandler.forget_callers(state)
     notify_subscription_processes(state, {:client_subscription_disconnected, reason})
 
     :telemetry.execute(

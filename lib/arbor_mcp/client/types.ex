@@ -20,6 +20,7 @@ defmodule Arbor.MCP.Client.Types do
           | {:retry_policy, keyword() | false}
           | {:http_stream_retry, :at_least_once | :safe_only}
           | {:retry_safe, boolean()}
+          | {:cancel_on_caller_exit, boolean() | nil}
           | {:progress_token, String.t() | integer()}
           | {:meta, map()}
           | {:idempotency_key, String.t()}

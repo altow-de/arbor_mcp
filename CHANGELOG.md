@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `cancel_on_caller_exit:` on every request function (`call_tool/4`,
+  `read_resource/3`, `get_prompt/4`, the list functions and the rest).
+  `true` cancels a request upstream when the process that made it exits
+  while it is in flight, as the client does when a request times out: over
+  modern (2026-07-28) Streamable HTTP it closes the request's POST or request
+  stream, and elsewhere (stdio, BEAM, legacy HTTP) it sends
+  `notifications/cancelled`. During an MRTR round, it also stops the client
+  handler that is answering the round's input requests. `false` turns it
+  off. Absent or `nil`, it is on for modern requests and off for legacy ones
+  (see Changed); any other value raises `ArgumentError`. The `all_*` list
+  helpers pass it to each page request, and a `tools/call` to the
+  `tools/list` refresh it makes after a header mismatch. The legacy batches
+  (`batch_request/3`, `send_batch/3`) don't take it. Each cancellation emits
+  `[:arbor_mcp, :client, :request, :caller_exited]`.
 - Under `:prefer_modern`, a stdio server that exits without answering the
   `server/discover` probe, as Python `mcp` 1.6 and 1.8 stdio servers do, or
   that does not answer it within its bound is now reached with a legacy
@@ -38,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A modern (2026-07-28) request whose caller exits while it is in flight is
+  now cancelled upstream by default: a `Task` running a call that is killed,
+  or a process that crashes mid-call, no longer leaves the server working on
+  a result nobody will read. Pass `cancel_on_caller_exit: false` to let such
+  a request run to completion. Legacy-era requests keep running unless the
+  call passes `cancel_on_caller_exit: true`: there the cancellation is a
+  `notifications/cancelled` that legacy peers did not get before, so it
+  stays opt-in.
 - `jose` `>= 1.11.13` is required and locked. 1.11.13 fixes five advisories:
   EEF-CVE-2026-65625 (attacker-chosen AES-GCM tag length), EEF-CVE-2026-65626
   (RSAES-PKCS1-v1_5 padding oracle), EEF-CVE-2026-65627 (unbounded JWE zip

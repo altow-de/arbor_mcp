@@ -330,13 +330,7 @@ defmodule Arbor.MCP.Client.Operations.Tools do
   defp maybe_retry_header_mismatch(result, client, params, opts, deadline) do
     if header_mismatch?(result) do
       with {:ok, remaining} <- remaining_timeout(deadline),
-           {:ok, _tools} <-
-             list_tools(client,
-               timeout: remaining,
-               format: :map,
-               retry_policy: false,
-               cache_mode: :refresh
-             ),
+           {:ok, _tools} <- list_tools(client, refresh_opts(remaining, opts)),
            {:ok, remaining} <- remaining_timeout(deadline) do
         # What's left becomes the retry's limit: its total limit if
         # progress keeps it alive, else its timeout.
@@ -361,6 +355,15 @@ defmodule Arbor.MCP.Client.Operations.Tools do
     else
       result
     end
+  end
+
+  # The refresh is made on the caller's behalf, so the caller's exit cancels
+  # it as it would the call (or doesn't, as the call asked). It inherits
+  # nothing else: its timeout is what is left of the call's, and the call's
+  # meta, progress token and MRTR options belong to the call alone.
+  defp refresh_opts(remaining, opts) do
+    [timeout: remaining, format: :map, retry_policy: false, cache_mode: :refresh] ++
+      Keyword.take(opts, [:cancel_on_caller_exit])
   end
 
   defp header_mismatch?({:error, %Error.ProtocolError{code: -32_020}}), do: true
