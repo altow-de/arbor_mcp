@@ -586,6 +586,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asynchronous requests that the gateway settles in its own loop. Each
   request's later steps still wait for its own answers, so results, batch
   arrays and errors keep their order.
+- The deprecated HTTP+SSE GET stream (`legacy_http_sse: true`) sent
+  `connection: keep-alive`. HTTP/2 forbids connection-specific header fields
+  and its clients treat such a response as malformed (RFC 9113, section
+  8.2.2), so curl and other nghttp2 clients over h2c or TLS got no `endpoint`
+  event from Bandit (#182). Neither legacy GET stream sends the header now;
+  over HTTP/1.1 it was redundant, since connections persist by default.
 
 ## [2.0.0-rc.6] — 2026-10-26
 

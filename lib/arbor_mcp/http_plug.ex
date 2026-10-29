@@ -566,7 +566,6 @@ defmodule Arbor.MCP.HttpPlug do
       |> put_resp_header("content-type", "text/event-stream")
       |> put_resp_header("x-accel-buffering", "no")
       |> put_resp_header("cache-control", "no-cache")
-      |> put_resp_header("connection", "keep-alive")
       |> RuntimeSessionStream.serve(stream, {"endpoint", {:raw, endpoint}})
     else
       {:error, reason}
@@ -2829,7 +2828,6 @@ defmodule Arbor.MCP.HttpPlug do
         |> put_resp_header("content-type", "text/event-stream")
         |> put_resp_header("x-accel-buffering", "no")
         |> put_resp_header("cache-control", "no-cache")
-        |> put_resp_header("connection", "keep-alive")
         |> send_chunked(200)
 
       serve_sse(conn, session_id, session_manager, initial_sse_opts(opts, session_id))
