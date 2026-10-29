@@ -50,6 +50,22 @@ defmodule Arbor.MCP.Server.Handler do
   ArborMCP preserves that protocol error, including its
   `data.requiredCapabilities` field, across every server transport.
 
+  ## Tool definitions for the `Mcp-Param` check
+
+  A modern `tools/call` over Streamable HTTP is checked against the
+  `x-mcp-header` annotations of the tool's definition before
+  `c:handle_call_tool/3` runs. The server gets that definition from
+  `c:handle_get_tool/2` when the handler defines it, and otherwise by walking
+  `c:handle_list_tools/2` from the first page until the tool turns up.
+
+  On a Runtime, which serves every `Arbor.MCP.HttpPlug` mount, that walk
+  calls `c:handle_list_tools/2` in the `tools/call` request's context. A list
+  callback that must tell the two apart can read
+  `Arbor.MCP.Server.Context.current().method`: `"tools/list"` for a client's
+  listing and `"tools/call"` for the check. Leaving the tool out of the
+  list for `"tools/call"` skips the check, so define `c:handle_get_tool/2`
+  instead.
+
   ## Basic Example
 
   > #### Tip
@@ -416,6 +432,56 @@ defmodule Arbor.MCP.Server.Handler do
               | {:error, any(), state()}
 
   @doc """
+  Looks up one tool definition by name for the `Mcp-Param` header check.
+
+  Before a modern (2026-07-28) `tools/call` over Streamable HTTP reaches
+  `c:handle_call_tool/3`, the server checks the request's `Mcp-Param-*`
+  headers against the `x-mcp-header` annotations of the tool's
+  `inputSchema`. It rejects a mismatched, missing or malformed header with
+  `-32020`, so it needs the definition even when the request has no such
+  header. Without this callback the server finds the definition by calling
+  `c:handle_list_tools/2` from the first page and following its cursors
+  until the tool turns up, on every call. Define this callback when listing
+  is costly or dynamic, as in a gateway that asks upstream servers, and the
+  server asks it for the one definition instead.
+
+  Return:
+
+    * `{:ok, tool, state}` with the definition, as `c:handle_list_tools/2`
+      lists it. Its `name` must be `name`.
+    * `{:ok, nil, state}` when this callback doesn't know the tool. The
+      server then walks `c:handle_list_tools/2`, as it does without this
+      callback, so `nil` never skips the check.
+    * `{:error, reason, state}` when the definition can't be had.
+
+  An error, an invalid reply, or a definition with another name fails the
+  request closed with "Tool schema unavailable", the error a failed
+  `tools/list` page gives (`-32020` on a Runtime). A raise or a timeout is
+  handled as in the walk too. The callback runs under the walk's deadline:
+  the request's `:request_timeout_ms` on a Runtime, or one
+  `:handler_call_timeout` for the lookup and any walk after it when
+  `Arbor.MCP.MessageProcessor` calls a handler process. It runs in the
+  `tools/call` request's context, so `Arbor.MCP.Server.Context.current/0`
+  gives its `method`, `auth_info` and `request_headers`. Under the default
+  `execution: :stateless` it must return the state unchanged.
+
+  Tools added with `Arbor.MCP.Server.add_tool/3` are checked against their
+  own definition, without this callback. `use Arbor.MCP.Server.DSL` defines
+  it for the tools the module declares, unless the module defines it
+  itself. `use Arbor.MCP.Server.Handler` defines no default, so a handler
+  without it keeps the walk.
+
+      @impl true
+      def handle_get_tool(name, state) do
+        {:ok, MyApp.Gateway.tool_definition(name), state}
+      end
+
+  @doc api: :public
+  """
+  @callback handle_get_tool(name :: String.t(), state()) ::
+              {:ok, tool() | string_keyed() | nil, state()} | {:error, any(), state()}
+
+  @doc """
   Handles a tool call.
 
   The result can be returned in multiple formats:
@@ -680,8 +746,10 @@ defmodule Arbor.MCP.Server.Handler do
   # `@behaviour Arbor.MCP.Server.Handler` should annotate their GenServer callbacks
   # with `@impl GenServer` (or omit `@impl`), not `@impl true`.
 
-  # Optional callbacks with defaults provided in __using__.
+  # Optional callbacks. __using__ provides defaults for all of them except
+  # handle_get_tool/2, whose absence keeps the tools/list walk.
   @optional_callbacks [
+    handle_get_tool: 2,
     handle_list_resources: 2,
     handle_read_resource: 2,
     handle_list_prompts: 2,
@@ -872,6 +940,10 @@ defmodule Arbor.MCP.Server.Handler do
 
       def handle_call({:list_tools, cursor}, _from, state),
         do: HandlerBridge.list(__MODULE__, :handle_list_tools, [cursor], state)
+
+      # Sent only when the module exports handle_get_tool/2.
+      def handle_call({:get_tool, name}, _from, state),
+        do: HandlerBridge.call(__MODULE__, :handle_get_tool, [name], state)
 
       def handle_call({:call_tool, name, args}, _from, state),
         do: HandlerBridge.call(__MODULE__, :handle_call_tool, [name, args], state)

@@ -107,6 +107,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A dead target misses the updates without failing the request.
 
   See "Progress to another process" in `docs/PROTOCOL_GUIDE.md`.
+- An optional `Arbor.MCP.Server.Handler` callback,
+  `handle_get_tool(name, state)`, which returns `{:ok, tool | nil, state}`
+  (#184). Before a modern `tools/call` over Streamable HTTP, the server
+  checks the `Mcp-Param-*` headers against the tool's `x-mcp-header`
+  annotations. To find them it called `handle_list_tools/2` from the first
+  page until the tool turned up, on every call. A handler that defines the
+  callback now supplies that one definition, which saves a gateway, or any
+  handler whose list is costly or dynamic, a listing per call. The check is
+  never skipped:
+  - `nil` means the callback doesn't know the tool, and the server walks the
+    list as before.
+  - An `{:error, reason, state}`, an invalid reply, or a definition with
+    another `name` fails the request with "Tool schema unavailable", as a
+    failed list page does (`-32020` on a Runtime).
+  - A raise or a timeout is handled as in the walk. The lookup shares the
+    walk's deadline: the request's `:request_timeout_ms` on a Runtime, or one
+    `:handler_call_timeout` for the lookup and any walk after it through
+    `Arbor.MCP.MessageProcessor`.
+
+  Handlers without the callback walk the list as before.
+  `use Arbor.MCP.Server.DSL` defines the callback for the tools a module
+  declares, unless the module defines it, so a DSL server with `page_size:`
+  no longer pages for the check. `Arbor.MCP.Server.Context.current/0` is now
+  documented: on a Runtime, its `method` is `"tools/call"` while
+  `handle_list_tools/2` runs for the check. See the `handle_get_tool/2` docs
+  and "Modern Streamable HTTP headers" in `docs/CONFIGURATION.md`.
 
 ### Changed
 

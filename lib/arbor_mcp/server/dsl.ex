@@ -136,6 +136,7 @@ defmodule Arbor.MCP.Server.DSL do
     assert_unique_ids!(env, prompts, :prompt, & &1.name)
     assert_local_completers!(env, resource_templates, :resource_templates, locations)
     assert_local_completers!(env, prompts, :prompts, locations)
+    get_tool_defined? = Module.defines?(env.module, {:handle_get_tool, 2})
 
     quote do
       @doc false
@@ -147,6 +148,7 @@ defmodule Arbor.MCP.Server.DSL do
 
       unquote_splicing(generate_tool_handlers(tools))
       unquote(generate_tool_callbacks(tools))
+      unquote(generate_get_tool_callback(tools, get_tool_defined?))
 
       unquote_splicing(generate_resource_handlers(resources, :resource))
       unquote_splicing(generate_resource_handlers(resource_templates, :resource_template))
@@ -942,6 +944,23 @@ defmodule Arbor.MCP.Server.DSL do
       end
 
       defp __ex_mcp_dsl_widen_validation__(validation), do: validation
+    end
+  end
+
+  # The declared definitions by name, so the Mcp-Param header check needs no
+  # tools/list walk. A module's own handle_get_tool/2 wins.
+  defp generate_get_tool_callback([], _defined?), do: nil
+  defp generate_get_tool_callback(_tools, true), do: nil
+
+  defp generate_get_tool_callback(tools, false) do
+    definitions =
+      Map.new(tools, fn {definition, _handler, _params} -> {definition.name, definition} end)
+
+    quote do
+      @impl Arbor.MCP.Server.Handler
+      def handle_get_tool(name, state) do
+        {:ok, Map.get(unquote(Macro.escape(definitions)), name), state}
+      end
     end
   end
 
