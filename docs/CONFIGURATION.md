@@ -1760,9 +1760,12 @@ defaults when a handler omits them:
 authorization contexts. A `resources/read` handler may return the whole result
 with `ttl_ms` / `cache_scope` (or the wire keys `ttlMs` / `cacheScope`) to
 override those defaults, as in `{:ok, %{contents: contents, ttl_ms: 60_000},
-state}`. For the results the server builds itself, such as the lists, set
+state}`. `server/discover` has defaults of its own, one hour and `public`. For
+the results the server builds itself, such as the lists and discovery, set
 hints per method with the `:cache_hints` server option, as with the
-TypeScript SDK's `cacheHints`; a handler's own fields take precedence:
+TypeScript SDK's `cacheHints`; a handler's own fields take precedence. A
+server whose discovery result differs by caller, its instructions for
+example, sets `"server/discover" => [cache_scope: :private]`:
 
 ```elixir
 Arbor.MCP.Server.start_link(
