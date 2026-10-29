@@ -80,6 +80,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers never reach the client's own callers. See "Forwarding clients" in
   `docs/CONFIGURATION.md`. Thanks to Wagner for the design and the first
   implementation.
+- `progress_to: pid` on any `Arbor.MCP.Client` request also sends the
+  request's progress to `pid` as
+  `{:arbor_mcp_progress, client, progress_token, params}`, alongside the
+  client handler's `handle_progress/3`, so a process that forwards the
+  request for another client can relay it (#92). `client` is the client
+  process.
+  - It works on every transport that carries progress: modern and legacy
+    Streamable HTTP, stdio, BEAM and the test transport.
+  - A request without a progress token gets one. Under automatic MRTR, all
+    rounds share it. With `mrtr: :manual`, the caller must pass
+    `:progress_token` and repeat it on every round, or the call returns a
+    `ValidationError`.
+  - Delivery stops once the call returns, with a result, an error, a timeout
+    or a cancellation. A request's target gets only that request's progress.
+    The token of a request that settled less than a second ago reaches no
+    target, so a late notification can't reach a newer request that reuses
+    it. Use connection-unique tokens. An `input_required` round's token and
+    target stay reserved until the round's deadline for its own
+    continuation, the request that presents the round's `request_state`.
+    The continuation gets the target back even if it doesn't repeat
+    `progress_to:`.
+  - Delivery stops when the caller goes down, local or remote, whether or
+    not the request is cancelled: the client monitors the caller of every
+    request with a target, and a lost node connection stops delivery too.
+  - A dead target misses the updates without failing the request.
+
+  See "Progress to another process" in `docs/PROTOCOL_GUIDE.md`.
 
 ### Changed
 
@@ -104,6 +131,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A request or disconnect from a caller on another node used that node's
+  monotonic deadline as if it were the client's own. Two nodes' monotonic
+  clocks are unrelated, so a caller whose clock trailed by a minute got an
+  immediate timeout, refusal or cleanup timeout on a fresh call, and one
+  whose clock led got no limit. Outside legacy HTTP+SSE, which already
+  converted it, the client used the deadline to cap the transport send,
+  classify a failed send, and bound a disconnect or stop. It now counts a
+  remote caller's relative timeout, or its own cleanup budget, from its own
+  clock.
 - A Streamable HTTP client started with `reliability:` could not connect,
   in any `protocol_mode`: the modern probe failed with
   `{:era_probe_failed, {:unexpected_response, ...}}` and a legacy
