@@ -67,7 +67,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   space for instance, is part of the value it sits in and fails the grammar
   (found and fixed on the 1.x line first, `ex_mcp` a2d8ccc, efa779e and
   cc2a61c).
-
+- An HTTP `:auth_provider` whose `init/1` fails now fails the connection
+  instead of being dropped. The transport used to go on without it, so every
+  request went out without the credentials the application configured.
+  `Arbor.MCP.Transport.HTTP.connect/1` returns
+  `{:error, {:auth_provider_init_failed, provider, reason}}`, and
+  `Arbor.MCP.Client.start_link/1` returns it as
+  `{:error, {:transport_connect_failed, {:auth_provider_init_failed, provider, reason}}}`
+  before sending any request. `reason` is the provider's own when it is an
+  atom; any other error is reported as `:redacted`, an exception as
+  `{:raised, exception_module}` and an unexpected return as
+  `:invalid_init_result`, so neither the result nor the error log carries the
+  provider's config. A connection without a provider is unchanged.
 - An unsupported-version error (`-32022`) lists `supported` as exactly the
   revisions the mount or server accepts, from the same source its request
   validation uses (`Arbor.MCP.Server.RequestContext.accepted_versions/1`), in
