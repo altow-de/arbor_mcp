@@ -91,7 +91,7 @@ defmodule Arbor.MCP.Server.RequestState do
   @spec binding(RequestContext.t(), map(), [String.t()], non_neg_integer(), keyword()) ::
           {:ok, map()} | {:error, error()}
   def binding(context, params, expected_input_ids, round, opts \\ []) do
-    immutable_params = immutable_params(params)
+    immutable_params = immutable_params(params, opts)
 
     with {:ok, params_digest} <- digest(immutable_params),
          {:ok, capability_digest} <- digest(context.client_capabilities || %{}) do
@@ -112,31 +112,39 @@ defmodule Arbor.MCP.Server.RequestState do
     end
   end
 
-  defp immutable_params(params) do
+  defp immutable_params(params, opts) do
     params = Map.drop(params, ["inputResponses", "requestState", :inputResponses, :requestState])
+    injected = injected_arguments(opts)
 
     params =
       Enum.reduce(["arguments", :arguments], params, fn key, acc ->
         case Map.get(acc, key) do
-          arguments when is_map(arguments) ->
-            arguments = Map.drop(arguments, ["_request_id", :_request_id])
-            Map.put(acc, key, without_progress_token(arguments))
-
-          _other ->
-            acc
+          arguments when is_map(arguments) -> Map.put(acc, key, Map.drop(arguments, injected))
+          _other -> acc
         end
       end)
 
     without_progress_token(params)
   end
 
+  # What the server itself put into the arguments. The handler server adds
+  # the request id, and a copy of the request's `_meta` when it has one,
+  # which `_meta` already binds; it says so with `:injected_argument_meta`.
+  # An argument named `_meta` from the caller, as over HTTP, is part of the
+  # tool's input and stays bound, a `progressToken` in it included.
+  defp injected_arguments(opts) do
+    if Keyword.get(opts, :injected_argument_meta, false),
+      do: ["_request_id", :_request_id, "_meta", :_meta],
+      else: ["_request_id", :_request_id]
+  end
+
   # Every round of a call is a new request with its own JSON-RPC id, and a
   # client may give each one a new progress token: the TypeScript SDK sends
-  # the request id as the token. So the token stays out of the binding, in
-  # `_meta` and in the copy of `_meta` a handler server puts into the
-  # arguments. An `_meta` that held nothing else binds like a missing one.
-  defp without_progress_token(map) do
-    Enum.reduce(["_meta", :_meta], map, fn key, acc ->
+  # the request id as the token. So the token in the request's `_meta` stays
+  # out of the binding. An `_meta` that held nothing else binds like a
+  # missing one.
+  defp without_progress_token(params) do
+    Enum.reduce(["_meta", :_meta], params, fn key, acc ->
       case Map.get(acc, key) do
         meta when is_map(meta) ->
           put_meta(acc, key, Map.drop(meta, ["progressToken", :progressToken]))

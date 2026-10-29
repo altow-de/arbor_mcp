@@ -274,7 +274,9 @@ The authenticated payload binds the immutable request digest, expected input
 IDs, round, protocol version, endpoint, capability fingerprint, principal, and
 tenant. The digest covers the request params without `inputResponses`,
 `requestState`, the argument `_request_id` and `_meta.progressToken`, which
-change from round to round. It contains only bounded JSON application
+change from round to round, and without the copy of `_meta` the handler server
+puts into a call's arguments. An argument named `_meta` from the caller stays
+in the digest. It contains only bounded JSON application
 state—never bearer tokens or runtime secrets.
 
 Load the 32-byte key ring at runtime and retain decrypt-only old keys for at

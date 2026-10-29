@@ -60,10 +60,7 @@ defmodule Arbor.MCP.Server.RequestStateTest do
       {put_in(params(), ["_meta", "progressToken"], "a"), params()},
       {Map.put(without_meta, "_meta", %{"progressToken" => 1}), without_meta},
       {Map.put(without_meta, :_meta, %{progressToken: "a"}), without_meta},
-      {Map.put(without_meta, "_meta", %{}), without_meta},
-      # A handler server copies _meta into the arguments.
-      {put_in(params(), ["arguments", "_meta"], %{"progressToken" => 1, "trace" => "t-1"}),
-       put_in(params(), ["arguments", "_meta"], %{"progressToken" => 2, "trace" => "t-1"})}
+      {Map.put(without_meta, "_meta", %{}), without_meta}
     ]
 
     for {left, right} <- same do
@@ -72,9 +69,23 @@ defmodule Arbor.MCP.Server.RequestStateTest do
 
     other_meta = put_in(params(), ["_meta", "example.com/trace"], "t-2")
     refute binding_of(other_meta) == binding_of(params())
+  end
 
-    refute binding_of(put_in(params(), ["arguments", "_meta"], %{"trace" => "t-1"})) ==
-             binding_of(put_in(params(), ["arguments", "_meta"], %{"trace" => "t-2"}))
+  test "binds an argument named _meta whole unless the handler server injected it" do
+    with_argument_meta = fn meta -> put_in(params(), ["arguments", "_meta"], meta) end
+    token_1 = with_argument_meta.(%{"progressToken" => 1, "trace" => "t-1"})
+    token_2 = with_argument_meta.(%{"progressToken" => 2, "trace" => "t-1"})
+
+    # Caller data, as over HTTP: the progress token in it stays bound.
+    refute binding_of(token_1) == binding_of(token_2)
+
+    # The handler server's copy of the request's _meta, which _meta binds.
+    injected = [injected_argument_meta: true]
+    assert binding_of(token_1, injected) == binding_of(token_2, injected)
+    assert binding_of(token_1, injected) == binding_of(params(), injected)
+
+    other_argument = put_in(token_1, ["arguments", "city"], "Chicago")
+    refute binding_of(other_argument, injected) == binding_of(token_1, injected)
   end
 
   test "supports decrypt-only rotation keys and expiry" do
@@ -191,9 +202,9 @@ defmodule Arbor.MCP.Server.RequestStateTest do
     end
   end
 
-  defp binding_of(params) do
+  defp binding_of(params, opts \\ []) do
     assert {:ok, binding} =
-             RequestState.binding(context(), params, ["answer"], 1, options(now: 1_000))
+             RequestState.binding(context(), params, ["answer"], 1, options(now: 1_000) ++ opts)
 
     binding
   end

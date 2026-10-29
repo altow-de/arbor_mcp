@@ -1761,7 +1761,11 @@ defmodule Arbor.MCP.Server.HandlerServer do
     enhanced_params = Map.put(params, "arguments", enhanced_arguments)
     enhanced_request = Map.put(request, "params", enhanced_params)
 
-    dispatch(enhanced_request, state)
+    # The copy of _meta is not caller data, so the requestState binding leaves
+    # it out; the request's own _meta stays bound.
+    dispatch(enhanced_request, state,
+      injected_argument_meta: not is_nil(Map.get(params, "_meta"))
+    )
   end
 
   defp do_process_mcp_request(%{"method" => "subscriptions/listen"} = request, state) do
@@ -1829,7 +1833,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
 
   # Runs the shared dispatcher against the handler module and folds the new
   # handler state back into the server state.
-  defp dispatch(request, state) do
+  defp dispatch(request, state, extra_opts \\ []) do
     state = request |> maybe_pin_connection_era(state) |> remember_client_capabilities(request)
 
     token = state.current_ingress
@@ -1851,7 +1855,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
            state.runtime,
            token,
            request,
-           dispatch_opts: dispatch_opts,
+           dispatch_opts: dispatch_opts ++ extra_opts,
            output: %{
              edge: self(),
              connection: state.connection,

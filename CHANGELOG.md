@@ -70,7 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `complete/4` take it on its own. All three need a 2026-07-28 connection.
   Otherwise they return `{:error, %Arbor.MCP.Error.ValidationError{}}`
   before anything is sent. Every round of one call repeats its arguments,
-  capabilities and progress token, because an arbor_mcp server binds
+  capabilities and progress token, because a server may bind
   `requestState` to them, so `mrtr: :manual` with
   `reset_timeout_on_progress: true` needs an explicit `:progress_token`.
   Each input response is validated against the 2026-07-28 schema's
@@ -248,9 +248,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   id, and a client may give each one its own progress token: the TypeScript
   SDK sends the request id as the token whenever a request has a progress
   handler, so its retries were refused. The binding now leaves
-  `progressToken` out of `_meta`, and out of the copy of `_meta` a handler
-  server puts into the arguments, and binds an `_meta` that held only the
-  token like a missing one. The arguments and the rest of `_meta` stay bound.
+  `progressToken` out of the request's `_meta` and binds an `_meta` that
+  held only the token like a missing one. On stdio, BEAM and the test
+  transport, the handler server's copy of `_meta` in a call's arguments
+  stays out of the binding as a whole, since `_meta` binds it. An argument
+  named `_meta` from the caller, as over HTTP, is part of the tool's input
+  and stays bound, a `progressToken` in it included. The arguments, the
+  rest of `_meta` and the capabilities stay bound.
 - `Accept: application/json, text/event-stream;q` — a `q` parameter with no
   value — and `q =1` / `q= 1`, whose whitespace around the equals sign
   violates the weight grammar (RFC 9110 section 12.4.2: optional whitespace

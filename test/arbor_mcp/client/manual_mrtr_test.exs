@@ -420,6 +420,41 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
                  )
       end
 
+      if transport == :http do
+        # Over HTTP an argument named _meta is caller data, part of the tool's
+        # input, and stays bound, its progressToken included. Only the copy of
+        # the request's _meta a handler server puts into the arguments is left
+        # out of the binding.
+        test "an argument named _meta stays bound, its progressToken included",
+             %{transport: transport} do
+          client = connect(transport)
+
+          round = [
+            mrtr: :manual,
+            client_capabilities: @form,
+            progress_token: "up-1",
+            format: :map
+          ]
+
+          approved = %{"topic" => "intro", "_meta" => %{"progressToken" => "approved-value"}}
+
+          assert {:input_required, %{request_state: state}} =
+                   Client.call_tool(client, "ask", approved, round)
+
+          retry = round ++ [input_responses: @tom, request_state: state]
+          different = put_in(approved, ["_meta", "progressToken"], "different-value")
+
+          assert {:error,
+                  %{"code" => -32_602, "data" => %{"reason" => "request_state_binding_mismatch"}}} =
+                   Client.call_tool(client, "ask", different, retry)
+
+          refute_received {:app_retry, _responses, _state}
+
+          assert {:ok, %{"content" => [%{"text" => "Welcome, Tom"}]}} =
+                   Client.call_tool(client, "ask", approved, retry)
+        end
+      end
+
       test "automatic MRTR is unchanged", %{transport: transport} do
         client = connect(transport)
 
