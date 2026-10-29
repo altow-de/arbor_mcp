@@ -139,12 +139,15 @@ reserved, and metadata-service addresses remain denied.
 
 ### OAuth credential isolation
 
-Modern pre-registered clients bind their credentials to an exact
-authorization-server issuer through `credential_issuer`. ArborMCP rejects
-mismatches without normalizing trailing slashes or paths, validates discovered
-AS metadata against the issuer that led to it, and never resolves the client
-secret before that check succeeds. CIMD client IDs are the deliberate portable
-exception defined by the protocol.
+Pre-registered clients bind their credentials to an exact authorization-server
+issuer through `credential_issuer`, including the default legacy revision
+(`2025-11-25`), the `client_id` / `client_secret` compatibility aliases, and
+`Arbor.MCP.Authorization.DiscoveryFlow`. ArborMCP rejects a missing or
+mismatched issuer without normalizing trailing slashes, case, or paths,
+validates discovered AS metadata against the issuer that led to it, and never
+resolves or sends the client secret before that check succeeds. CIMD client
+IDs are the deliberate portable exception defined by the protocol. There is
+no opt-out.
 
 Persistent hosts should implement `Arbor.MCP.Authorization.CredentialStore` using
 an encrypted database or platform keychain. Registrations are keyed by issuer
@@ -252,6 +255,17 @@ authenticated client credentials and rejects tokens with a missing or wrong
 issuer/audience, expired `exp`, or future `nbf`, even when the endpoint reports
 `active: true`. `legacy_unbound_tokens: true` is a migration-only escape hatch
 that deliberately disables these bindings.
+
+Unless the host resolves `:principal_id` itself, the token's `sub` claim is
+the principal that MRTR state, separate modern cancellations, legacy sessions,
+stored tasks and subscriptions are bound to. An introspection response may
+omit `sub`, and then one user's token can't be told from another user's of the
+same client, so a token without `sub` is refused rather than bound to its
+client. Set `client_principals: true` only when the authorization server
+leaves `sub` out of client-credentials tokens alone; those tokens then run as
+`client:<client_id>`. The option reserves that prefix: a token whose `sub`
+starts with `client:` is refused, so no user's principal can equal a
+client's.
 
 ### MRTR request state
 

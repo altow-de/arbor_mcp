@@ -208,8 +208,12 @@ an explicit `application_type: :native | :web` and a stable `redirect_port`;
 ArborMCP never invents a CIMD URL or guesses the application type. A missing
 strategy returns an actionable registration error.
 
-Modern pre-registered credentials must include `credential_issuer`, which is
-compared exactly with discovered AS metadata. To retain DCR credentials and
+Pre-registered credentials must include `credential_issuer` on every protocol
+version, including the default legacy revision (`2025-11-25`), the
+`client_id` / `client_secret` compatibility aliases, and
+`DiscoveryFlow.execute/1`. It is compared exactly with discovered AS
+metadata; trailing slashes are not normalized. A missing or mismatched
+binding fails closed and the secret is never sent to another origin. To retain DCR credentials and
 tokens safely across flows, configure an adapter implementing
 `Arbor.MCP.Authorization.CredentialStore`; registrations are issuer + client-ID
 bound and tokens use the complete authorization partition. See the
@@ -539,6 +543,18 @@ Arbor.MCP.Client.start_link(
   ]
 )
 ```
+
+Over Streamable HTTP the client stays an HTTP client: each request after
+establishment still POSTs from its own task, so calls run at the same time.
+The circuit breaker admits every POST, from establishment on, and records how
+it ended: a POST that crashes or that the client stops at a timeout is a
+failure, and one whose caller cancels it or exits isn't counted. An open
+circuit refuses a request with
+`{:error, %Arbor.MCP.Error.TransportError{reason: :circuit_open}}` before
+anything is sent. A request stream (a request with a progress token) is
+admitted, but its outcome isn't recorded, and receives aren't counted. The
+breaker's `:timeout` doesn't apply over HTTP: each exchange keeps its own
+deadline, the caller's timeout or the transport's `:request_timeout`.
 
 ## Telemetry
 
