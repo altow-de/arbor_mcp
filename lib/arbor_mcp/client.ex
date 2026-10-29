@@ -1803,17 +1803,17 @@ defmodule Arbor.MCP.Client do
   end
 
   def handle_call({:scope_disconnect, deadline}, from, state) do
-    Process.put({ConnectionScope, :cleanup_deadline}, deadline)
+    Process.put({ConnectionScope, :cleanup_deadline}, local_cleanup_deadline(from, deadline))
     handle_call(:disconnect, from, state)
   end
 
   def handle_call({:ordinary_disconnect, deadline}, from, state) do
-    Process.put({__MODULE__, :cleanup_deadline}, deadline)
+    Process.put({__MODULE__, :cleanup_deadline}, local_cleanup_deadline(from, deadline))
     handle_call(:disconnect, from, state)
   end
 
   def handle_call({:ordinary_stop, reason, deadline}, from, state) do
-    Process.put({__MODULE__, :cleanup_deadline}, deadline)
+    Process.put({__MODULE__, :cleanup_deadline}, local_cleanup_deadline(from, deadline))
     {:reply, result, state} = handle_call(:disconnect, from, state)
     {:stop, reason, result, state}
   end
@@ -3152,6 +3152,15 @@ defmodule Arbor.MCP.Client do
         {:error, :client_cleanup_timeout}
     end
   end
+
+  # A caller on another node sends a deadline on its own monotonic clock. The
+  # client's cleanup budget counts from now instead, as the caller computed
+  # it from the same budget.
+  defp local_cleanup_deadline({caller, _tag}, _deadline)
+       when is_pid(caller) and node(caller) != node(),
+       do: Deadline.after_ms(Lifetime.client_cleanup_ms(self()))
+
+  defp local_cleanup_deadline(_from, deadline), do: deadline
 
   defp cleanup_deadline do
     Deadline.earliest(

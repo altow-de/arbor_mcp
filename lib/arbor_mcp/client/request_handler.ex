@@ -372,18 +372,30 @@ defmodule Arbor.MCP.Client.RequestHandler do
       else: {:reply, {:error, send_failure(reason, state)}, state}
   end
 
+  # Every deadline the client compares is on its own monotonic clock (see
+  # local_request_deadline/2), so the transport cap, the timeout timer and a
+  # failed send's classification all use this node's time.
   defp request_send_context(from, state, meta) do
-    deadline = request_deadline(meta)
+    deadline =
+      case state do
+        %{transport_mod: LegacySSE, transport_state: %LegacySSE{}} ->
+          legacy_request_cutoff(meta, from, state)
 
-    case state do
-      %{transport_mod: LegacySSE, transport_state: %LegacySSE{}} ->
-        deadline = legacy_request_cutoff(meta, from, state)
-        {deadline, Map.put(meta, :deadline, deadline)}
+        _other ->
+          local_request_deadline(from, meta)
+      end
 
-      _other ->
-        {deadline, meta}
-    end
+    {deadline, Map.put(meta, :deadline, deadline)}
   end
+
+  # A remote caller's monotonic clock is another node's, and comparing its
+  # deadline here would end a fresh request at once, or never. Its relative
+  # timeout counts from now instead, a budget captured on this node.
+  defp local_request_deadline({caller, _tag}, meta)
+       when is_pid(caller) and node(caller) != node(),
+       do: remote_relative_deadline(meta)
+
+  defp local_request_deadline(_from, meta), do: request_deadline(meta)
 
   defp inline_request_response(response_data, method, id, updated_state) do
     case Protocol.parse_message(response_data) do
@@ -424,10 +436,7 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
     # Remote monotonic clocks are not cutoff authority. Preserve the actual
     # relative option with a locally captured budget, capped by the transport.
-    deadline =
-      if node(elem(from, 0)) == node(),
-        do: request_deadline(meta),
-        else: remote_relative_deadline(meta)
+    deadline = local_request_deadline(from, meta)
 
     deadline =
       if is_nil(deadline) and meta[:timeout] == nil,

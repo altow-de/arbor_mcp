@@ -126,6 +126,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A request or disconnect from a caller on another node used that node's
+  monotonic deadline as if it were the client's own. Two nodes' monotonic
+  clocks are unrelated, so a caller whose clock trailed by a minute got an
+  immediate timeout, refusal or cleanup timeout on a fresh call, and one
+  whose clock led got no limit. Outside legacy HTTP+SSE, which already
+  converted it, the client used the deadline to cap the transport send,
+  classify a failed send, and bound a disconnect or stop. It now counts a
+  remote caller's relative timeout, or its own cleanup budget, from its own
+  clock.
+
 - `Accept: application/json, text/event-stream;q` — a `q` parameter with no
   value — and `q =1` / `q= 1`, whose whitespace around the equals sign
   violates the weight grammar (RFC 9110 section 12.4.2: optional whitespace
