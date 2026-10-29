@@ -88,6 +88,7 @@ defmodule Arbor.MCP.Transport.HTTP do
   require Logger
 
   alias Arbor.MCP.Authorization.FullOAuthFlow
+  alias Arbor.MCP.Authorization.Provider.OAuth
   alias Arbor.MCP.Client.{ConnectionScope, Deadline, Lifetime}
 
   alias Arbor.MCP.Internal.{CACerts, DNSResolver, Headers, Options, Security, SecurityConfig, SSE}
@@ -140,6 +141,10 @@ defmodule Arbor.MCP.Transport.HTTP do
     modern_streams: %{},
     sse_deferred_attempted: false,
     auth_completed: false,
+    # Credential acquisitions use the VM's monotonic counter. Applying an
+    # existing credential preserves its generation, even when results are late.
+    credential_generation: 0,
+    rejected_generation: 0,
     # The scopes granted to the token the transport's own OAuth flow
     # obtained, when there is no auth provider (see put_oauth_token/3).
     granted_scopes: []
@@ -261,7 +266,7 @@ defmodule Arbor.MCP.Transport.HTTP do
     max_retry_delay = Keyword.get(config, :max_retry_delay, 60_000)
 
     # Auth provider: explicit provider tuple, or auto-create from :auth config
-    {auth_provider, auth_provider_state} =
+    provider =
       init_auth_provider(
         Keyword.get(config, :auth_provider),
         auth_config,
@@ -273,6 +278,11 @@ defmodule Arbor.MCP.Transport.HTTP do
     state = %__MODULE__{
       base_url: base_url,
       headers: all_headers,
+      credential_generation:
+        if(Headers.get(all_headers, "authorization"),
+          do: System.unique_integer([:positive, :monotonic]),
+          else: 0
+        ),
       http_client: http_client,
       endpoint: endpoint,
       security: security,
@@ -286,8 +296,6 @@ defmodule Arbor.MCP.Transport.HTTP do
       modern_streams: %{},
       auth_config: auth_config,
       max_retry_delay: max_retry_delay,
-      auth_provider: auth_provider,
-      auth_provider_state: auth_provider_state,
       max_response_bytes: max_response_bytes,
       max_stream_buffer_bytes: max_stream_buffer_bytes,
       max_request_bytes: max_request_bytes,
@@ -300,7 +308,9 @@ defmodule Arbor.MCP.Transport.HTTP do
     # Per MCP spec, session ID comes from the server after initialization.
     # SSE is deferred until after the first successful POST (which provides
     # the session ID needed for the GET SSE stream).
-    with :ok <- validate_security(state),
+    with {:ok, {auth_provider, auth_provider_state}} <- provider,
+         state = %{state | auth_provider: auth_provider, auth_provider_state: auth_provider_state},
+         :ok <- validate_security(state),
          :ok <- TargetPolicy.validate_options(network_policy_options(state)) do
       if use_sse do
         Logger.debug("HTTP transport configured with SSE (deferred until after initialization)")
@@ -318,24 +328,20 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   @impl true
-  def send_message(message, %__MODULE__{use_sse: true, sse_pid: nil} = state) do
+  def send_message(message, %__MODULE__{} = state) do
+    case send_message_with_state(message, state) do
+      {:error, reason, _latest_state} -> {:error, reason}
+      result -> result
+    end
+  end
+
+  @doc false
+  @spec send_message_with_state(term(), t()) ::
+          {:ok, t()} | {:ok, t(), term()} | {:error, term(), t()}
+  def send_message_with_state(message, %__MODULE__{use_sse: true, sse_pid: nil} = state) do
     # SSE configured but not yet started (pre-initialization).
     # Handle synchronously like non-SSE mode, then start SSE if we get a session ID.
     case perform_and_maybe_auth(message, state) do
-      {:ok, response} ->
-        case handle_http_response(response, state, message) do
-          {:ok, new_state, response_data} ->
-            new_state = maybe_start_deferred_sse(new_state, message)
-            {:ok, new_state, response_data}
-
-          {:ok, new_state} ->
-            new_state = maybe_start_deferred_sse(new_state, message)
-            {:ok, new_state}
-
-          error ->
-            error
-        end
-
       {:ok, response, new_state} ->
         case handle_http_response(response, new_state, message) do
           {:ok, new_state2, response_data} ->
@@ -346,61 +352,38 @@ defmodule Arbor.MCP.Transport.HTTP do
             new_state2 = maybe_start_deferred_sse(new_state2, message)
             {:ok, new_state2}
 
-          error ->
-            error
+          {:error, reason} ->
+            {:error, reason, new_state}
         end
 
-      {:error, reason, _state} ->
-        {:error, reason}
-
-      {:error, reason} ->
-        {:error, reason}
+      {:error, reason, new_state} ->
+        {:error, reason, new_state}
     end
   end
 
-  def send_message(message, %__MODULE__{use_sse: false} = state) do
-    # For non-SSE mode, we handle the request-response synchronously
-    case perform_and_maybe_auth(message, state) do
-      {:ok, response} ->
-        handle_http_response(response, state, message)
-
-      {:ok, response, new_state} ->
-        handle_http_response(response, new_state, message)
-
-      {:error, reason, _state} ->
-        {:error, reason}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
+  def send_message_with_state(message, %__MODULE__{use_sse: false} = state) do
+    send_authenticated(message, state)
   end
 
-  def send_message(message, %__MODULE__{use_sse: true, sse_pid: sse_pid} = state)
+  def send_message_with_state(message, %__MODULE__{use_sse: true, sse_pid: sse_pid} = state)
       when is_pid(sse_pid),
       do: async_post(message, state)
 
   # SSE mode without active connection (pre-initialization) or fallback
-  def send_message(message, %__MODULE__{} = state) do
-    case send_authenticated(message, state) do
-      {:error, reason, _state} -> {:error, reason}
-      result -> result
-    end
+  def send_message_with_state(message, %__MODULE__{} = state) do
+    send_authenticated(message, state)
   end
 
   @doc false
   # Sends `message` synchronously from the calling process, running any
-  # authentication its response asks for. The client re-sends a request this
-  # way when a legacy-era async POST without an auth provider hands back an
-  # auth challenge, so only one authentication runs at a time.
+  # authentication its response asks for. Used before an SSE connection is
+  # established; established clients send requests from their own POST tasks.
   # An authentication failure returns the transport state too, so the
   # provider's record of what it tried is kept.
   @spec send_authenticated(term(), t()) ::
           {:ok, t()} | {:ok, t(), term()} | {:error, term()} | {:error, term(), t()}
   def send_authenticated(message, %__MODULE__{} = state) do
     case perform_and_maybe_auth(message, state) do
-      {:ok, response} ->
-        handle_http_response(response, state, message)
-
       # Authentication changed the state (a refresh may have rotated its
       # token), so a request that still fails keeps it.
       {:ok, response, new_state} ->
@@ -411,9 +394,6 @@ defmodule Arbor.MCP.Transport.HTTP do
 
       {:error, reason, new_state} ->
         {:error, reason, new_state}
-
-      {:error, reason} ->
-        {:error, reason}
     end
   end
 
@@ -424,17 +404,23 @@ defmodule Arbor.MCP.Transport.HTTP do
   # where meta carries the request id and the deadline the POST ran under.
   # Used for every request sent after establishment, and for all messages
   # once a legacy SSE stream is open.
-  @spec send_async(binary(), t()) :: {:ok, t()}
+  @spec send_async(binary(), t()) :: {:ok, t()} | {:error, term(), t()}
   def send_async(message, %__MODULE__{} = state) when is_binary(message),
     do: state |> maybe_start_deferred_sse(message) |> then(&async_post(message, &1))
 
   defp async_post(message, state) do
+    case apply_provider_token(state) do
+      {:ok, request_state} -> start_async_post(message, state, request_state)
+      {:error, _reason, _state} = refusal -> refusal
+    end
+  end
+
+  defp start_async_post(message, state, request_state) do
     parent = self()
     request_id = extract_request_id(message)
     nonce = make_ref()
     # Resolved here, in the client process, so tasks never refresh (and
     # possibly rotate) a provider's token concurrently.
-    request_state = apply_provider_token(state)
 
     # spawn_monitor rather than Task.start: the parent (the Arbor.MCP.Client
     # GenServer) owns the monitor, so a crashed POST task produces a
@@ -481,6 +467,7 @@ defmodule Arbor.MCP.Transport.HTTP do
        state
        | auth_provider_state: request_state.auth_provider_state,
          access_token: request_state.access_token,
+         credential_generation: request_state.credential_generation,
          headers: request_state.headers
      }}
   end
@@ -488,10 +475,8 @@ defmodule Arbor.MCP.Transport.HTTP do
   # A POST task does not authenticate: with several in flight, each would run
   # the OAuth flow. It hands an auth challenge to the client process, which
   # answers one at a time across its requests: with the auth provider, or,
-  # for a modern request without one, with the OAuth flow a synchronous send
-  # runs (see answer_challenge_inline/2). A legacy-era task without a
-  # provider hands its request back instead, and the client re-sends it with
-  # send_authenticated/2.
+  # without one, with the OAuth flow a synchronous send runs (see
+  # answer_challenge_inline/2). The task then re-sends with its stream consumer.
   defp perform_async(message, state, parent, attempts \\ 0) do
     stream =
       PostStream.consumer(parent,
@@ -499,20 +484,34 @@ defmodule Arbor.MCP.Transport.HTTP do
         max_kept_bytes: state.max_response_bytes
       )
 
-    client_answers? = not is_nil(state.auth_provider) or state.protocol_era == :modern
-
     case perform_http_request(message, state, event_stream: stream) do
       {:ok, response} ->
-        case {extract_auth_status(response), client_answers?} do
-          {:ok, _client_answers?} ->
+        if match?({:unauthorized, _}, extract_auth_status(response)) do
+          Lifetime.deliver(
+            parent,
+            {:http_credential_rejected, :post, self(), extract_request_id(message),
+             state.credential_generation}
+          )
+        end
+
+        case extract_auth_status(response) do
+          :ok ->
             {handle_http_response(response, state, message), state}
 
           # As a modern request stream does: the client process answers the
           # challenge, one at a time across its requests, and this task sends
           # the request again itself, so the client isn't held up meanwhile.
           # At most an initial 401 and a 403 step-up.
-          {{kind, www_auth}, true} when attempts < 2 ->
+          {kind, www_auth} when attempts < 2 ->
             case await_authentication(parent, kind, www_auth, state) do
+              {:ok, token, context} ->
+                state = %{state | session_id: context.session_id, headers: context.headers}
+
+                authenticated =
+                  apply_token_to_state(state, token, Map.get(context, :credential_generation))
+
+                perform_async(message, authenticated, parent, attempts + 1)
+
               {:ok, token} ->
                 perform_async(message, apply_token_to_state(state, token), parent, attempts + 1)
 
@@ -520,11 +519,8 @@ defmodule Arbor.MCP.Transport.HTTP do
                 {authentication_failure(reason, response, state, message), state}
             end
 
-          {_challenge, true} ->
-            {handle_http_response(response, state, message), state}
-
-          {_challenge, false} ->
-            {{:error, {:reauthenticate, message}}, state}
+          {kind, _www_auth} when kind in [:unauthorized, :forbidden] ->
+            {mark_auth_refusal(handle_http_response(response, state, message)), state}
         end
 
       {:error, reason} ->
@@ -534,15 +530,19 @@ defmodule Arbor.MCP.Transport.HTTP do
 
   defp authentication_failure(reason, _response, %{auth_provider: provider}, _message)
        when not is_nil(provider),
-       do: {:error, {:authentication_failed, reason}}
+       do: {:error, {:auth_refused, {:authentication_failed, reason}}}
 
   # Without a provider the caller sees what a synchronous send reported: the
   # server's own response to a challenge OAuth can't answer, or the failed
   # OAuth flow.
   defp authentication_failure(:no_credentials, response, state, message),
-    do: handle_http_response(response, state, message)
+    do: mark_auth_refusal(handle_http_response(response, state, message))
 
-  defp authentication_failure(reason, _response, _state, _message), do: {:error, reason}
+  defp authentication_failure(reason, _response, _state, _message),
+    do: {:error, {:auth_refused, reason}}
+
+  defp mark_auth_refusal({:error, reason}), do: {:error, {:auth_refused, reason}}
+  defp mark_auth_refusal(result), do: result
 
   @auth_wait_ms 600_000
 
@@ -554,7 +554,9 @@ defmodule Arbor.MCP.Transport.HTTP do
       status: if(kind == :unauthorized, do: 401, else: 403),
       www_authenticate: www_auth,
       scopes: extract_scope_from_www_auth(www_auth),
-      token: state.access_token
+      token: state.access_token,
+      credential_generation: state.credential_generation,
+      deadline: state.deadline
     }
 
     Lifetime.deliver(parent, {:http_post_auth_challenge, self(), ref, challenge})
@@ -585,14 +587,15 @@ defmodule Arbor.MCP.Transport.HTTP do
   # Perform HTTP request with automatic OAuth retry via auth provider.
   defp perform_and_maybe_auth(body, %{auth_provider: provider} = state)
        when not is_nil(provider) do
-    state = apply_provider_token(state)
+    with {:ok, state} <- apply_provider_token(state) do
+      case perform_http_request(body, state) do
+        {:ok, response} ->
+          state = retire_response_credential(state, response)
+          handle_provider_auth_challenge(response, body, state)
 
-    case perform_http_request(body, state) do
-      {:ok, response} ->
-        handle_provider_auth_challenge(response, body, state)
-
-      {:error, reason} ->
-        {:error, reason}
+        {:error, reason} ->
+          {:error, reason, state}
+      end
     end
   end
 
@@ -602,24 +605,45 @@ defmodule Arbor.MCP.Transport.HTTP do
 
     case result do
       {:ok, response} ->
+        retired = retire_response_credential(state, response)
+
+        # Keep the pre-rejection snapshot for the existing inline loop guard;
+        # carry retirement forward even when no flow or retry is allowed.
         case handle_auth_challenge(response, body, state) do
           :no_challenge ->
-            {:ok, response}
+            {:ok, response, retired}
 
           {:ok, retry_response, new_state} ->
+            new_state = retire_credential(new_state, retired.rejected_generation)
+            retry_retired = retire_response_credential(new_state, retry_response)
+
             # Check if retry got another 401 (scope step-up)
             case handle_auth_challenge(retry_response, body, new_state) do
-              :no_challenge -> {:ok, retry_response, new_state}
-              {:ok, r, s} -> {:ok, r, s}
-              {:error, reason} -> {:error, reason}
+              :no_challenge ->
+                {:ok, retry_response, retry_retired}
+
+              {:ok, final_response, authenticated} ->
+                authenticated =
+                  retire_credential(authenticated, retry_retired.rejected_generation)
+
+                {:ok, final_response, retire_response_credential(authenticated, final_response)}
+
+              {:error, reason} ->
+                {:error, reason, retry_retired}
+
+              {:error, reason, latest} ->
+                {:error, reason, retire_credential(latest, retry_retired.rejected_generation)}
             end
 
           {:error, reason} ->
-            {:error, reason}
+            {:error, reason, retired}
+
+          {:error, reason, latest} ->
+            {:error, reason, retire_credential(latest, retired.rejected_generation)}
         end
 
       {:error, reason} ->
-        {:error, reason}
+        {:error, reason, state}
     end
   end
 
@@ -633,7 +657,7 @@ defmodule Arbor.MCP.Transport.HTTP do
         provider_authenticate(:handle_forbidden, www_auth, body, state)
 
       :ok ->
-        {:ok, response}
+        {:ok, response, state}
     end
   end
 
@@ -644,7 +668,11 @@ defmodule Arbor.MCP.Transport.HTTP do
 
     case apply(provider, callback, [www_auth, scopes, state.auth_provider_state]) do
       {:ok, token, new_ps} ->
-        new_state = state |> Map.put(:auth_provider_state, new_ps) |> apply_token_to_state(token)
+        new_state =
+          state
+          |> Map.put(:auth_provider_state, new_ps)
+          |> apply_token_to_state(token, System.unique_integer([:positive, :monotonic]))
+
         provider_retry_request(body, new_state)
 
       # The provider's state records what it tried (its loop guards), so it
@@ -658,6 +686,8 @@ defmodule Arbor.MCP.Transport.HTTP do
   defp provider_retry_request(body, state) do
     case perform_http_request(body, state) do
       {:ok, retry_resp} ->
+        state = retire_response_credential(state, retry_resp)
+
         case extract_auth_status(retry_resp) do
           {:forbidden, www_auth} ->
             provider_authenticate(:handle_forbidden, www_auth, body, state)
@@ -667,7 +697,7 @@ defmodule Arbor.MCP.Transport.HTTP do
         end
 
       {:error, reason} ->
-        {:error, reason}
+        {:error, reason, state}
     end
   end
 
@@ -683,30 +713,42 @@ defmodule Arbor.MCP.Transport.HTTP do
        when not is_nil(provider) do
     case provider.get_token(ps) do
       {:ok, nil, new_ps} ->
-        %{state | auth_provider_state: new_ps}
+        {:ok, %{state | auth_provider_state: new_ps}}
 
-      # access_token names the token the header carries, which a stream's
-      # auth challenge is compared with.
       {:ok, token, new_ps} ->
-        %{apply_token_to_state(state, token) | auth_provider_state: new_ps}
+        generation =
+          if new_ps != ps or state.credential_generation == 0,
+            do: System.unique_integer([:positive, :monotonic]),
+            else: state.credential_generation
+
+        state = %{state | auth_provider_state: new_ps}
+
+        if generation <= state.rejected_generation do
+          {:error, {:auth_refused, {:authentication_failed, :rejected_credential}}, state}
+        else
+          {:ok, apply_token_to_state(state, token, generation)}
+        end
 
       {:error, _} ->
-        state
+        {:ok, state}
     end
   end
 
-  defp apply_provider_token(state), do: state
+  defp apply_provider_token(state), do: {:ok, state}
 
-  defp apply_token_to_state(state, token) do
-    %{state | access_token: token, headers: put_bearer_header(state.headers, token)}
+  defp apply_token_to_state(state, token, generation \\ nil) do
+    generation = generation || System.unique_integer([:positive, :monotonic])
+
+    %{
+      state
+      | access_token: token,
+        credential_generation: generation,
+        headers: put_bearer_header(state.headers, token)
+    }
   end
 
-  defp init_auth_provider({mod, provider_config}, _auth_config, _base_url, _endpoint, _version) do
-    case mod.init(provider_config) do
-      {:ok, ps} -> {mod, ps}
-      {:error, _} -> {nil, nil}
-    end
-  end
+  defp init_auth_provider({mod, provider_config}, _auth_config, _base_url, _endpoint, _version),
+    do: start_auth_provider(mod, provider_config)
 
   defp init_auth_provider(nil, auth_config, base_url, endpoint, version)
        when is_map(auth_config) do
@@ -715,11 +757,37 @@ defmodule Arbor.MCP.Transport.HTTP do
       |> Map.put(:resource_url, base_url <> (endpoint || ""))
       |> Map.put(:protocol_version, version)
 
-    {:ok, ps} = Arbor.MCP.Authorization.Provider.OAuth.init(provider_config)
-    {Arbor.MCP.Authorization.Provider.OAuth, ps}
+    start_auth_provider(OAuth, provider_config)
   end
 
-  defp init_auth_provider(nil, _auth_config, _base_url, _endpoint, _version), do: {nil, nil}
+  defp init_auth_provider(nil, _auth_config, _base_url, _endpoint, _version),
+    do: {:ok, {nil, nil}}
+
+  # A configured provider that can't start fails the connection: without it,
+  # every request would go out without the credentials the application set up.
+  # Only an atom reason is kept, because a provider's other reasons, and its
+  # exceptions, may carry its config, secrets included.
+  defp start_auth_provider(mod, provider_config) do
+    case mod.init(provider_config) do
+      {:ok, provider_state} -> {:ok, {mod, provider_state}}
+      {:error, reason} when is_atom(reason) -> auth_provider_failed(mod, reason)
+      {:error, _reason} -> auth_provider_failed(mod, :redacted)
+      _invalid -> auth_provider_failed(mod, :invalid_init_result)
+    end
+  rescue
+    exception -> auth_provider_failed(mod, {:raised, exception.__struct__})
+  catch
+    kind, _reason -> auth_provider_failed(mod, kind)
+  end
+
+  defp auth_provider_failed(mod, reason) do
+    Logger.error(
+      "HTTP auth provider #{inspect(mod)} failed to initialize (#{inspect(reason)}); " <>
+        "not connecting without it"
+    )
+
+    {:error, {:auth_provider_init_failed, mod, reason}}
+  end
 
   # Check if the response is a 401 that we can handle with OAuth
   defp handle_auth_challenge({status_line, headers, _body}, original_body, state) do
@@ -743,7 +811,7 @@ defmodule Arbor.MCP.Transport.HTTP do
       {:ok, new_state} ->
         case perform_http_request(original_body, new_state) do
           {:ok, response} -> {:ok, response, new_state}
-          {:error, reason} -> {:error, reason}
+          {:error, reason} -> {:error, reason, new_state}
         end
 
       no_retry ->
@@ -752,11 +820,11 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   @doc false
-  # Answers, from the client process, the 401 or 403 that a modern POST task
-  # without an auth provider handed back (see perform_async/4): runs the
+  # Answers, from the client's dedicated auth worker, the 401 or 403 that a
+  # POST task or request stream without an auth provider handed back: runs the
   # OAuth flow a synchronous send would run, and returns the token for the
-  # task to send its request again with. Only the authentication runs here,
-  # one challenge at a time; the request itself is re-sent by its task.
+  # task to send its request again with. Only authentication runs here;
+  # the client applies its credentials before each request's own task retries.
   # `{:error, :no_credentials}` means the challenge is not one OAuth can
   # answer, so the task delivers the server's response as it came.
   @spec answer_challenge_inline(t(), map()) :: {{:ok, String.t()} | {:error, term()}, t()}
@@ -806,18 +874,21 @@ defmodule Arbor.MCP.Transport.HTTP do
     # Have auth_config with credentials — use FullOAuthFlow which handles
     # PRM discovery with header fallback and pre-existing credentials
     resource_url = build_url(state, "")
+    scopes = extract_scope_from_www_auth(www_auth)
 
     config =
       (state.auth_config || %{})
       |> Map.put(:resource_url, resource_url)
       |> Map.put(:www_authenticate, www_auth)
 
+    config = if scopes == [], do: config, else: Map.put(config, :scopes, scopes)
+
     Logger.info("Received 401, attempting OAuth flow with credentials")
 
     case FullOAuthFlow.execute(config) do
       {:ok, token_result} ->
         Logger.info("OAuth token obtained")
-        {:ok, put_oauth_token(state, token_result, extract_scope_from_www_auth(www_auth))}
+        {:ok, put_oauth_token(state, token_result, scopes)}
 
       {:error, reason} ->
         Logger.warning("OAuth discovery flow failed", reason: LogSummary.describe(reason))
@@ -851,19 +922,50 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   @doc false
+  @spec retire_credential(t(), non_neg_integer()) :: t()
+  def retire_credential(%__MODULE__{} = state, generation)
+      when is_integer(generation) and generation > 0 do
+    state = %{state | rejected_generation: max(state.rejected_generation, generation)}
+
+    if generation == state.credential_generation do
+      headers =
+        Enum.reject(state.headers, fn {key, _} -> String.downcase(key) == "authorization" end)
+
+      %{state | access_token: nil, granted_scopes: [], headers: headers, auth_completed: false}
+    else
+      state
+    end
+  end
+
+  def retire_credential(%__MODULE__{} = state, _generation), do: state
+
+  defp retire_response_credential(state, response) do
+    if match?({:unauthorized, _}, extract_auth_status(response)),
+      do: retire_credential(state, state.credential_generation),
+      else: state
+  end
+
+  @doc false
   # The state carrying the token an OAuth flow without an auth provider
   # returned, in its Authorization header too, and the scopes it was granted:
   # those the token response names, else the ones the flow asked for, as for
   # the OAuth provider. The client checks a later 403 against them, so a
   # step-up another request already obtained isn't run again.
   @spec put_oauth_token(t(), map(), [String.t()]) :: t()
-  def put_oauth_token(%__MODULE__{} = state, token_result, requested_scopes)
+  @spec put_oauth_token(t(), map(), [String.t()], pos_integer()) :: t()
+  def put_oauth_token(
+        %__MODULE__{} = state,
+        token_result,
+        requested_scopes,
+        generation \\ System.unique_integer([:positive, :monotonic])
+      )
       when is_map(token_result) do
     access_token = token_result[:access_token] || token_result["access_token"]
 
     %{
       state
       | access_token: access_token,
+        credential_generation: generation,
         auth_completed: true,
         headers: put_bearer_header(state.headers, access_token),
         granted_scopes: token_scopes(token_result, requested_scopes)
@@ -950,6 +1052,7 @@ defmodule Arbor.MCP.Transport.HTTP do
   defp make_http_request(url, headers, body, state, opts) do
     with {:ok, transport_opts} <- https_transport_opts(url, state) do
       BoundedClient.request(:post, url, headers, "application/json", body,
+        auth_headers_only: true,
         event_stream: Keyword.get(opts, :event_stream),
         deadline: state.deadline,
         connect_timeout: state.timeouts.connect,
@@ -1011,6 +1114,7 @@ defmodule Arbor.MCP.Transport.HTTP do
   @async_merge_fields [
     :session_id,
     :access_token,
+    :credential_generation,
     :auth_completed,
     :auth_provider_state,
     :headers,
@@ -1517,7 +1621,8 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   @doc false
-  @spec open_stream(binary(), t(), pid(), keyword()) :: {:ok, t()} | {:error, term()}
+  @spec open_stream(binary(), t(), pid(), keyword()) ::
+          {:ok, t()} | {:error, term()} | {:error, term(), t()}
   def open_stream(message, state, parent, opts \\ [])
 
   def open_stream(message, %__MODULE__{protocol_era: :modern} = state, parent, opts)
@@ -1527,40 +1632,43 @@ defmodule Arbor.MCP.Transport.HTTP do
     # dedicated process, so it cannot call perform_and_maybe_auth/2. Passing
     # the provider snapshot lets that process handle a later 401/403 and send
     # the refreshed durable auth state back to the client.
-    state = apply_provider_token(state)
-    request_id = extract_request_id(message)
-    url = build_url(state, "")
-    headers = RequestHeaders.build(message, state)
-    stream_kind = Keyword.get(opts, :stream_kind, :request)
+    with {:ok, state} <- apply_provider_token(state) do
+      request_id = extract_request_id(message)
+      url = build_url(state, "")
+      headers = RequestHeaders.build(message, state)
+      stream_kind = Keyword.get(opts, :stream_kind, :request)
 
-    with :ok <- request_within_limit(message, state.max_request_bytes),
-         :ok <- validate_stream_kind(stream_kind),
-         :ok <- validate_stream_request_id(request_id, state),
-         {:ok, headers} <- sanitize_http_request("POST", url, headers, state),
-         {:ok, http_options} <- modern_stream_http_options(url, state),
-         {:ok, pid} <-
-           ModernStreamClient.start(
-             _connection_scope: ConnectionScope.current(),
-             parent: parent,
-             request_id: request_id,
-             url: url,
-             headers: headers,
-             body: message,
-             stream_kind: stream_kind,
-             http_options: http_options,
-             handshake_timeout: state.timeouts.stream_handshake,
-             idle_timeout: state.timeouts.stream_idle,
-             max_response_bytes: state.max_response_bytes,
-             max_buffer_bytes: state.max_stream_buffer_bytes,
-             auth_provider: state.auth_provider,
-             auth_provider_state: state.auth_provider_state,
-             header_sanitizer: fn retry_headers ->
-               sanitize_http_request("POST", url, retry_headers, state)
-             end
-           ) do
-      {:ok, %{state | modern_streams: Map.put(state.modern_streams, request_id, pid)}}
-    else
-      {:error, reason} -> {:error, reason}
+      with :ok <- request_within_limit(message, state.max_request_bytes),
+           :ok <- validate_stream_kind(stream_kind),
+           :ok <- validate_stream_request_id(request_id, state),
+           {:ok, headers} <- sanitize_http_request("POST", url, headers, state),
+           {:ok, http_options} <- modern_stream_http_options(url, state),
+           {:ok, pid} <-
+             ModernStreamClient.start(
+               _connection_scope: ConnectionScope.current(),
+               parent: parent,
+               request_id: request_id,
+               deadline: state.deadline,
+               credential_generation: state.credential_generation,
+               url: url,
+               headers: headers,
+               body: message,
+               stream_kind: stream_kind,
+               http_options: http_options,
+               handshake_timeout: state.timeouts.stream_handshake,
+               idle_timeout: state.timeouts.stream_idle,
+               max_response_bytes: state.max_response_bytes,
+               max_buffer_bytes: state.max_stream_buffer_bytes,
+               auth_provider: state.auth_provider,
+               auth_provider_state: state.auth_provider_state,
+               header_sanitizer: fn retry_headers ->
+                 sanitize_http_request("POST", url, retry_headers, state)
+               end
+             ) do
+        {:ok, %{state | modern_streams: Map.put(state.modern_streams, request_id, pid)}}
+      else
+        {:error, reason} -> {:error, reason, state}
+      end
     end
   end
 
