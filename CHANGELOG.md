@@ -104,6 +104,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Streamable HTTP client started with `reliability:` could not connect,
+  in any `protocol_mode`: the modern probe failed with
+  `{:era_probe_failed, {:unexpected_response, ...}}` and a legacy
+  `initialize` with `Failed to parse handshake response`.
+  `Arbor.MCP.Transport.ReliabilityWrapper` swapped the transport state and
+  the response of every synchronous send, which is fixed for anyone using
+  it directly. A client no longer wraps its HTTP transport: the transport
+  keeps the circuit breaker and health check itself, so each request after
+  establishment POSTs from its own task as without `reliability:`, with the
+  same cancellation and authentication. The breaker admits every POST and
+  settles each admission once, with the POST's result unless the client
+  decides first: as a failure when the task crashes or the client's timeout
+  abandons the POST, in either era, so a late response doesn't count, and
+  released, not counted, when the caller cancels or exits, even while the
+  POST waits on authentication or before its task has started. A request
+  re-sent after authenticating settles with the re-send's result, and a
+  definitive refusal counts as a failure, so repeated failed authentication
+  opens the circuit. A request stream is admitted but its outcome isn't
+  recorded. Its `:timeout` doesn't apply over HTTP, where each exchange keeps
+  its own deadline. A client's circuit breaker and health check no longer
+  outlive it: whenever the client closes or loses its transport, it stops
+  them itself, within what is left of its cleanup budget, after the
+  transport's close, so a close it cuts off (a stalled session DELETE, a
+  stuck stdio server, a busy health check) no longer leaves them running.
 - An elicitation whose validation ran out of time was reported as invalid
   params. On a busy server, a handler that returned a valid elicitation in an
   `input_required` result could make the client get `-32602 "Invalid MRTR
