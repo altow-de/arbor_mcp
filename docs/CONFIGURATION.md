@@ -844,6 +844,12 @@ kept only when it is an atom. `{:ok, nil, state}` sends the request without
 an `Authorization` header. See `Arbor.MCP.Authorization.Provider` for the
 details.
 
+A request stream whose connection never opens (the connection is refused,
+or the address doesn't resolve or isn't permitted) fails at once, as not
+sent and with the reason an ordinary request reports, and isn't reissued
+under `:http_stream_retry`. A stream that breaks after it opened is
+reissued as before.
+
 ### TLS trust store
 
 Outbound HTTPS verifies peers against the operating system's trust store

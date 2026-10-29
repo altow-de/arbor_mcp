@@ -192,6 +192,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   credential the server already rejected, never counts as a `reliability:`
   circuit-breaker failure, and the rejected-credential refusal is now
   reported as `:not_sent` too.
+- A modern request stream (`progress_token:`) whose connection never opened
+  was reported as possibly delivered (#177): a refused connection, an
+  address that didn't resolve or wasn't permitted, or an unavailable trust
+  store failed as `%Arbor.MCP.Error.TransportError{reason: :outcome_unknown}`
+  after the default `http_stream_retry: :at_least_once` had reissued it
+  once. It now fails at once, without a reissue, with the reason an
+  ordinary POST reports (for example `%Mint.TransportError{reason: :econnrefused}`
+  or `:dns_failed`), which `Arbor.MCP.Client.delivery_outcome/1` reports as
+  `:not_sent`. A stream that breaks after it opened is reissued as before,
+  and a reissue that is never sent now reports `:outcome_unknown`, since the
+  first attempt may have been delivered.
 - A pre-registered client secret configured through the legacy
   `client_id` / `client_secret` aliases was not bound to an issuer under the
   default legacy protocol (`2025-11-25`). Attacker-controlled authorization

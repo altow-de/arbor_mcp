@@ -383,6 +383,10 @@ defmodule Arbor.MCP.Client do
     request stream with a new JSON-RPC id. `:safe_only` reissues only built-in
     read operations or operations explicitly marked `retry_safe: true`, and
     otherwise returns a transport error whose reason is `:outcome_unknown`.
+    A stream whose connection never opened sent nothing, so it isn't
+    reissued: it fails at once, as not sent (see `delivery_outcome/1`). A
+    reissue that isn't sent leaves the outcome unknown, since the first
+    attempt may have been delivered.
   - `:http_stream_retry_delay` - Delay before the one reissue (default: 200ms),
     bounded by the operation's original deadline.
   - `:retry_safe` - Caller-owned safety attestation. Tool annotations such as
@@ -1409,7 +1413,8 @@ defmodule Arbor.MCP.Client do
       refused it before writing anything (the connection could not be opened,
       the address could not be resolved or was not permitted, the request was
       too large, a security policy blocked it, the auth provider gave no
-      token for it, or gave one the server had already rejected).
+      token for it, or gave one the server had already rejected). This holds
+      for a request with its own response stream too.
     * `:unknown` - the request was, or may have been, delivered, and whether
       the server acted on it is not known. This covers the caller's own
       timeout, a connection that failed after sending, a broken response
