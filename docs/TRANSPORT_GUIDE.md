@@ -551,10 +551,13 @@ it ended: a POST that crashes or that the client stops at a timeout is a
 failure, and one whose caller cancels it or exits isn't counted. An open
 circuit refuses a request with
 `{:error, %Arbor.MCP.Error.TransportError{reason: :circuit_open}}` before
-anything is sent. A request stream (a request with a progress token) is
-admitted, but its outcome isn't recorded, and receives aren't counted. The
-breaker's `:timeout` doesn't apply over HTTP: each exchange keeps its own
-deadline, the caller's timeout or the transport's `:request_timeout`.
+anything is sent. A request the client refuses before sending it, because
+its auth provider gave no token for it or gave one the server had already
+rejected, never reached the server, so the breaker doesn't count it. A
+request stream (a request with a progress token) is admitted, but its
+outcome isn't recorded, and receives aren't counted. The breaker's
+`:timeout` doesn't apply over HTTP: each exchange keeps its own deadline,
+the caller's timeout or the transport's `:request_timeout`.
 
 ## Telemetry
 

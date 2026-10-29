@@ -369,7 +369,7 @@ defmodule Arbor.MCP.Transport.HTTP do
       case ReliabilityWrapper.admit(reliability) do
         :ok ->
           result = send_message_with_state(message, %{state | reliability: nil})
-          ReliabilityWrapper.report(reliability, reported_result(result))
+          report_admitted(reliability, result)
           reattach(result, reliability)
 
         {:error, reason} ->
@@ -414,9 +414,18 @@ defmodule Arbor.MCP.Transport.HTTP do
     send_authenticated(message, state)
   end
 
-  # The breaker records what the caller of send_message/2 sees.
-  defp reported_result({:error, reason, _state}), do: {:error, reason}
-  defp reported_result(result), do: result
+  # The breaker records what the caller of send_message/2 sees, unless the
+  # request was refused before it was sent (see presend_refusal?/1): no call
+  # reached the server, so there is nothing to record. A POST task's refusal
+  # comes before it is admitted at all.
+  defp report_admitted(reliability, {:error, reason, _state}) do
+    unless presend_refusal?(reason),
+      do: ReliabilityWrapper.report(reliability, {:error, reason})
+
+    :ok
+  end
+
+  defp report_admitted(reliability, result), do: ReliabilityWrapper.report(reliability, result)
 
   defp async_send?(%__MODULE__{use_sse: true, sse_pid: sse_pid}) when is_pid(sse_pid), do: true
   defp async_send?(%__MODULE__{}), do: false
@@ -464,6 +473,8 @@ defmodule Arbor.MCP.Transport.HTTP do
   def send_async(message, %__MODULE__{} = state) when is_binary(message),
     do: state |> maybe_start_deferred_sse(message) |> then(&async_post(message, &1))
 
+  # A request the auth provider refuses (see apply_provider_token/1) fails
+  # here, before a task starts or the breaker admits it.
   defp async_post(message, state) do
     case apply_provider_token(state) do
       {:ok, request_state} -> start_async_post(message, state, request_state)
@@ -541,8 +552,9 @@ defmodule Arbor.MCP.Transport.HTTP do
 
   # The breaker (see attach_reliability/2) admits the POST before it is sent
   # (hold_post/2) and settles the admission with how it ended, a re-send
-  # after authenticating included: a definitive refusal ({:auth_refused, _})
-  # counts as a failure, as any other failed request does.
+  # after authenticating included: a definitive refusal once the server has
+  # answered ({:auth_refused, _}) counts as a failure, as any other failed
+  # request does.
   defp hold_post(%{reliability: nil}, _task), do: :ok
 
   defp hold_post(%{reliability: reliability}, task),
@@ -811,13 +823,22 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
+  # Each request carries the token the provider gives for it. A provider that
+  # gives none (an error, or a return the callback doesn't allow) refuses the
+  # request before anything is written: it goes out neither with the token
+  # the provider gave before nor without one, and the transport drops that
+  # token. The refusal is definitive, as a rejected credential's is, and its
+  # reason is redacted as an init failure's is (see provider_call/1).
+  # `{:ok, nil, state}`, "no token yet", returns the transport to where it
+  # starts: the request goes out without an Authorization header, so the
+  # server's challenge can start the provider's flow.
   defp apply_provider_token(%{auth_provider: provider, auth_provider_state: ps} = state)
        when not is_nil(provider) do
-    case provider.get_token(ps) do
-      {:ok, nil, new_ps} ->
-        {:ok, %{state | auth_provider_state: new_ps}}
+    case provider_call(fn -> provider.get_token(ps) end) do
+      {:ok, {:ok, nil, new_ps}} ->
+        {:ok, %{drop_provider_token(state) | auth_provider_state: new_ps}}
 
-      {:ok, token, new_ps} ->
+      {:ok, {:ok, token, new_ps}} when is_binary(token) ->
         generation =
           if new_ps != ps or state.credential_generation == 0,
             do: System.unique_integer([:positive, :monotonic]),
@@ -831,12 +852,46 @@ defmodule Arbor.MCP.Transport.HTTP do
           {:ok, apply_token_to_state(state, token, generation)}
         end
 
-      {:error, _} ->
-        {:ok, state}
+      {:ok, {:error, reason}} ->
+        refuse_without_token(state, provider, redact_provider_reason(reason))
+
+      {:ok, _invalid} ->
+        refuse_without_token(state, provider, :invalid_token_result)
+
+      {:failed, reason} ->
+        refuse_without_token(state, provider, reason)
     end
   end
 
   defp apply_provider_token(state), do: {:ok, state}
+
+  defp refuse_without_token(state, provider, reason) do
+    {:error, {:auth_refused, {:auth_provider_token_failed, provider, reason}},
+     drop_provider_token(state)}
+  end
+
+  # As before the provider's first token: no Authorization header, and no
+  # credential generation, so a challenge to a request sent without a token
+  # retires none of the provider's. What the server rejected stays rejected.
+  defp drop_provider_token(state) do
+    %{
+      state
+      | access_token: nil,
+        credential_generation: 0,
+        headers: Headers.delete(state.headers, "authorization")
+    }
+  end
+
+  @doc false
+  # Whether `reason` is a refusal apply_provider_token/1 made before anything
+  # was written: the auth provider gave no token, or gave one the server had
+  # already rejected. Arbor.MCP.Client reports these without the
+  # {:auth_refused, _} marker, once its retry decisions are made.
+  @spec presend_refusal?(term()) :: boolean()
+  def presend_refusal?({:auth_refused, reason}), do: presend_refusal?(reason)
+  def presend_refusal?({:auth_provider_token_failed, _provider, _reason}), do: true
+  def presend_refusal?({:authentication_failed, :rejected_credential}), do: true
+  def presend_refusal?(_reason), do: false
 
   defp apply_token_to_state(state, token, generation \\ nil) do
     generation = generation || System.unique_integer([:positive, :monotonic])
@@ -867,20 +922,29 @@ defmodule Arbor.MCP.Transport.HTTP do
 
   # A configured provider that can't start fails the connection: without it,
   # every request would go out without the credentials the application set up.
-  # Only an atom reason is kept, because a provider's other reasons, and its
-  # exceptions, may carry its config, secrets included.
   defp start_auth_provider(mod, provider_config) do
-    case mod.init(provider_config) do
-      {:ok, provider_state} -> {:ok, {mod, provider_state}}
-      {:error, reason} when is_atom(reason) -> auth_provider_failed(mod, reason)
-      {:error, _reason} -> auth_provider_failed(mod, :redacted)
-      _invalid -> auth_provider_failed(mod, :invalid_init_result)
+    case provider_call(fn -> mod.init(provider_config) end) do
+      {:ok, {:ok, provider_state}} -> {:ok, {mod, provider_state}}
+      {:ok, {:error, reason}} -> auth_provider_failed(mod, redact_provider_reason(reason))
+      {:ok, _invalid} -> auth_provider_failed(mod, :invalid_init_result)
+      {:failed, reason} -> auth_provider_failed(mod, reason)
     end
-  rescue
-    exception -> auth_provider_failed(mod, {:raised, exception.__struct__})
-  catch
-    kind, _reason -> auth_provider_failed(mod, kind)
   end
+
+  # Runs an auth provider callback. A provider's exceptions, throws and
+  # exits may carry its config, secrets included, so a failure is reported
+  # only as `{:raised, exception_module}`, `:throw` or `:exit`.
+  defp provider_call(callback) do
+    {:ok, callback.()}
+  rescue
+    exception -> {:failed, {:raised, exception.__struct__}}
+  catch
+    kind, _reason -> {:failed, kind}
+  end
+
+  # Only an atom reason is kept, for the same reason.
+  defp redact_provider_reason(reason) when is_atom(reason), do: reason
+  defp redact_provider_reason(_reason), do: :redacted
 
   defp auth_provider_failed(mod, reason) do
     Logger.error(

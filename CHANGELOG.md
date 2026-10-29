@@ -167,6 +167,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An HTTP `:auth_provider` whose `get_token/1` returns `{:error, reason}` now
+  refuses the request before it is sent (#176). The transport ignored the
+  error, so the request went out with the token the provider gave before, or
+  with none, and the caller got the server's answer. This held for modern
+  POSTs, request streams (`progress_token:`), subscriptions, legacy POSTs,
+  notifications and the requests that open a connection. The request now
+  fails with `{:auth_provider_token_failed, provider, reason}`, which
+  `Arbor.MCP.Client.delivery_outcome/1` reports as `:not_sent`;
+  `Arbor.MCP.Client.listen/2` returns it as
+  `{:error, {:stream_error, {:auth_refused, {:auth_provider_token_failed, provider, reason}}}}`,
+  and `Arbor.MCP.Client.start_link/1` as
+  `{:error, {:transport_connect_failed, {:auth_provider_token_failed, provider, reason}}}`
+  in every `protocol_mode`, without falling back to the other era. `reason`
+  is redacted as an init failure's is (#161): an atom is kept, any other
+  error is `:redacted`, an exception `{:raised, exception_module}`, a throw
+  or exit `:throw` or `:exit`, and a return the callback doesn't allow
+  (including a token that isn't a string) `:invalid_token_result`.
+  `{:ok, nil, state}` now sends the request without an `Authorization`
+  header; it used to keep the earlier token. Requests that went out with a
+  stale token before now fail, so a provider that would rather let the
+  server decide should return a token, as the built-in OAuth provider does
+  when a refresh fails. A request refused this way, or for carrying a
+  credential the server already rejected, never counts as a `reliability:`
+  circuit-breaker failure, and the rejected-credential refusal is now
+  reported as `:not_sent` too.
 - A pre-registered client secret configured through the legacy
   `client_id` / `client_secret` aliases was not bound to an issuer under the
   default legacy protocol (`2025-11-25`). Attacker-controlled authorization
