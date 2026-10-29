@@ -177,11 +177,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   methods without `tasks: :store` (and legacy-era task requests with it), as
   well as the `handle_create_message/2` default. Over modern (2026-07-28)
   Streamable HTTP the error goes out with HTTP `404`, as the transport
-  specification requires and as for an unknown method; legacy HTTP keeps
-  `200`. A callback that calls `super` now gets an
-  `Arbor.MCP.Error.ProtocolError` with code `-32601` instead of a string. A
-  method whose capability the server doesn't advertise is still dispatched,
-  so a handler that serves one without advertising it keeps working.
+  specification requires and as for an unknown method, also when the
+  request's progress token selected an event stream that nothing had been
+  written to yet; legacy HTTP keeps `200`. A callback that calls `super` now
+  gets an `Arbor.MCP.Error.ProtocolError` with code `-32601` instead of a
+  string. A method whose capability the server doesn't advertise is still
+  dispatched, so a handler that serves one without advertising it keeps
+  working.
 - A server that serves a capability now answers the parts of it a handler
   leaves out as the TypeScript SDK does, instead of with an error: an empty
   `resources/list`, `resources/templates/list` or `prompts/list` (plus any

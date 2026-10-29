@@ -384,6 +384,22 @@ defmodule Arbor.MCP.Server.UnimplementedMethodsTest do
       end
     end
 
+    test "a modern request with a progress token is still answered with 404 and -32601", %{
+      opts: opts
+    } do
+      # The token selects an event stream, but nothing went out before the
+      # final response, so it can still carry the status.
+      request = modern("prompts/list", %{})
+      request = put_in(request, ["params", "_meta", "progressToken"], "p")
+
+      conn =
+        post(request, [{"mcp-protocol-version", @modern}, {"mcp-method", "prompts/list"}], opts)
+
+      assert conn.status == 404
+      assert ["application/json" <> _] = Plug.Conn.get_resp_header(conn, "content-type")
+      conn.resp_body |> Jason.decode!() |> assert_method_not_found("prompts/list")
+    end
+
     test "a modern request for a named entry is answered with 404 and -32601", %{opts: opts} do
       conn =
         post(

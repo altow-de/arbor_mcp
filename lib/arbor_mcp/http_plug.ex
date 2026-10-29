@@ -2061,7 +2061,30 @@ defmodule Arbor.MCP.HttpPlug do
     RuntimeWriter.perform(conn, effect, wire, &Plug.Conn.send_resp(&1, status, &2))
   end
 
-  defp write_runtime_response(conn, effect, wire, :sse) do
+  # A modern request with a progress token selects an event stream, but its
+  # headers go out only with its first write. When that write is the final
+  # response and the method is one the server doesn't serve, the response is
+  # still the 404 with a JSON body that the 2026-07-28 transport requires, as
+  # for a request without the token.
+  defp write_runtime_response(%{state: state} = conn, effect, "data: " <> framed = wire, :sse)
+       when state != :chunked do
+    body = String.trim_trailing(framed, "\r\n\r\n")
+
+    if HTTPWriterRegistry.kind(effect) == :response and runtime_json_status(conn, body) == 404 do
+      conn = put_resp_content_type(conn, "application/json")
+
+      RuntimeWriter.perform(conn, effect, wire, fn conn, _wire ->
+        Plug.Conn.send_resp(conn, 404, body)
+      end)
+    else
+      write_runtime_stream_frame(conn, effect, wire)
+    end
+  end
+
+  defp write_runtime_response(conn, effect, wire, :sse),
+    do: write_runtime_stream_frame(conn, effect, wire)
+
+  defp write_runtime_stream_frame(conn, effect, wire) do
     conn =
       if conn.state == :chunked do
         conn
