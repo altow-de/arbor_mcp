@@ -372,6 +372,9 @@ defmodule Arbor.MCP.Reliability.CircuitBreaker do
   # through the error filter; throws, exits and timeouts always count.
   defp record_outcome({:ok, {:error, reason}}, state), do: record_filtered(reason, state)
 
+  defp record_outcome({:ok, {:error, reason, _updated}}, state),
+    do: record_filtered(reason, state)
+
   defp record_outcome({:ok, _value}, state),
     do: Core.record_success(state.circuit_breaker, now_ms())
 

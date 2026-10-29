@@ -198,52 +198,39 @@ defmodule Arbor.MCP.Client.ReliabilityHTTPTest do
     end
   end
 
-  # The provider-less path on this branch: a 401 hands the request back to
-  # the client process, which re-sends it after the OAuth flow.
-  test "a re-send whose authentication fails counts as a failure" do
-    bypass = Bypass.open()
-    test_pid = self()
+  # A 401 goes to the client process, which answers it (OAuth without a
+  # provider, the provider otherwise), and the POST task re-sends the request
+  # itself: the task's one admission settles with the final result, so a
+  # definitive refusal counts as a failure.
+  describe "a request whose authentication is refused" do
+    test "counts as a failure when the OAuth flow fails" do
+      client = start_refusing_client([])
 
-    Bypass.stub(bypass, "POST", "/mcp", fn conn ->
-      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      # The OAuth flow fails at once: this server's metadata isn't served
+      # over HTTPS, so the request isn't sent again.
+      assert {:error, %TransportError{reason: {:oauth_failed, _reason}}} =
+               Client.call_tool(client, "protected", %{}, 2_000)
 
-      case Jason.decode!(body) do
-        %{"method" => "server/discover", "id" => id} ->
-          json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => discover()})
+      assert_received :call_posted
+      refute_received :call_posted
+      assert %{total_failures: 1, state: :open} = breaker_stats(client)
+      assert_refused_unsent(client)
+    end
 
-        %{"method" => "tools/call"} ->
-          send(test_pid, :call_posted)
+    test "counts as a failure when every re-send is refused" do
+      client = start_refusing_client(auth_provider: {Provider, test_pid: self()})
 
-          conn
-          |> Plug.Conn.put_resp_header("www-authenticate", "Bearer")
-          |> Plug.Conn.resp(401, "")
-      end
-    end)
+      assert {:error, %TransportError{}} = Client.call_tool(client, "protected", %{}, 2_000)
 
-    {:ok, client} =
-      Client.start_link(
-        transport: :http,
-        url: "http://127.0.0.1:#{bypass.port}/mcp",
-        protocol_mode: :modern_only,
-        reliability: [circuit_breaker: [failure_threshold: 1, reset_timeout: 60_000]],
-        health_check_interval: nil,
-        reconnect: false
-      )
+      # The first POST and its two re-sends, after a 401 and a step-up.
+      for _ <- 1..3, do: assert_received(:call_posted)
+      refute_received :call_posted
 
-    on_exit(fn -> stop(client) end)
-
-    # The OAuth flow fails at once: this server's metadata isn't served
-    # over HTTPS.
-    assert {:error, %TransportError{reason: {:oauth_failed, _reason}}} =
-             Client.call_tool(client, "protected", %{}, 2_000)
-
-    assert_received :call_posted
-    assert_received :call_posted
-
-    assert {:error, %TransportError{reason: :circuit_open}} =
-             Client.call_tool(client, "protected", %{}, 2_000)
-
-    refute_received :call_posted
+      # One admission, settled once, with the final refusal. (A next call
+      # is refused before the breaker sees it: the rejected credential
+      # stops it in the client.)
+      assert %{total_failures: 1, state: :open} = breaker_stats(client)
+    end
   end
 
   test "the breaker and health check stop even when the session DELETE stalls" do
@@ -350,8 +337,59 @@ defmodule Arbor.MCP.Client.ReliabilityHTTPTest do
 
   defp era(version), do: Arbor.MCP.Internal.VersionRegistry.era_for(version)
 
-  # The circuit is open: a call is refused before anything is sent.
+  # A modern server that refuses every tools/call with a Bearer 401.
+  defp start_refusing_client(opts) do
+    bypass = Bypass.open()
+    test_pid = self()
+
+    Bypass.stub(bypass, "POST", "/mcp", fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      case Jason.decode!(body) do
+        %{"method" => "server/discover", "id" => id} ->
+          json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => discover()})
+
+        %{"method" => "tools/call"} ->
+          send(test_pid, :call_posted)
+
+          conn
+          |> Plug.Conn.put_resp_header("www-authenticate", "Bearer")
+          |> Plug.Conn.resp(401, "")
+      end
+    end)
+
+    {:ok, client} =
+      Client.start_link(
+        [
+          transport: :http,
+          url: "http://127.0.0.1:#{bypass.port}/mcp",
+          protocol_mode: :modern_only,
+          reliability: [circuit_breaker: [failure_threshold: 1, reset_timeout: 60_000]],
+          health_check_interval: nil,
+          reconnect: false
+        ] ++ opts
+      )
+
+    on_exit(fn -> stop(client) end)
+    client
+  end
+
+  defp assert_refused_unsent(client) do
+    assert {:error, %TransportError{reason: :circuit_open}} =
+             Client.call_tool(client, "protected", %{}, 2_000)
+
+    refute_received :call_posted
+  end
+
+  # The circuit is open: a call is refused before anything is sent. The
+  # caller hears of its failed call before the breaker has always recorded
+  # it (the task settles at the same deadline, the client after it replies),
+  # so the check waits for the failure first.
   defp assert_refused(client) do
+    Arbor.MCP.TestHelpers.wait_until(fn -> breaker_stats(client).total_failures >= 1 end,
+      timeout: 2_000
+    )
+
     assert {:error, %TransportError{reason: :circuit_open}} =
              Client.call_tool(client, "hold", %{"label" => "refused"}, 2_000)
 

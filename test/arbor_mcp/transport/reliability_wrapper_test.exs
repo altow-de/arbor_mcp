@@ -2,6 +2,49 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapperTest do
   use ExUnit.Case, async: true
   alias Arbor.MCP.Transport.{ReliabilityWrapper, Test}
 
+  defmodule StatefulFailure do
+    @behaviour Arbor.MCP.Transport
+    @impl true
+    def connect(_opts), do: {:ok, 0}
+    @impl true
+    def send_message(_message, _state), do: {:error, {:connection_error, :refused}}
+    @doc false
+    def send_message_with_state(_message, state),
+      do: {:error, {:connection_error, :refused}, state + 1}
+
+    @impl true
+    def receive_message(state), do: {:ok, "", state}
+    @impl true
+    def close(_state), do: :ok
+    @impl true
+    def connected?(_state), do: true
+  end
+
+  test "public wrapped failures keep two-tuples while internal sends retain state" do
+    assert {:ok, wrapped} = ReliabilityWrapper.wrap(StatefulFailure, 0, [])
+    on_exit(fn -> ReliabilityWrapper.close(wrapped) end)
+
+    assert {:error, {:connection_error, :refused}} =
+             ReliabilityWrapper.send_message("body", wrapped)
+
+    assert {:error, {:connection_error, :refused}, %{wrapped_state: 1}} =
+             ReliabilityWrapper.send_message_with_state("body", wrapped)
+  end
+
+  @tag :reauth_round8
+  test "failed sends preserve wrapped state and still count toward the circuit breaker" do
+    assert {:ok, wrapped} =
+             ReliabilityWrapper.wrap(StatefulFailure, 0, circuit_breaker: [failure_threshold: 1])
+
+    on_exit(fn -> ReliabilityWrapper.close(wrapped) end)
+
+    assert {:error, {:connection_error, :refused}, updated} =
+             ReliabilityWrapper.send_message_with_state("body", wrapped)
+
+    assert updated.wrapped_state == 1
+    assert {:error, :circuit_open} = ReliabilityWrapper.send_message("body", updated)
+  end
+
   describe "wrap/3" do
     test "successfully wraps a transport with circuit breaker" do
       {:ok, transport_state} = Test.connect([])
