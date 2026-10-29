@@ -1636,12 +1636,12 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   # The components attached here stop within this close's cleanup deadline,
-  # handed to the wrapper with them.
+  # if it has one, handed to the wrapper with them (and with whether the
+  # client retired their links, see Deadline.put_cleanup_on_transport/3).
   @impl true
   def close(%__MODULE__{reliability: %ReliabilityWrapper{} = reliability} = state) do
-    deadline = state.deadline || Deadline.after_ms(Deadline.cleanup_timeout())
-    state = %{put_deadline(state, deadline) | reliability: nil}
-    ReliabilityWrapper.close(%{reliability | deadline: deadline, wrapped_state: state})
+    state = %{state | reliability: nil}
+    ReliabilityWrapper.close(%{reliability | deadline: state.deadline, wrapped_state: state})
   end
 
   def close(%__MODULE__{} = state) do

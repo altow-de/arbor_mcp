@@ -3112,7 +3112,8 @@ defmodule Arbor.MCP.Client do
   defp close_transport(%{transport_mod: mod, transport_state: transport_state}, close_mode)
        when not is_nil(mod) and not is_nil(transport_state) do
     deadline = cleanup_deadline()
-    cleanup_state = Deadline.put_on_transport(mod, transport_state, deadline)
+    # Every caller has retired the transport's links (retire_links/1).
+    cleanup_state = Deadline.put_cleanup_on_transport(mod, transport_state, deadline)
 
     result =
       if ConnectionScope.current() && close_mode == :native do
@@ -3513,7 +3514,7 @@ defmodule Arbor.MCP.Client do
 
     # However the client stops (stop/2, its starter's exit, a linked
     # process's crash), the connection and any child process go with it.
-    close_transport(state)
+    close_transport(retire_links(state))
     Lifetime.cleanup(deadline)
     :ok
   end

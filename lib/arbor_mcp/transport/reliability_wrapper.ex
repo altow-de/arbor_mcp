@@ -60,10 +60,10 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
   # How much longer than a receive's own timeout the circuit breaker waits.
   @receive_slack_ms 500
 
-  # The longest close/1 waits for its components to stop, or for a killed
-  # one's exit, when its caller gives it no cleanup deadline, and the least
-  # time worth giving a stop: with less, a stop would only add the risk of
-  # the caller cutting the close off before anything is done.
+  # How long close/1 gives each component to stop, and then a killed one to
+  # exit, when its caller gives it no cleanup deadline; and the least time
+  # worth giving a stop within a deadline: with less, a stop would only add
+  # the risk of the caller cutting the close off before anything is done.
   @component_stop_ms 500
   @min_stop_ms 10
 
@@ -76,7 +76,11 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
     # The caller's cleanup deadline, put here by Deadline.put_on_transport/3
     # for any wrapped transport, or by the transport the components are
     # attached to (HTTP.close/1).
-    :deadline
+    :deadline,
+    # Set by Deadline.put_cleanup_on_transport/3 for a client's close made
+    # after it retired the transport's links: their exits, a kill's
+    # included, are then expected.
+    links_retired: false
   ]
 
   @type t :: %__MODULE__{
@@ -85,7 +89,8 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
           circuit_breaker_pid: pid() | nil,
           health_check_pid: pid() | nil,
           config: map(),
-          deadline: integer() | nil
+          deadline: integer() | nil,
+          links_retired: boolean()
         }
 
   @type reliability_opts :: [
@@ -238,19 +243,28 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
     # running. Neither runs work in its own loop (a health check runs in a
     # task of the checker's), so a stop is prompt even mid-check.
     #
-    # Nothing here waits past the caller's cleanup deadline (`:deadline`,
-    # whatever the wrapped transport), so the transport's close (a stdio
-    # server's stop, an HTTP session DELETE) is always attempted within it:
-    # graceful stops share at most half of what is left of it (500 ms
-    # without one). A component that doesn't stop within that share is
+    # Without a cleanup deadline each component gets its own graceful stop
+    # of 500 ms, and is killed only if it ignores that, as before deadlines
+    # came here. With one (`:deadline`), nothing waits past it, so the
+    # transport's close (a stdio server's stop, an HTTP session DELETE) is
+    # always attempted within it: graceful stops share at most half of what
+    # is left of it, a component that doesn't stop within that share is
     # killed at once, and so is every component when the share is under
-    # 10 ms (a deadline already expired, or about to): the close then
-    # follows straight away. A kill's exit is confirmed after the close,
-    # within what is left.
+    # 10 ms. A kill's exit is confirmed after the close, within what is left.
+    #
+    # Killing a component sends its :killed exit to every process linked to
+    # it, so within a deadline one is killed only when nothing it is linked
+    # to can die of that: the client retired its links (`:links_retired`),
+    # or it is linked to nothing but the closer, whose link the kill
+    # removes. Any other component is stopped as without a deadline, taking
+    # the time that needs.
     share = stop_share(state)
 
     stopping =
-      Enum.map([state.circuit_breaker_pid, state.health_check_pid], &stop_component(&1, share))
+      Enum.map(
+        [state.circuit_breaker_pid, state.health_check_pid],
+        &stop_component(&1, share, state)
+      )
 
     result = close_wrapped(state)
     components = Enum.map(stopping, &confirm_component(&1, state))
@@ -269,7 +283,7 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
     end
   end
 
-  defp stop_share(%__MODULE__{deadline: nil}), do: Deadline.after_ms(@component_stop_ms)
+  defp stop_share(%__MODULE__{deadline: nil}), do: nil
 
   defp stop_share(%__MODULE__{deadline: deadline}),
     do: Deadline.after_ms(min(@component_stop_ms, div(Deadline.remaining(deadline), 2)))
@@ -286,25 +300,58 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
     kind, reason -> {:error, {:cleanup_failure, kind, reason}}
   end
 
-  defp stop_component(nil, _share), do: :ok
+  defp stop_component(nil, _share, _state), do: :ok
 
-  defp stop_component(pid, share) do
-    case Deadline.remaining(share) do
-      wait when wait < @min_stop_ms -> kill_component(pid)
-      wait -> graceful_stop(pid, wait)
+  defp stop_component(pid, share, state) do
+    killable = killable?(pid, state)
+
+    cond do
+      is_nil(share) or not killable -> graceful_stop(pid, @component_stop_ms, killable)
+      Deadline.remaining(share) < @min_stop_ms -> kill_component(pid)
+      true -> graceful_stop(pid, Deadline.remaining(share), killable)
     end
   end
 
-  defp graceful_stop(pid, wait) do
-    GenServer.stop(pid, :normal, wait)
-  catch
-    :exit, {:noproc, _call} -> :ok
-    :exit, _reason -> kill_component(pid)
+  defp killable?(_pid, %__MODULE__{links_retired: true}), do: true
+
+  defp killable?(pid, _state) do
+    case Process.info(pid, :links) do
+      {:links, links} -> Enum.all?(links, &(&1 == self()))
+      nil -> true
+    end
+  end
+
+  # The stop is asked with :sys.terminate/3 and its exit awaited here, not
+  # with GenServer.stop/3: proc_lib:stop/3 raises (a negative `after`) when
+  # the stop is accepted just before its timeout. A component that accepted
+  # its stop is already exiting normally, so one that can't be killed safely
+  # gets the time its terminate callback takes; any other is killed once
+  # `wait` is up.
+  defp graceful_stop(pid, wait, killable) do
+    monitor = Process.monitor(pid)
+    stop_by = Deadline.after_ms(wait)
+
+    grace =
+      try do
+        case :sys.terminate(pid, :normal, wait) do
+          :ok when not killable -> @component_stop_ms
+          _accepted -> 0
+        end
+      catch
+        :exit, _reason -> 0
+      end
+
+    receive do
+      {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+    after
+      Deadline.remaining(stop_by) + grace ->
+        Process.demonitor(monitor, [:flush])
+        kill_component(pid)
+    end
   end
 
   # A killed component's linker gets its :killed exit, unless it is the
-  # caller: the client closes either in its own process or from a worker
-  # after retiring those links.
+  # closer, whose link is removed first.
   defp kill_component(pid) do
     monitor = Process.monitor(pid)
     Process.unlink(pid)

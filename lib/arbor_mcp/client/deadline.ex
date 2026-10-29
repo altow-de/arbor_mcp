@@ -101,6 +101,26 @@ defmodule Arbor.MCP.Client.Deadline do
 
   def put_on_transport(_transport_mod, transport_state, _deadline), do: transport_state
 
+  @doc """
+  `put_on_transport/3` for the close a client makes once it has retired the
+  transport's links: its reliability components, if any, may then be killed
+  when they don't stop within their share of `deadline`, since the exits of
+  those links are expected.
+  """
+  @spec put_cleanup_on_transport(module() | nil, term(), t()) :: term()
+  def put_cleanup_on_transport(transport_mod, transport_state, deadline) do
+    case put_on_transport(transport_mod, transport_state, deadline) do
+      %ReliabilityWrapper{} = wrapper ->
+        %{wrapper | links_retired: true}
+
+      %HTTP{reliability: %ReliabilityWrapper{} = reliability} = http ->
+        %{http | reliability: %{reliability | links_retired: true}}
+
+      other ->
+        other
+    end
+  end
+
   @doc "The deadline currently held by `transport_state`, if any."
   @spec on_transport(module() | nil, term()) :: t()
   def on_transport(HTTP, %HTTP{deadline: deadline}), do: deadline

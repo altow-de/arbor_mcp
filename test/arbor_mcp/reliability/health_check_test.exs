@@ -431,6 +431,8 @@ defmodule Arbor.MCP.Reliability.HealthCheckTest do
           timeout: 30_000
         )
 
+      # No periodic check (the first comes a second after the start) joins in.
+      :ok = HealthCheck.pause(checker)
       {:ok, checker: checker}
     end
 
@@ -498,6 +500,7 @@ defmodule Arbor.MCP.Reliability.HealthCheckTest do
           recovery_threshold: 1
         )
 
+      :ok = HealthCheck.pause(checker)
       {:ok, checker: checker}
     end
 
