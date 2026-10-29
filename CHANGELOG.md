@@ -592,6 +592,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   8.2.2), so curl and other nghttp2 clients over h2c or TLS got no `endpoint`
   event from Bandit (#182). Neither legacy GET stream sends the header now;
   over HTTP/1.1 it was redundant, since connections persist by default.
+- When a client closed a request's SSE stream, the next progress or log
+  notification, or the final response, raised
+  `Arbor.MCP.HttpPlug.RuntimeWriter.AdmissionError` ("MCP HTTP response
+  capacity unavailable"), which Bandit logged as an error with a stack trace
+  (#179). Closing the stream is how a modern client cancels, so the response
+  now ends quietly, as it does after a failed keepalive. The sender still
+  gets `{:error, :stream_closed}`, a modern request is still cancelled, and a
+  legacy one still runs to its end. Output refused before it is written, and
+  a write that raises, still raise.
 
 ## [2.0.0-rc.6] — 2026-10-26
 

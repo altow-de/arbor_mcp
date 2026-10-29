@@ -271,8 +271,11 @@ Closing a modern request/subscription response stream is the cancellation
 signal; there is no session DELETE and no resumable `Last-Event-ID` cursor.
 For a modern SSE request response other than `subscriptions/listen`, which
 has its own keepalive, the server writes comment keepalives every
-`:request_keepalive_interval_ms` (15 seconds by default). A failed write
-cancels the running handler and releases its Runtime capacity. Over TCP the
+`:request_keepalive_interval_ms` (15 seconds by default). A failed write,
+of a keepalive or of a progress or log notification, cancels the running
+handler and releases its Runtime capacity. The client has closed the stream,
+which is how it cancels, so that write, like a failed write of the final
+response, ends the response without logging an error. Over TCP the
 first write after the client closes usually succeeds and the next one fails,
 so on Bandit the close is usually noticed within two intervals. Cowboy instead
 terminates the request process when it sees the connection close, which
