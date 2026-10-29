@@ -34,6 +34,14 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
 
       # Manual health check
       HealthCheck.check_now(checker)
+
+  ## Checks
+
+  Each check runs in a process of its own, off the checker's loop, so
+  `get_status/1` and the checker's other calls answer while a check is in
+  progress, and stopping the checker stops its check with it. Checks still
+  run one at a time: `check_now/1` and each periodic check get a check of
+  their own, in the order asked.
   """
 
   use GenServer
@@ -45,6 +53,8 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
   @default_timeout 5_000
   @default_failure_threshold 3
   @default_recovery_threshold 2
+  # How long stopping a check may take; its watcher answers at once.
+  @check_shutdown_ms 1_000
 
   defstruct [
     :name,
@@ -57,6 +67,7 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
     :on_status_change,
     :timer_ref,
     :check,
+    check_queue: [],
     status: :unknown,
     consecutive_failures: 0,
     consecutive_successes: 0,
@@ -87,6 +98,7 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
           on_status_change: (status(), status() -> any()) | nil,
           timer_ref: reference() | nil,
           check: map() | nil,
+          check_queue: [{:reply, GenServer.from()} | :periodic],
           status: status(),
           consecutive_failures: non_neg_integer(),
           consecutive_successes: non_neg_integer(),
@@ -120,7 +132,9 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
   end
 
   @doc """
-  Gets the current health status.
+  Gets the current health status, as the checks finished so far left it.
+
+  It answers at once, also while a check is in progress.
   """
   @spec get_status(GenServer.server()) :: {status(), map()}
   def get_status(checker) do
@@ -128,8 +142,10 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
   end
 
   @doc """
-  Triggers an immediate health check, or joins the one already running, and
-  returns its result.
+  Runs a health check and returns its result.
+
+  The check starts once any check already running, or asked for earlier,
+  has finished, so the result is always a sample taken after the call.
   """
   @spec check_now(GenServer.server()) :: check_result()
   def check_now(checker) do
@@ -216,7 +232,7 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
   end
 
   def handle_call(:check_now, from, state) do
-    {:noreply, start_check(state, waiter: from)}
+    {:noreply, request_check(state, {:reply, from})}
   end
 
   def handle_call({:get_history, limit}, _from, state) do
@@ -240,9 +256,11 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
       Process.cancel_timer(state.timer_ref)
     end
 
-    # A periodic check still running finishes without scheduling the next.
+    # A periodic check running or waiting its turn no longer schedules the
+    # next, and one waiting its turn doesn't run.
     check = state.check && %{state.check | periodic: false}
-    {:reply, :ok, %{state | timer_ref: nil, check: check}}
+    queue = Enum.reject(state.check_queue, &(&1 == :periodic))
+    {:reply, :ok, %{state | timer_ref: nil, check: check, check_queue: queue}}
   end
 
   def handle_call(:resume, _from, state) do
@@ -253,7 +271,7 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
   @impl GenServer
   def handle_info(:perform_check, state) do
     # The next check is scheduled when this one finishes.
-    {:noreply, start_check(%{state | timer_ref: nil}, periodic: true)}
+    {:noreply, request_check(%{state | timer_ref: nil}, :periodic)}
   end
 
   def handle_info({ref, reply}, %{check: %{task: %Task{ref: ref}}} = state) do
@@ -270,7 +288,7 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
 
   def handle_info({:check_timeout, ref}, %{check: %{task: %Task{ref: ref} = task}} = state) do
     outcome =
-      case Task.shutdown(task, :brutal_kill) do
+      case stop_check(task) do
         nil -> {:unhealthy, %{error: :timeout}}
         finished -> check_outcome(finished)
       end
@@ -287,7 +305,7 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
 
   @impl GenServer
   def terminate(_reason, %{check: %{task: task}}) do
-    Task.shutdown(task, :brutal_kill)
+    stop_check(task)
     :ok
   end
 
@@ -295,35 +313,73 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
 
   ## Private Functions
 
-  # A check runs in a task of its own, never in this loop, so the checker
-  # answers get_status/1 and a stop while a check waits on its target: a
-  # stop (a closing transport's) must not wait out the check's timeout, and
-  # terminate/2 takes the task down with the checker. A check asked for while
-  # one is running joins it.
-  defp start_check(%{check: nil} = state, opts) do
-    task = Task.async(fn -> state.check_fn.(state.target) end)
+  # A check runs off this loop, so the checker answers get_status/1 and a
+  # stop (a closing transport's) while a check waits on its target. Each
+  # check_now/1 and each periodic tick gets a check of its own, in the order
+  # asked, as when checks ran in this loop.
+  defp request_check(%{check: nil} = state, request), do: start_check(state, request)
+  defp request_check(state, request), do: %{state | check_queue: state.check_queue ++ [request]}
+
+  defp start_check(state, request) do
+    task = start_check_task(state.check_fn, state.target)
 
     check = %{
       task: task,
       timer: Process.send_after(self(), {:check_timeout, task.ref}, state.timeout),
       started: System.monotonic_time(:millisecond),
       timestamp: DateTime.utc_now(),
-      waiters: List.wrap(opts[:waiter]),
-      periodic: Keyword.get(opts, :periodic, false)
+      reply_to: reply_to(request),
+      periodic: request == :periodic
     }
 
     %{state | check: check}
   end
 
-  defp start_check(%{check: check} = state, opts) do
-    check = %{
-      check
-      | waiters: List.wrap(opts[:waiter]) ++ check.waiters,
-        periodic: check.periodic or Keyword.get(opts, :periodic, false)
-    }
+  defp reply_to({:reply, from}), do: from
+  defp reply_to(:periodic), do: nil
 
-    %{state | check: check}
+  # The check function runs in a process of its own under a watcher task,
+  # which is linked to the checker and traps exits: however the checker goes
+  # down (a stop, a kill, its linker's exit), the watcher kills the check
+  # with it, so a check that traps exits itself can't outlive the checker. A
+  # check that crashes takes the watcher, and so the checker, down with it,
+  # as it did when it was the checker's own task.
+  defp start_check_task(check_fn, target) do
+    Task.async(fn ->
+      Process.flag(:trap_exit, true)
+      watcher = self()
+      callers = [watcher | Process.get(:"$callers", [])]
+
+      {runner, monitor} =
+        spawn_monitor(fn ->
+          Process.put(:"$callers", callers)
+          send(watcher, {:check_result, self(), check_fn.(target)})
+        end)
+
+      await_check(runner, monitor)
+    end)
   end
+
+  defp await_check(runner, monitor) do
+    receive do
+      {:check_result, ^runner, result} ->
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {:DOWN, ^monitor, :process, ^runner, reason} ->
+        exit(reason)
+
+      {:EXIT, _checker, _reason} ->
+        Process.exit(runner, :kill)
+
+        receive do
+          {:DOWN, ^monitor, :process, ^runner, _reason} -> exit(:shutdown)
+        end
+    end
+  end
+
+  # The watcher answers a shutdown at once, killing the check first.
+  defp stop_check(task), do: Task.shutdown(task, @check_shutdown_ms)
 
   defp finish_check(%{check: check} = state, {status, details}) do
     Process.cancel_timer(check.timer)
@@ -336,20 +392,29 @@ defmodule Arbor.MCP.Reliability.HealthCheck do
     }
 
     state = update_health_state(%{state | check: nil}, result)
-    Enum.each(check.waiters, &GenServer.reply(&1, result))
+    if check.reply_to, do: GenServer.reply(check.reply_to, result)
 
     # A resume/1 during the check has scheduled the next one already.
-    if check.periodic and is_nil(state.timer_ref),
-      do: %{
-        state
-        | timer_ref: Process.send_after(self(), :perform_check, state.check_interval)
-      },
-      else: state
+    state =
+      if check.periodic and is_nil(state.timer_ref),
+        do: %{
+          state
+          | timer_ref: Process.send_after(self(), :perform_check, state.check_interval)
+        },
+        else: state
+
+    case state.check_queue do
+      [] -> state
+      [request | queue] -> start_check(%{state | check_queue: queue}, request)
+    end
   end
 
   defp check_outcome({:ok, {:ok, details}}), do: {:healthy, details}
   defp check_outcome({:ok, {:error, reason}}), do: {:unhealthy, %{error: reason}}
-  defp check_outcome({:ok, other}), do: {:unhealthy, %{error: {:invalid_check_result, other}}}
+  # As reported when the check's result was matched in this loop.
+  defp check_outcome({:ok, other}),
+    do: {:unhealthy, %{error: Exception.format(:error, %CaseClauseError{term: {:ok, other}})}}
+
   defp check_outcome({:exit, reason}), do: {:unhealthy, %{error: {:exit, reason}}}
 
   defp update_health_state(state, result) do

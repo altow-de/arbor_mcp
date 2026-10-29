@@ -101,6 +101,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JWE, derives shared secrets or exports password-encrypted keys, and MRTR
   request state is sealed with `:crypto` directly and checks the tag length.
   The floor keeps applications' dependency graphs off the affected releases.
+- `Arbor.MCP.Reliability.HealthCheck.get_status/1` answers at once while a
+  check is in progress, with the status the finished checks left, instead of
+  waiting for that check: each check now runs in a process of its own, off
+  the checker's loop. `check_now/1` is unchanged: it still runs a check of
+  its own, after any already running, and returns its result.
 
 ### Fixed
 
@@ -118,17 +123,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decides first: as a failure when the task crashes or the client's timeout
   abandons the POST, in either era, so a late response doesn't count, and
   released, not counted, when the caller cancels or exits, even while the
-  POST waits on authentication. A request re-sent after authenticating
+  POST waits on authentication or before its task has started. A request re-sent after authenticating
   settles with the re-send's result, and a definitive refusal counts as a
   failure, so repeated failed authentication opens the circuit. A request
   stream is admitted but its outcome isn't recorded. Its `:timeout` doesn't
   apply over HTTP, where each exchange keeps its own deadline. The breaker
   and health check now stop before the transport closes, within half of the
-  client's cleanup budget, so a close the client cuts off (a stalled session
-  DELETE, a stuck stdio server) no longer leaves them running, and the close
-  is still attempted. `Arbor.MCP.Reliability.HealthCheck` runs each check in
-  a task of its own, so `get_status/1` and a stop no longer wait for a check
-  in progress, and `check_now/1` during a check joins it.
+  client's cleanup budget over any transport, so a close the client cuts off
+  (a stalled session DELETE, a stuck stdio server) no longer leaves them
+  running, and the close is still attempted. A health checker stops at once
+  even while a check waits on its target, and its check, one that traps
+  exits included, no longer outlives it, however it goes down.
 - Probe and handshake receive failures retain refreshed authentication state
   during fallback and cleanup. Synchronous HTTP state-bearing failures stay
   internal; public transport `send_message/2` errors remain `{:error, reason}`.

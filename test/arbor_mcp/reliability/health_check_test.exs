@@ -343,11 +343,10 @@ defmodule Arbor.MCP.Reliability.HealthCheckTest do
   describe "status change callbacks" do
     test "calls on_status_change callback", context do
       {:ok, target} = start_toggle_target()
-      {:ok, callback_agent} = Agent.start_link(fn -> [] end)
+      test_pid = self()
 
       on_status_change = fn old_status, new_status ->
-        # Update synchronously within the callback
-        Agent.update(callback_agent, &[{old_status, new_status} | &1])
+        send(test_pid, {:status_changed, old_status, new_status})
       end
 
       # Custom check function that checks the state
@@ -374,13 +373,8 @@ defmodule Arbor.MCP.Reliability.HealthCheckTest do
       GenServer.call(target, {:update, fn _ -> :healthy end})
       HealthCheck.check_now(checker)
 
-      # Let callback execute (ensure enough time for async Task)
-      Process.sleep(500)
-
-      changes = Agent.get(callback_agent, &Enum.reverse/1)
-      assert changes != [], "No status changes were recorded"
-      # Should see transition from unknown to healthy
-      assert {:unknown, :healthy} in changes
+      # The callback runs in a task of its own.
+      assert_receive {:status_changed, :unknown, :healthy}
     end
   end
 
@@ -440,19 +434,36 @@ defmodule Arbor.MCP.Reliability.HealthCheckTest do
       {:ok, checker: checker}
     end
 
-    test "doesn't hold the checker's answers, and joins a check asked for", %{checker: checker} do
+    test "doesn't hold the checker's answers", %{checker: checker} do
       asker = Task.async(fn -> HealthCheck.check_now(checker) end)
       assert_receive {:checking, check}
 
       assert {:unknown, _info} = HealthCheck.get_status(checker)
-      joined = Task.async(fn -> HealthCheck.check_now(checker) end)
-      wait_until(fn -> length(:sys.get_state(checker).check.waiters) == 2 end, timeout: 2_000)
-      refute_received {:checking, _another}
+      assert [] = HealthCheck.get_history(checker)
 
       send(check, :finish)
       assert %{status: :healthy} = result = Task.await(asker)
-      assert ^result = Task.await(joined)
       assert [^result] = HealthCheck.get_history(checker)
+    end
+
+    # A caller of check_now/1 expects a sample taken after its call.
+    test "is followed by a check of its own for a check_now/1 asked meanwhile",
+         %{checker: checker} do
+      first = Task.async(fn -> HealthCheck.check_now(checker) end)
+      assert_receive {:checking, check}
+
+      second = Task.async(fn -> HealthCheck.check_now(checker) end)
+      wait_until(fn -> length(:sys.get_state(checker).check_queue) == 1 end, timeout: 2_000)
+      refute_received {:checking, _another}
+
+      send(check, :finish)
+      assert %{status: :healthy} = first_result = Task.await(first)
+      assert_receive {:checking, next}
+      assert next != check
+
+      send(next, :finish)
+      assert %{status: :healthy} = second_result = Task.await(second)
+      assert [^second_result, ^first_result] = HealthCheck.get_history(checker)
     end
 
     test "is taken down by a stop, which doesn't wait for it", %{checker: checker} do
@@ -463,6 +474,49 @@ defmodule Arbor.MCP.Reliability.HealthCheckTest do
       assert :ok = GenServer.stop(checker, :normal, 1_000)
       assert_receive {:DOWN, ^check_ref, :process, ^check, :killed}
     end
+  end
+
+  # Killing the checker skips terminate/2, and its link only sends a check
+  # that traps exits a message.
+  test "a check that traps exits doesn't outlive a checker that is killed", context do
+    test_pid = self()
+
+    {:ok, checker} =
+      HealthCheck.start_link(
+        name: context.checker_name,
+        target: self(),
+        check_fn: fn _target ->
+          Process.flag(:trap_exit, true)
+          send(test_pid, {:checking, self()})
+          receive do: (:never -> {:ok, %{}})
+        end,
+        check_interval: 60_000,
+        timeout: 30_000
+      )
+
+    Process.unlink(checker)
+    _asker = spawn(fn -> HealthCheck.check_now(checker) end)
+    assert_receive {:checking, check}
+    on_exit(fn -> Process.exit(check, :kill) end)
+    check_ref = Process.monitor(check)
+
+    Process.exit(checker, :kill)
+    assert_receive {:DOWN, ^check_ref, :process, ^check, :killed}
+  end
+
+  # Matchers written for the error a check's unexpected result reported
+  # keep working.
+  test "a check's unexpected result is reported as before", context do
+    {:ok, checker} =
+      HealthCheck.start_link(
+        name: context.checker_name,
+        target: self(),
+        check_fn: fn _target -> :weird end,
+        check_interval: 60_000
+      )
+
+    assert %{status: :unhealthy, details: %{error: error}} = HealthCheck.check_now(checker)
+    assert error == "** (CaseClauseError) no case clause matching:\n\n    {:ok, :weird}\n"
   end
 
   test "a check that outlives its timeout is unhealthy and stopped", context do

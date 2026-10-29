@@ -60,15 +60,23 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
   # How much longer than a receive's own timeout the circuit breaker waits.
   @receive_slack_ms 500
 
-  # The longest close/1 waits for its components to stop.
+  # The longest close/1 waits for its components to stop, and the least it
+  # gives each stop (or kill) even when the caller's cleanup budget is spent:
+  # a component answers a stop well within it, so only a stuck one waits it
+  # out before it is killed.
   @component_stop_ms 500
+  @component_floor_ms 50
 
   defstruct [
     :wrapped_module,
     :wrapped_state,
     :circuit_breaker_pid,
     :health_check_pid,
-    :config
+    :config,
+    # The caller's cleanup deadline, put here by Deadline.put_on_transport/3
+    # for any wrapped transport, or by the transport the components are
+    # attached to (HTTP.close/1).
+    :deadline
   ]
 
   @type t :: %__MODULE__{
@@ -76,7 +84,8 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
           wrapped_state: any(),
           circuit_breaker_pid: pid() | nil,
           health_check_pid: pid() | nil,
-          config: map()
+          config: map(),
+          deadline: integer() | nil
         }
 
   @type reliability_opts :: [
@@ -229,8 +238,9 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
     # running. Neither runs work in its own loop (a health check runs in a
     # task of the checker's), so a stop is prompt even mid-check; a component
     # that still doesn't stop is killed. Together they get at most half of the
-    # caller's remaining cleanup budget, so the transport's close (a stdio
-    # server's stop, an HTTP session DELETE) is always attempted within it.
+    # caller's remaining cleanup budget (`:deadline`, whatever the wrapped
+    # transport), so the transport's close (a stdio server's stop, an HTTP
+    # session DELETE) is always attempted within it.
     deadline = component_deadline(state)
 
     components =
@@ -252,15 +262,12 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
     end
   end
 
-  defp component_deadline(state) do
-    budget =
-      case Deadline.on_transport(state.wrapped_module, state.wrapped_state) do
-        nil -> @component_stop_ms
-        deadline -> min(@component_stop_ms, div(Deadline.remaining(deadline), 2))
-      end
+  defp component_deadline(%__MODULE__{deadline: nil}), do: Deadline.after_ms(@component_stop_ms)
 
-    Deadline.after_ms(budget)
-  end
+  defp component_deadline(%__MODULE__{deadline: deadline}),
+    do: Deadline.after_ms(min(@component_stop_ms, div(Deadline.remaining(deadline), 2)))
+
+  defp component_wait(deadline), do: max(Deadline.remaining(deadline), @component_floor_ms)
 
   defp close_wrapped(state) do
     case state.wrapped_module.close(state.wrapped_state) do
@@ -277,7 +284,7 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
   defp stop_component(nil, _deadline), do: :ok
 
   defp stop_component(pid, deadline) do
-    GenServer.stop(pid, :normal, Deadline.remaining(deadline))
+    GenServer.stop(pid, :normal, component_wait(deadline))
   catch
     :exit, {:noproc, _call} -> :ok
     :exit, _reason -> kill_component(pid, deadline)
@@ -293,7 +300,7 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
     receive do
       {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
     after
-      Deadline.remaining(deadline) ->
+      component_wait(deadline) ->
         Process.demonitor(monitor, [:flush])
         {:error, :reliability_cleanup_timeout}
     end
@@ -363,15 +370,20 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
   def admit(%__MODULE__{}), do: :ok
 
   @doc false
-  # For a send its transport makes from a process of its own, which may be
-  # killed before it ends (see CircuitBreaker.hold/1): settle/3 then settles
-  # the admission exactly once, and the breaker settles one its holder never
-  # did when that process goes down.
-  @spec hold(t()) :: :ok | {:error, :circuit_open | :circuit_breaker_unavailable}
-  def hold(%__MODULE__{config: %{circuit_breaker_enabled: true}, circuit_breaker_pid: pid}),
-    do: CircuitBreaker.hold(pid)
+  # For a send its transport makes from a process of its own, `holder`,
+  # which may be killed before it ends (see CircuitBreaker.hold/2): settle/3
+  # then settles the admission exactly once, and the breaker settles one its
+  # holder never did when that process goes down.
+  @spec hold(t(), pid()) :: :ok | {:error, :circuit_open | :circuit_breaker_unavailable}
+  def hold(wrapper, holder \\ self())
 
-  def hold(%__MODULE__{}), do: :ok
+  def hold(
+        %__MODULE__{config: %{circuit_breaker_enabled: true}, circuit_breaker_pid: pid},
+        holder
+      ),
+      do: CircuitBreaker.hold(pid, holder)
+
+  def hold(%__MODULE__{}, _holder), do: :ok
 
   @doc false
   @spec settle(t(), pid(), {:result, term()} | :failure | :release) :: :ok

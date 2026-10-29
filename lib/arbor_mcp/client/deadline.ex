@@ -89,10 +89,13 @@ defmodule Arbor.MCP.Client.Deadline do
   def put_on_transport(MockTransport, %MockTransport{} = state, deadline),
     do: %{state | deadline: deadline}
 
+  # The wrapper keeps the deadline itself as well, whatever it wraps: its
+  # close bounds stopping its components by it.
   def put_on_transport(ReliabilityWrapper, %ReliabilityWrapper{} = state, deadline) do
     %{
       state
-      | wrapped_state: put_on_transport(state.wrapped_module, state.wrapped_state, deadline)
+      | deadline: deadline,
+        wrapped_state: put_on_transport(state.wrapped_module, state.wrapped_state, deadline)
     }
   end
 
@@ -107,7 +110,7 @@ defmodule Arbor.MCP.Client.Deadline do
   def on_transport(MockTransport, %MockTransport{deadline: deadline}), do: deadline
 
   def on_transport(ReliabilityWrapper, %ReliabilityWrapper{} = state),
-    do: on_transport(state.wrapped_module, state.wrapped_state)
+    do: state.deadline || on_transport(state.wrapped_module, state.wrapped_state)
 
   def on_transport(_transport_mod, _transport_state), do: nil
 

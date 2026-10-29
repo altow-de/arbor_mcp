@@ -90,14 +90,17 @@ defmodule Arbor.MCP.Reliability.CircuitBreaker do
   def report(server, result), do: GenServer.cast(server, {:report, {:ok, result}})
 
   @doc false
-  # Admission for an operation the calling process runs and settles later
-  # with settle/3, such as an HTTP POST from its own task, which may be
-  # killed before it can report. The breaker monitors the holder, and an
-  # admission it never settles is settled when it goes down: as a failure,
-  # unless it exited normally.
-  @spec hold(GenServer.server()) :: :ok | {:error, :circuit_open | :circuit_breaker_unavailable}
-  def hold(server) do
-    GenServer.call(server, :hold, 5000)
+  # Admission for an operation `holder` (the calling process by default)
+  # runs and settles later with settle/3, such as an HTTP POST from its own
+  # task, which may be killed before it can report. The breaker monitors the
+  # holder, and an admission it never settles is settled when it goes down:
+  # as a failure, unless it exited normally. Taking it for another process
+  # lets the process that starts the operation admit it before anything else
+  # can settle it.
+  @spec hold(GenServer.server(), pid()) ::
+          :ok | {:error, :circuit_open | :circuit_breaker_unavailable}
+  def hold(server, holder \\ self()) when is_pid(holder) do
+    GenServer.call(server, {:hold, holder}, 5000)
   catch
     :exit, _reason -> {:error, :circuit_breaker_unavailable}
   end
@@ -270,7 +273,7 @@ defmodule Arbor.MCP.Reliability.CircuitBreaker do
     end
   end
 
-  def handle_call(:hold, {holder, _tag}, state) do
+  def handle_call({:hold, holder}, _from, state) do
     {allowed, updated_cb} = Core.allow_request_with_state?(state.circuit_breaker, now_ms())
     state = %{state | circuit_breaker: updated_cb}
 

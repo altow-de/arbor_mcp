@@ -485,13 +485,18 @@ defmodule Arbor.MCP.Transport.HTTP do
     # exit-trapping client's {:EXIT, ...} transport handling is untouched.
     {task_pid, task_ref} =
       ConnectionScope.spawn_monitor(fn ->
-        receive do
-          {^nonce, :run} -> :ok
-        after
-          1_000 -> exit(:client_generation_retired)
-        end
+        admission =
+          receive do
+            {^nonce, :run, admission} ->
+              admission
+          after
+            1_000 ->
+              # Never told to run, so nothing was sent: free any admission.
+              release_post(request_state)
+              exit(:client_generation_retired)
+          end
 
-        {result, sent_state} = admitted_async(message, request_state, parent)
+        {result, sent_state} = admitted_async(message, request_state, parent, admission)
 
         # Report the durable transport-state fields this POST changed
         # (session rotation, SSE metadata) so the client can merge them into
@@ -510,9 +515,15 @@ defmodule Arbor.MCP.Transport.HTTP do
         Lifetime.deliver(parent, {:async_post_result, result, meta})
       end)
 
+    # The task's breaker admission is taken here, before the task registers:
+    # once the client knows the task, it may settle that admission (at its
+    # caller's exit, say), and a settle that came before the task took it
+    # would be lost, leaving the task's own result to count.
+    admission = hold_post(request_state, task_pid)
+
     # Let the client associate the monitored task with the request it serves.
     Lifetime.deliver(parent, {:async_post_task, task_ref, task_pid, request_id})
-    send(task_pid, {nonce, :run})
+    send(task_pid, {nonce, :run, admission})
 
     # Return without response data — it will arrive via :async_post_result
     # or via the GET SSE stream (for SSE-formatted POST responses). The
@@ -529,23 +540,29 @@ defmodule Arbor.MCP.Transport.HTTP do
   end
 
   # The breaker (see attach_reliability/2) admits the POST before it is sent
-  # and settles the admission with how it ended, a re-send after
-  # authenticating included: a definitive refusal ({:auth_refused, _}) counts
-  # as a failure, as any other failed request does.
-  defp admitted_async(message, %{reliability: nil} = state, parent),
+  # (hold_post/2) and settles the admission with how it ended, a re-send
+  # after authenticating included: a definitive refusal ({:auth_refused, _})
+  # counts as a failure, as any other failed request does.
+  defp hold_post(%{reliability: nil}, _task), do: :ok
+
+  defp hold_post(%{reliability: reliability}, task),
+    do: ReliabilityWrapper.hold(reliability, task)
+
+  defp release_post(%{reliability: nil}), do: :ok
+
+  defp release_post(%{reliability: reliability}),
+    do: ReliabilityWrapper.settle(reliability, self(), :release)
+
+  defp admitted_async(message, %{reliability: nil} = state, parent, _admission),
     do: perform_async(message, state, parent)
 
-  defp admitted_async(message, %{reliability: reliability} = state, parent) do
-    case ReliabilityWrapper.hold(reliability) do
-      :ok ->
-        {result, sent_state} = perform_async(message, state, parent)
-        ReliabilityWrapper.settle(reliability, self(), {:result, result})
-        {result, sent_state}
-
-      {:error, reason} ->
-        {{:error, reason}, state}
-    end
+  defp admitted_async(message, %{reliability: reliability} = state, parent, :ok) do
+    {result, sent_state} = perform_async(message, state, parent)
+    ReliabilityWrapper.settle(reliability, self(), {:result, result})
+    {result, sent_state}
   end
+
+  defp admitted_async(_message, state, _parent, {:error, reason}), do: {{:error, reason}, state}
 
   @doc false
   # Settles the breaker admission of a POST task the client is about to stop
@@ -1618,9 +1635,14 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
+  # The components attached here stop within this close's cleanup deadline,
+  # handed to the wrapper with them.
   @impl true
-  def close(%__MODULE__{reliability: %ReliabilityWrapper{} = reliability} = state),
-    do: ReliabilityWrapper.close(%{reliability | wrapped_state: %{state | reliability: nil}})
+  def close(%__MODULE__{reliability: %ReliabilityWrapper{} = reliability} = state) do
+    deadline = state.deadline || Deadline.after_ms(Deadline.cleanup_timeout())
+    state = %{put_deadline(state, deadline) | reliability: nil}
+    ReliabilityWrapper.close(%{reliability | deadline: deadline, wrapped_state: state})
+  end
 
   def close(%__MODULE__{} = state) do
     :telemetry.execute([:arbor_mcp, :transport, :connection, :closed], %{}, %{

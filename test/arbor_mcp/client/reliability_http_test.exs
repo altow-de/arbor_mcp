@@ -250,6 +250,41 @@ defmodule Arbor.MCP.Client.ReliabilityHTTPTest do
     end
   end
 
+  # The client may settle a POST's admission as soon as it knows the task
+  # (at its caller's exit, say), so the admission must be held by then: a
+  # settle that came before the task held it was lost, and the task's own
+  # result counted. A breaker that answers a process's hold of its own only
+  # after the client's settle stands in for a task that runs late.
+  test "a POST task's admission is held before the client knows the task" do
+    bypass = Bypass.open()
+    Bypass.stub(bypass, "POST", "/mcp", &Plug.Conn.resp(&1, 500, "unavailable"))
+
+    {:ok, transport} = HTTP.connect(url: "http://127.0.0.1:#{bypass.port}/mcp", use_sse: false)
+    transport = HTTP.settle_protocol_era(transport, :legacy, "2025-06-18")
+
+    {:ok, wrapper} =
+      ReliabilityWrapper.wrap(HTTP, transport,
+        circuit_breaker: [failure_threshold: 1, reset_timeout: 60_000]
+      )
+
+    breaker = wrapper.circuit_breaker_pid
+    proxy = spawn_link(fn -> late_own_holds(breaker, []) end)
+    transport = HTTP.attach_reliability(transport, %{wrapper | circuit_breaker_pid: proxy})
+
+    request =
+      Jason.encode!(%{"jsonrpc" => "2.0", "id" => 7, "method" => "tools/call", "params" => %{}})
+
+    assert {:ok, _transport} = HTTP.send_async(request, transport)
+    assert_received {:async_post_task, _ref, task, 7}
+
+    # Its caller exited, so the client releases the request's admission.
+    assert :ok = HTTP.settle_post(transport, task, :release)
+    send(proxy, :settled)
+
+    assert_receive {:async_post_result, {:error, _reason}, %{request_id: 7}}, 5_000
+    assert %{total_failures: 0, state: :closed} = CircuitBreaker.get_stats(breaker)
+  end
+
   # The client decides a cancelled request's outcome before it wakes the
   # POST task waiting on its authentication, so the task's own settle, an
   # auth failure from the :stream_retired it is woken with, can't count.
@@ -540,6 +575,40 @@ defmodule Arbor.MCP.Client.ReliabilityHTTPTest do
 
     refute_received :call_posted
   end
+
+  # Forwards calls to `breaker`, keeping back a hold a process takes for
+  # itself until told the client has settled.
+  defp late_own_holds(breaker, kept) do
+    receive do
+      :settled ->
+        Enum.each(kept, &send(breaker, &1))
+        forward_all(breaker)
+
+      {:"$gen_call", {caller, _tag}, request} = call ->
+        if own_hold?(request, caller) do
+          late_own_holds(breaker, kept ++ [call])
+        else
+          send(breaker, call)
+          late_own_holds(breaker, kept)
+        end
+
+      other ->
+        send(breaker, other)
+        late_own_holds(breaker, kept)
+    end
+  end
+
+  defp forward_all(breaker) do
+    receive do
+      message ->
+        send(breaker, message)
+        forward_all(breaker)
+    end
+  end
+
+  defp own_hold?(:hold, _caller), do: true
+  defp own_hold?({:hold, caller}, caller), do: true
+  defp own_hold?(_request, _caller), do: false
 
   defp era(version), do: Arbor.MCP.Internal.VersionRegistry.era_for(version)
 
