@@ -25,7 +25,9 @@ defmodule Arbor.MCP.Server.Dispatch do
 
   Callbacks that `Arbor.MCP.Server.Handler` marks optional are probed with
   `function_exported?/3`; a handler that does not implement one answers
-  `-32601 Method not found`.
+  `-32601 Method not found`, as does the default `use Arbor.MCP.Server.Handler`
+  provides for it. Entries added with `Arbor.MCP.Server.add_tool/3` and its
+  siblings are still listed, read and fetched for such a handler.
   """
 
   require Logger
@@ -51,6 +53,8 @@ defmodule Arbor.MCP.Server.Dispatch do
   alias Arbor.MCP.Server.Runtime.{CallbackContext, Deadline}
   alias Arbor.MCP.Transport.HTTP.ToolHeaders
   alias Arbor.RPC.JSONRPC
+
+  @method_not_found ErrorCodes.method_not_found()
 
   @type handler_state :: term()
   @type result ::
@@ -392,7 +396,14 @@ defmodule Arbor.MCP.Server.Dispatch do
         callback_result(ctx, result, "Read resource error", state, on_ok)
 
       :error ->
-        call(ctx, :handle_read_resource, [uri, state], "Read resource error", state, on_ok: on_ok)
+        ctx
+        |> call(:handle_read_resource, [uri, state], "Read resource error", state, on_ok: on_ok)
+        |> unless_registered(ctx, [:resource, :resource_template], fn ->
+          Error.protocol_error(
+            ErrorCodes.resource_not_found(:modern),
+            "Resource not found: #{uri}"
+          )
+        end)
     end
   end
 
@@ -430,7 +441,11 @@ defmodule Arbor.MCP.Server.Dispatch do
         callback_result(ctx, result, "Get prompt error", state, & &1)
 
       :error ->
-        call(ctx, :handle_get_prompt, [name, arguments, state], "Get prompt error", state)
+        ctx
+        |> call(:handle_get_prompt, [name, arguments, state], "Get prompt error", state)
+        |> unless_registered(ctx, [:prompt], fn ->
+          Error.protocol_error(ErrorCodes.invalid_params(), "Prompt not found: #{name}")
+        end)
     end
   end
 
@@ -618,19 +633,38 @@ defmodule Arbor.MCP.Server.Dispatch do
     end
   end
 
-  # The Handler defaults for lists a handler doesn't serve.
-  @unimplemented_lists [
-    "Resources not implemented",
-    "Resource templates not implemented",
-    "Prompts not implemented"
-  ]
-
-  defp list_error(_ctx, _label, reason, state, unimplemented)
-       when is_function(unimplemented, 1) and reason in @unimplemented_lists,
+  # A list the handler doesn't serve: the Handler defaults answer -32601, and
+  # so may the handler itself.
+  defp list_error(
+         _ctx,
+         _label,
+         %Error.ProtocolError{code: @method_not_found},
+         state,
+         unimplemented
+       )
+       when is_function(unimplemented, 1),
        do: unimplemented.(state)
 
   defp list_error(ctx, label, reason, state, _unimplemented),
     do: {:response, error_response(ctx.id, label, reason), state}
+
+  # resources/read and prompts/get for a name the registry doesn't hold. When
+  # the handler doesn't serve the method but the registry holds entries of
+  # its kind, the server does serve it, so the name is not found.
+  defp unless_registered(
+         {:response, %{"error" => %{"code" => @method_not_found}}, state} = result,
+         ctx,
+         kinds,
+         not_found
+       ) do
+    registry = Registry.current()
+
+    if Enum.any?(kinds, &Registry.any?(registry, &1)),
+      do: {:response, JSONRPC.error(ctx.id, Error.to_json_rpc(not_found.())), state},
+      else: result
+  end
+
+  defp unless_registered(result, _ctx, _kinds, _not_found), do: result
 
   defp cursor(ctx), do: Map.get(ctx.params, "cursor")
 

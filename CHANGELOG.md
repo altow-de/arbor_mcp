@@ -164,6 +164,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JWE, derives shared secrets or exports password-encrypted keys, and MRTR
   request state is sealed with `:crypto` directly and checks the tag length.
   The floor keeps applications' dependency graphs off the affected releases.
+- **BREAKING:** the default callbacks of `use Arbor.MCP.Server.Handler` now
+  answer a method the handler doesn't serve with JSON-RPC `-32601` (Method
+  not found), as the MCP schema asks for a method behind a capability the
+  server did not advertise (#180). They returned plain strings such as
+  `"Resources not implemented"`, which went out as `-32000` and HTTP 200, so
+  clients and gateways could not tell an unsupported method from a server
+  failure, and the `Dispatch` promise of `-32601` never held. This covers
+  `resources/list`, `resources/templates/list`, `resources/read`,
+  `resources/subscribe`, `resources/unsubscribe`, `prompts/list`,
+  `prompts/get`, `completion/complete`, `roots/list` and the `tasks/*`
+  methods without `tasks: :store` (and legacy-era task requests with it), as
+  well as the `handle_create_message/2` default. Over modern (2026-07-28)
+  Streamable HTTP the error goes out with HTTP `404`, as the transport
+  specification requires and as for an unknown method; legacy HTTP keeps
+  `200`. `resources/read` and `prompts/get` had answered "Resource not found"
+  and "Prompt not found" (`-32602`); they still do for a name that none of
+  the entries added with `Arbor.MCP.Server.add_resource/3`,
+  `add_resource_template/3` or `add_prompt/3` has, and registered entries are
+  still listed. A callback that calls `super` now gets an
+  `Arbor.MCP.Error.ProtocolError` with code `-32601` instead of a string. A
+  method whose capability the server doesn't advertise is still dispatched,
+  so a handler that serves one without advertising it keeps working.
 
 ### Fixed
 

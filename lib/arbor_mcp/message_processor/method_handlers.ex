@@ -640,9 +640,18 @@ defmodule Arbor.MCP.MessageProcessor.MethodHandlers do
   # instead of `inspect(reason)` output (audit M12).
   defp put_error(conn, _message, %Error.ProtocolError{} = error, id) do
     conn =
-      if error.code == ErrorCodes.missing_required_client_capability(),
-        do: Conn.assign(conn, :http_status, 400),
-        else: conn
+      cond do
+        error.code == ErrorCodes.missing_required_client_capability() ->
+          Conn.assign(conn, :http_status, 400)
+
+        # A method the handler doesn't serve, such as a Handler default's
+        # answer, is a modern 404 like an unknown method.
+        error.code == ErrorCodes.method_not_found() ->
+          put_method_not_found_status(conn)
+
+        true ->
+          conn
+      end
 
     %{conn | response: JSONRPC.error(id, Error.to_json_rpc(error))}
   end
@@ -657,15 +666,14 @@ defmodule Arbor.MCP.MessageProcessor.MethodHandlers do
   end
 
   defp put_method_not_found(conn, id) do
-    conn =
-      case conn.assigns do
-        %{request_context: %{era: :modern}} ->
-          Conn.assign(conn, :http_status, 404)
-
-        _legacy_or_unscoped ->
-          conn
-      end
-
+    conn = put_method_not_found_status(conn)
     %{conn | response: JSONRPC.error(id, -32601, "Method not found")}
+  end
+
+  defp put_method_not_found_status(conn) do
+    case conn.assigns do
+      %{request_context: %{era: :modern}} -> Conn.assign(conn, :http_status, 404)
+      _legacy_or_unscoped -> conn
+    end
   end
 end
