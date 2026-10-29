@@ -128,6 +128,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them itself, within what is left of its cleanup budget, after the
   transport's close, so a close it cuts off (a stalled session DELETE, a
   stuck stdio server, a busy health check) no longer leaves them running.
+- An elicitation whose validation ran out of time was reported as invalid
+  params. On a busy server, a handler that returned a valid elicitation in an
+  `input_required` result could make the client get `-32602 "Invalid MRTR
+  input request"`, with nothing to say it was a timeout. That validation now
+  gets at most 1 s and never more than the request itself has left, rather
+  than a fresh second. Running out of time is now an internal error
+  (`-32603 "MRTR input request validation timed out"`, data `type`
+  `"elicitation_validation_timeout"` with the `inputRequestId` and `method`).
+  The same applies on the legacy bridge. `Arbor.MCP.Server.elicit/3`, over
+  HTTP and over the handler server, now returns `{:error, :timeout}` for it,
+  as it does when the client is too slow. Params that break the
+  ElicitRequest schema are still `-32602` and
+  `{:error, :invalid_elicitation_params}`. Reported by
+  arnavsharma2077-a11y.
+- A client that stopped because the process that started it exited could
+  skip closing its transport, log a Task crash
+  (`** (stop) :client_generation_retired`) and report
+  `{:error, :client_cleanup_timeout}` as its cleanup result. Its lifetime
+  observer sees the parent's exit too and retires the client's work, and it
+  also cleared the reservation of the worker the client closes its
+  transport from, or killed that worker while it ran. The client's own
+  cleanup worker now survives that, and the client still bounds it by its
+  cleanup deadline, so the transport closes (a stdio server is stopped, an
+  HTTP stream ended) before the client goes, in the same order as before.
+- A `:cache_hints` entry for `server/discover` had no effect: discovery
+  filled in its own `ttlMs` of one hour and `cacheScope` `"public"`, and a
+  result's own fields win over a hint, so a server could not keep a discovery
+  result that differs by caller, its instructions for example, out of shared
+  caches. The hint now sets both; without one, discovery keeps its defaults.
 - `Accept: application/json, text/event-stream;q` — a `q` parameter with no
   value — and `q =1` / `q= 1`, whose whitespace around the equals sign
   violates the weight grammar (RFC 9110 section 12.4.2: optional whitespace
