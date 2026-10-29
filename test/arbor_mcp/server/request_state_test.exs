@@ -51,6 +51,32 @@ defmodule Arbor.MCP.Server.RequestStateTest do
              RequestState.unseal(token, context, params(), %{"other" => %{}}, opts)
   end
 
+  test "leaves the progress token out of the binding and keeps the rest of _meta in it" do
+    without_meta = Map.delete(params(), "_meta")
+
+    same = [
+      {put_in(params(), ["_meta", "progressToken"], 1),
+       put_in(params(), ["_meta", "progressToken"], 2)},
+      {put_in(params(), ["_meta", "progressToken"], "a"), params()},
+      {Map.put(without_meta, "_meta", %{"progressToken" => 1}), without_meta},
+      {Map.put(without_meta, :_meta, %{progressToken: "a"}), without_meta},
+      {Map.put(without_meta, "_meta", %{}), without_meta},
+      # A handler server copies _meta into the arguments.
+      {put_in(params(), ["arguments", "_meta"], %{"progressToken" => 1, "trace" => "t-1"}),
+       put_in(params(), ["arguments", "_meta"], %{"progressToken" => 2, "trace" => "t-1"})}
+    ]
+
+    for {left, right} <- same do
+      assert binding_of(left) == binding_of(right)
+    end
+
+    other_meta = put_in(params(), ["_meta", "example.com/trace"], "t-2")
+    refute binding_of(other_meta) == binding_of(params())
+
+    refute binding_of(put_in(params(), ["arguments", "_meta"], %{"trace" => "t-1"})) ==
+             binding_of(put_in(params(), ["arguments", "_meta"], %{"trace" => "t-2"}))
+  end
+
   test "supports decrypt-only rotation keys and expiry" do
     old_opts = options(now: 1_000)
     assert {:ok, binding} = RequestState.binding(context(), params(), [], 1, old_opts)
@@ -163,6 +189,13 @@ defmodule Arbor.MCP.Server.RequestStateTest do
         request_state: [active_key_id: "bad", keys: %{"bad" => "too short"}]
       )
     end
+  end
+
+  defp binding_of(params) do
+    assert {:ok, binding} =
+             RequestState.binding(context(), params, ["answer"], 1, options(now: 1_000))
+
+    binding
   end
 
   defp context do

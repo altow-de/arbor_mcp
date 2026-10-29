@@ -104,6 +104,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An MRTR retry with a new `_meta.progressToken` failed with `-32602` and
+  `request_state_binding_mismatch`, because the `requestState` binding
+  covered all of `_meta`. Every round is a new request with its own JSON-RPC
+  id, and a client may give each one its own progress token: the TypeScript
+  SDK sends the request id as the token whenever a request has a progress
+  handler, so its retries were refused. The binding now leaves
+  `progressToken` out of `_meta`, and out of the copy of `_meta` a handler
+  server puts into the arguments, and binds an `_meta` that held only the
+  token like a missing one. The arguments and the rest of `_meta` stay bound.
 - `Accept: application/json, text/event-stream;q` — a `q` parameter with no
   value — and `q =1` / `q= 1`, whose whitespace around the equals sign
   violates the weight grammar (RFC 9110 section 12.4.2: optional whitespace

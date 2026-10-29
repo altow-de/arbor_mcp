@@ -1310,10 +1310,14 @@ server-to-client requests and calls the callback again with the answers.
 Every round of one call carries the same request apart from
 `input_responses:` and `request_state:`: the same arguments,
 `client_capabilities:`, `:meta` and `:progress_token`. An arbor_mcp server
-binds its `requestState` to the request's params, `_meta` included, and to
-the capabilities the request declared, and rejects a round that differs with
-`-32602` and the reason `request_state_binding_mismatch`. A gateway that sets
-its own upstream progress token therefore keeps it for all rounds of the call.
+binds its `requestState` to the request's params, `_meta` included apart from
+its `progressToken`, and to the capabilities the request declared, and
+rejects a round that differs with `-32602` and the reason
+`request_state_binding_mismatch`. The progress token stays out because every
+round is a new request and a client may give each one its own token, as the
+TypeScript SDK does. Another server may bind all of `_meta`, so a gateway that
+sets its own upstream progress token still keeps it for all rounds of the
+call.
 `mrtr: :manual` with `reset_timeout_on_progress: true` needs a
 `:progress_token` (or `"progressToken"` in `:meta`), and returns a
 `ValidationError` without one: the token the client would add differs on

@@ -377,14 +377,17 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
       end
 
       # An arbor_mcp server binds requestState to the request's params, _meta
-      # included, and to the capabilities it declared.
-      test "every round repeats the arguments, capabilities and progress token",
+      # included apart from its progress token, and to the capabilities it
+      # declared. Every round is a new request, and a client may give each
+      # one its own progress token, as the TypeScript SDK does.
+      test "every round repeats the arguments, capabilities and _meta, not the progress token",
            %{transport: transport} do
         client = connect(transport)
 
         round = [
           mrtr: :manual,
           client_capabilities: @form,
+          meta: %{"example.com/trace" => "t-1"},
           progress_token: "upstream-1",
           format: :map
         ]
@@ -396,7 +399,7 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
 
         for {arguments, changed} <- [
               {%{"topic" => "other"}, retry},
-              {%{"topic" => "intro"}, Keyword.put(retry, :progress_token, "upstream-2")},
+              {%{"topic" => "intro"}, Keyword.put(retry, :meta, %{"example.com/trace" => "t-2"})},
               {%{"topic" => "intro"},
                Keyword.put(retry, :client_capabilities, Map.put(@form, "roots", %{}))}
             ] do
@@ -408,7 +411,12 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
         refute_received {:app_retry, _responses, _state}
 
         assert {:ok, %{"content" => [%{"text" => "Welcome, Tom"}]}} =
-                 Client.call_tool(client, "ask", %{"topic" => "intro"}, retry)
+                 Client.call_tool(
+                   client,
+                   "ask",
+                   %{"topic" => "intro"},
+                   Keyword.put(retry, :progress_token, "upstream-2")
+                 )
       end
 
       test "automatic MRTR is unchanged", %{transport: transport} do

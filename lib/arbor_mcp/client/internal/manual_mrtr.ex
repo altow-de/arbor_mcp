@@ -154,8 +154,9 @@ defmodule Arbor.MCP.Client.Internal.ManualMRTR do
   defp needs_manual?(_continuation, _method), do: true
 
   # The token the client adds for reset_timeout_on_progress differs on every
-  # round, and a server that binds requestState to `_meta`, as arbor_mcp does,
-  # rejects the next round.
+  # round, and a server that binds requestState to all of `_meta` rejects the
+  # next round. arbor_mcp leaves the token out of its binding; another server
+  # may not.
   defp require_progress_token(method, params, opts) do
     if manual?(opts) and method in @mrtr_methods and
          Keyword.get(opts, :reset_timeout_on_progress) == true and not progress_token?(params) do

@@ -115,16 +115,40 @@ defmodule Arbor.MCP.Server.RequestState do
   defp immutable_params(params) do
     params = Map.drop(params, ["inputResponses", "requestState", :inputResponses, :requestState])
 
-    Enum.reduce(["arguments", :arguments], params, fn key, acc ->
+    params =
+      Enum.reduce(["arguments", :arguments], params, fn key, acc ->
+        case Map.get(acc, key) do
+          arguments when is_map(arguments) ->
+            arguments = Map.drop(arguments, ["_request_id", :_request_id])
+            Map.put(acc, key, without_progress_token(arguments))
+
+          _other ->
+            acc
+        end
+      end)
+
+    without_progress_token(params)
+  end
+
+  # Every round of a call is a new request with its own JSON-RPC id, and a
+  # client may give each one a new progress token: the TypeScript SDK sends
+  # the request id as the token. So the token stays out of the binding, in
+  # `_meta` and in the copy of `_meta` a handler server puts into the
+  # arguments. An `_meta` that held nothing else binds like a missing one.
+  defp without_progress_token(map) do
+    Enum.reduce(["_meta", :_meta], map, fn key, acc ->
       case Map.get(acc, key) do
-        arguments when is_map(arguments) ->
-          Map.put(acc, key, Map.drop(arguments, ["_request_id", :_request_id]))
+        meta when is_map(meta) ->
+          put_meta(acc, key, Map.drop(meta, ["progressToken", :progressToken]))
 
         _other ->
           acc
       end
     end)
   end
+
+  defp put_meta(map, key, meta) when map_size(meta) == 0, do: Map.delete(map, key)
+  defp put_meta(map, key, meta), do: Map.put(map, key, meta)
 
   @doc false
   @spec canonical_json(term()) :: {:ok, binary()} | {:error, :not_json}

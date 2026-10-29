@@ -258,8 +258,10 @@ that deliberately disables these bindings.
 Modern multi-round requests use an ArborMCP-owned, versioned AES-256-GCM envelope.
 The authenticated payload binds the immutable request digest, expected input
 IDs, round, protocol version, endpoint, capability fingerprint, principal, and
-tenant. It contains only bounded JSON application state—never bearer tokens or
-runtime secrets.
+tenant. The digest covers the request params without `inputResponses`,
+`requestState`, the argument `_request_id` and `_meta.progressToken`, which
+change from round to round. It contains only bounded JSON application
+state—never bearer tokens or runtime secrets.
 
 Load the 32-byte key ring at runtime and retain decrypt-only old keys for at
 least the maximum token TTL plus clock skew. `active_key_id` selects the only
