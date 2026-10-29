@@ -109,6 +109,13 @@ tool "add", "Adds two numbers" do
 end
 ```
 
+A module with tools also gets `handle_get_tool/2`, which returns a declared
+tool's definition by name and `nil` for any other name. A modern `tools/call`
+over HTTP checks its `Mcp-Param-*` headers against that definition, so the
+server doesn't page through `tools/list` for it, even with `page_size:`. A
+module that defines `handle_get_tool/2` itself keeps its own. See
+`c:Arbor.MCP.Server.Handler.handle_get_tool/2`.
+
 ### Param types
 
 | DSL type | JSON Schema |

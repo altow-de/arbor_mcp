@@ -1722,6 +1722,35 @@ end
 Result normalization repeats this validation as a defensive boundary, but it
 cannot correct a handler-owned cursor calculated from invalid definitions.
 
+To check a `tools/call`, the server needs the called tool's definition, even
+when the request has no `Mcp-Param-*` header, because a missing header is
+rejected too. Tools added with `Arbor.MCP.Server.add_tool/3` carry their own.
+For the others it calls the handler's `handle_get_tool/2` when the handler
+defines it. Otherwise it calls `handle_list_tools/2` from the first page and
+follows the cursors until the tool turns up, on every call and within the
+request's deadline. A list that is dynamic or costly to build, as in a
+gateway that asks upstream servers, should define the lookup:
+
+```elixir
+@impl true
+def handle_get_tool(name, state) do
+  # The definition as handle_list_tools/2 lists it, or nil if unknown here.
+  {:ok, MyApp.Gateway.tool_definition(name), state}
+end
+```
+
+`nil` means the callback doesn't know the tool, and the server then walks the
+list as before, so the check is never skipped. An `{:error, reason, state}`,
+an invalid reply, or a definition with another `name` fails the request with
+`-32020` "Tool schema unavailable", as a failed list page does; a raise or a
+timeout ends the request as it would during the walk. The DSL defines
+`handle_get_tool/2` for its declared tools. During the walk,
+`handle_list_tools/2` runs in the `tools/call` request's context, so
+`Arbor.MCP.Server.Context.current().method` is `"tools/call"` there and
+`"tools/list"` when a client lists. A list that leaves the tool out for
+`"tools/call"` makes the server skip the check; define `handle_get_tool/2`
+instead.
+
 The server validates standard and annotated headers against the body before
 tool dispatch. Custom raw `Mcp-Method`, `Mcp-Name`, `Mcp-Session-Id`,
 `Last-Event-ID`, and `Mcp-Param-*` values supplied through the client's
