@@ -950,6 +950,26 @@ defmodule Arbor.MCP.Client.RequestHandler do
   end
 
   @doc false
+  # Settles the circuit-breaker admissions of the POST tasks serving
+  # `request_id` (see HTTP.attach_reliability/2) without stopping them, in any
+  # era: the outcome the client decided (:failure at its timeout, :release at
+  # a cancellation or its caller's exit) wins over whatever a task would
+  # settle later, a late response or an auth wait the client woke included.
+  @spec settle_posts(map(), term(), :failure | :release) :: map()
+  def settle_posts(
+        %{transport_mod: HTTP, transport_state: %HTTP{} = transport} = state,
+        request_id,
+        outcome
+      ) do
+    for {_monitor, {pid, ^request_id}} <- state.async_post_tasks || %{},
+        do: HTTP.settle_post(transport, pid, outcome)
+
+    state
+  end
+
+  def settle_posts(state, _request_id, _outcome), do: state
+
+  @doc false
   # `outcome` settles a stopped POST task's circuit-breaker admission (see
   # HTTP.attach_reliability/2): `:failure` when the caller timed out,
   # `:release` when it cancelled.

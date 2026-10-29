@@ -114,16 +114,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps the circuit breaker and health check itself, so each request after
   establishment POSTs from its own task as without `reliability:`, with the
   same cancellation and authentication. The breaker admits every POST and
-  settles each admission once: with the POST's result, as a failure when
-  the task crashes or the client stops it at a timeout, and released, not
-  counted, when the caller cancels. A request re-sent after authenticating
+  settles each admission once, with the POST's result unless the client
+  decides first: as a failure when the task crashes or the client's timeout
+  abandons the POST, in either era, so a late response doesn't count, and
+  released, not counted, when the caller cancels or exits, even while the
+  POST waits on authentication. A request re-sent after authenticating
   settles with the re-send's result, and a definitive refusal counts as a
   failure, so repeated failed authentication opens the circuit. A request
-  stream is admitted but its outcome isn't
-  recorded. Its `:timeout` doesn't apply over HTTP, where each exchange
-  keeps its own deadline. The breaker and health check now stop before the
-  transport closes, so a close the client cuts off (a stalled session
-  DELETE, a stuck stdio server) no longer leaves them running.
+  stream is admitted but its outcome isn't recorded. Its `:timeout` doesn't
+  apply over HTTP, where each exchange keeps its own deadline. The breaker
+  and health check now stop before the transport closes, within half of the
+  client's cleanup budget, so a close the client cuts off (a stalled session
+  DELETE, a stuck stdio server) no longer leaves them running, and the close
+  is still attempted. `Arbor.MCP.Reliability.HealthCheck` runs each check in
+  a task of its own, so `get_status/1` and a stop no longer wait for a check
+  in progress, and `check_now/1` during a check joins it.
 - Probe and handshake receive failures retain refreshed authentication state
   during fallback and cleanup. Synchronous HTTP state-bearing failures stay
   internal; public transport `send_message/2` errors remain `{:error, reason}`.

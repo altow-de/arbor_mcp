@@ -223,6 +223,50 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapperTest do
       assert :ok = Task.await(closer)
     end
 
+    # A health check waiting on its target held the checker's loop, so
+    # close/1 waited out its stop and killed it, and the kill took down the
+    # process that wrapped the transport when another one closed it.
+    test "close stops a checker mid-check gracefully, sparing the wrapper's owner" do
+      defmodule ClosingTransport do
+        @behaviour Arbor.MCP.Transport
+
+        def connect(opts), do: {:ok, %{test: opts[:test]}}
+        def send_message(_message, state), do: {:ok, state}
+        def receive_message(state), do: {:ok, "message", state}
+        def connected?(_state), do: true
+
+        def close(state) do
+          send(state.test, :transport_closed)
+          :ok
+        end
+      end
+
+      test_pid = self()
+      {:ok, transport_state} = ClosingTransport.connect(test: test_pid)
+
+      {:ok, wrapped} =
+        ReliabilityWrapper.wrap(ClosingTransport, transport_state,
+          health_check: [
+            check_interval: 60_000,
+            timeout: 30_000,
+            check_fn: fn _target ->
+              send(test_pid, {:checking, self()})
+              receive do: (:never -> {:ok, %{}})
+            end
+          ]
+        )
+
+      assert_receive {:checking, check}, 3_000
+      checker_ref = Process.monitor(wrapped.health_check_pid)
+      check_ref = Process.monitor(check)
+
+      # Closed from a process other than the checker's linker (this one).
+      assert :ok = Task.await(Task.async(fn -> ReliabilityWrapper.close(wrapped) end))
+      assert_received :transport_closed
+      assert_receive {:DOWN, ^checker_ref, :process, _checker, :normal}
+      assert_receive {:DOWN, ^check_ref, :process, ^check, _reason}
+    end
+
     test "keeps a synchronous send's response apart from its state" do
       defmodule SyncTransport do
         @behaviour Arbor.MCP.Transport

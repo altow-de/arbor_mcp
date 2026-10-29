@@ -52,12 +52,16 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
 
   @behaviour Arbor.MCP.Transport
 
+  alias Arbor.MCP.Client.Deadline
   alias Arbor.MCP.Reliability.{CircuitBreaker, HealthCheck}
 
   require Logger
 
   # How much longer than a receive's own timeout the circuit breaker waits.
   @receive_slack_ms 500
+
+  # The longest close/1 waits for its components to stop.
+  @component_stop_ms 500
 
   defstruct [
     :wrapped_module,
@@ -222,8 +226,16 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
     # The components stop first: the transport's close can take until its
     # caller's cleanup deadline (a stuck stdio server, an HTTP session DELETE
     # that stalls), and a caller that then kills it must not leave them
-    # running. The transport cleanup is still always attempted.
-    components = Enum.map([state.circuit_breaker_pid, state.health_check_pid], &stop_component/1)
+    # running. Neither runs work in its own loop (a health check runs in a
+    # task of the checker's), so a stop is prompt even mid-check; a component
+    # that still doesn't stop is killed. Together they get at most half of the
+    # caller's remaining cleanup budget, so the transport's close (a stdio
+    # server's stop, an HTTP session DELETE) is always attempted within it.
+    deadline = component_deadline(state)
+
+    components =
+      Enum.map([state.circuit_breaker_pid, state.health_check_pid], &stop_component(&1, deadline))
+
     result = close_wrapped(state)
 
     # A component that would not stop is the wrapper's own failure, not the
@@ -240,6 +252,16 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
     end
   end
 
+  defp component_deadline(state) do
+    budget =
+      case Deadline.on_transport(state.wrapped_module, state.wrapped_state) do
+        nil -> @component_stop_ms
+        deadline -> min(@component_stop_ms, div(Deadline.remaining(deadline), 2))
+      end
+
+    Deadline.after_ms(budget)
+  end
+
   defp close_wrapped(state) do
     case state.wrapped_module.close(state.wrapped_state) do
       :ok -> :ok
@@ -252,16 +274,18 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
     kind, reason -> {:error, {:cleanup_failure, kind, reason}}
   end
 
-  defp stop_component(nil), do: :ok
+  defp stop_component(nil, _deadline), do: :ok
 
-  defp stop_component(pid) do
-    GenServer.stop(pid, :normal, 500)
+  defp stop_component(pid, deadline) do
+    GenServer.stop(pid, :normal, Deadline.remaining(deadline))
   catch
     :exit, {:noproc, _call} -> :ok
-    :exit, _reason -> kill_component(pid)
+    :exit, _reason -> kill_component(pid, deadline)
   end
 
-  defp kill_component(pid) do
+  # A killed component's linker gets its :killed exit, unless it is the
+  # caller; the client, which closes from a worker, retires those links first.
+  defp kill_component(pid, deadline) do
     monitor = Process.monitor(pid)
     Process.unlink(pid)
     Process.exit(pid, :kill)
@@ -269,7 +293,7 @@ defmodule Arbor.MCP.Transport.ReliabilityWrapper do
     receive do
       {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
     after
-      500 ->
+      Deadline.remaining(deadline) ->
         Process.demonitor(monitor, [:flush])
         {:error, :reliability_cleanup_timeout}
     end

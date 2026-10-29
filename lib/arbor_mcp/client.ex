@@ -2921,7 +2921,11 @@ defmodule Arbor.MCP.Client do
   # Modern streamable HTTP cancels an ordinary request by closing only that
   # request's connection. Other transports send the protocol cancellation
   # notification.
+  # `outcome` settles the request's breaker admissions first, before an auth
+  # wait is woken or a POST stopped, so the client decides it once:
+  # :failure at its timeout, :release at a cancellation or a caller's exit.
   defp cancel_on_wire(request_id, method, params, state, outcome \\ :release) do
+    state = RequestHandler.settle_posts(state, request_id, outcome)
     state = HTTPAuth.cancel_request(state, request_id)
 
     case state do
@@ -2946,15 +2950,18 @@ defmodule Arbor.MCP.Client do
   # The spec asks a sender to cancel a request it stops waiting for, so the
   # server can stop the work; servers no longer cut it off after 10 s.
   defp cancel_timed_out(request_id, state),
-    do: cancel_upstream(request_id, "Request timed out", state)
+    do: cancel_upstream(request_id, "Request timed out", state, :failure)
 
-  defp cancel_upstream(request_id, reason, state) do
+  # `outcome` is the breaker's (see cancel_on_wire/5): a timeout is a
+  # failure, a caller's exit a release.
+  defp cancel_upstream(request_id, reason, state, outcome) do
     case Protocol.encode_cancelled(request_id, reason) do
       {:ok, %{"method" => method, "params" => params}} ->
-        cancel_on_wire(request_id, method, params, state, :failure)
+        cancel_on_wire(request_id, method, params, state, outcome)
 
       {:error, :cannot_cancel_initialize} ->
-        RequestHandler.close_request_stream(request_id, state, :failure)
+        state = RequestHandler.settle_posts(state, request_id, outcome)
+        RequestHandler.close_request_stream(request_id, state, outcome)
     end
   end
 
@@ -2984,7 +2991,7 @@ defmodule Arbor.MCP.Client do
       %{method: method, request_id: request_id}
     )
 
-    state = cancel_upstream(request_id, "Caller exited", state)
+    state = cancel_upstream(request_id, "Caller exited", state, :release)
     prune_legacy_posts(RequestHandler.drop_pending(state, request_id))
   end
 

@@ -41,6 +41,8 @@ end
 defmodule Arbor.MCP.Reliability.HealthCheckTest do
   use ExUnit.Case, async: true
 
+  import Arbor.MCP.TestHelpers, only: [wait_until: 2]
+
   alias Arbor.MCP.Reliability.HealthCheck
 
   setup do
@@ -409,6 +411,78 @@ defmodule Arbor.MCP.Reliability.HealthCheckTest do
       assert result.status == :healthy
       assert result.details.tool_count == 2
     end
+  end
+
+  # A check runs in a task of the checker's, never in its loop: a check
+  # waiting on its target used to hold get_status/1 and a stop (a closing
+  # transport's) for the check's whole timeout.
+  describe "a check in progress" do
+    setup context do
+      test_pid = self()
+
+      check_fn = fn _target ->
+        send(test_pid, {:checking, self()})
+
+        receive do
+          :finish -> {:ok, %{}}
+        end
+      end
+
+      {:ok, checker} =
+        HealthCheck.start_link(
+          name: context.checker_name,
+          target: self(),
+          check_fn: check_fn,
+          check_interval: 60_000,
+          timeout: 30_000
+        )
+
+      {:ok, checker: checker}
+    end
+
+    test "doesn't hold the checker's answers, and joins a check asked for", %{checker: checker} do
+      asker = Task.async(fn -> HealthCheck.check_now(checker) end)
+      assert_receive {:checking, check}
+
+      assert {:unknown, _info} = HealthCheck.get_status(checker)
+      joined = Task.async(fn -> HealthCheck.check_now(checker) end)
+      wait_until(fn -> length(:sys.get_state(checker).check.waiters) == 2 end, timeout: 2_000)
+      refute_received {:checking, _another}
+
+      send(check, :finish)
+      assert %{status: :healthy} = result = Task.await(asker)
+      assert ^result = Task.await(joined)
+      assert [^result] = HealthCheck.get_history(checker)
+    end
+
+    test "is taken down by a stop, which doesn't wait for it", %{checker: checker} do
+      _asker = spawn(fn -> HealthCheck.check_now(checker) end)
+      assert_receive {:checking, check}
+      check_ref = Process.monitor(check)
+
+      assert :ok = GenServer.stop(checker, :normal, 1_000)
+      assert_receive {:DOWN, ^check_ref, :process, ^check, :killed}
+    end
+  end
+
+  test "a check that outlives its timeout is unhealthy and stopped", context do
+    test_pid = self()
+
+    {:ok, checker} =
+      HealthCheck.start_link(
+        name: context.checker_name,
+        target: self(),
+        check_fn: fn _target ->
+          send(test_pid, {:checking, self()})
+          receive do: (:never -> {:ok, %{}})
+        end,
+        check_interval: 60_000,
+        timeout: 50
+      )
+
+    assert %{status: :unhealthy, details: %{error: :timeout}} = HealthCheck.check_now(checker)
+    assert_receive {:checking, check}
+    refute Process.alive?(check)
   end
 
   # Helper functions
