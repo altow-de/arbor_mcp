@@ -1135,13 +1135,20 @@ defmodule Arbor.MCP.Client.ProgressToTest do
       assert_receive {:wire, %{"id" => e_id}}
       respond(client, e_id)
       assert {:ok, _result} = Task.await(e)
-      t1 = elem(:sys.get_state(client).progress_sweep, 0)
+      {t1, _at, old_ref} = :sys.get_state(client).progress_sweep
 
-      # Y's late answer is queued first, then T1 fires and queues its sweep.
+      # Queue Y's late answer before T1's message. Cancelling T1 ourselves
+      # makes the client's later cancellation observe an already-ended timer,
+      # as it would after T1 fired, without racing its one-second deadline.
       :ok = :sys.suspend(client)
-      respond_with(client, y_id, input_required_result("rs-y"))
-      :ok = Arbor.MCP.TestHelpers.wait_until(fn -> Process.read_timer(t1) == false end)
-      :ok = :sys.resume(client)
+
+      try do
+        Process.cancel_timer(t1)
+        respond_with(client, y_id, input_required_result("rs-y"))
+        send(client, {:progress_sweep, old_ref})
+      after
+        :ok = :sys.resume(client)
+      end
 
       state = :sys.get_state(client)
       %{"f" => %{until: f_until}} = state.progress_reservations
@@ -1289,7 +1296,16 @@ defmodule Arbor.MCP.Client.ProgressToTest do
   # the same Mix setup as this VM (see ModernStdioTest).
   defp mix_child_env do
     [{"MIX_ENV", "test"}] ++
-      for name <- ["MIX_HOME", "MIX_ARCHIVES", "MIX_DEPS_PATH", "MIX_BUILD_PATH"],
+      for name <- [
+            "MIX_HOME",
+            "MIX_ARCHIVES",
+            "MIX_DEPS_PATH",
+            "MIX_BUILD_PATH",
+            "ARBOR_RPC_PATH",
+            "ARBOR_V2_DEPS",
+            "ARBOR_V2_BUILD",
+            "ARBOR_V2_LOCK"
+          ],
           value = System.get_env(name),
           do: {name, value}
   end

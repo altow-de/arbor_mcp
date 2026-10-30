@@ -164,6 +164,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JWE, derives shared secrets or exports password-encrypted keys, and MRTR
   request state is sealed with `:crypto` directly and checks the tag length.
   The floor keeps applications' dependency graphs off the affected releases.
+- **BREAKING:** a legacy Streamable HTTP request that gets 404 for the
+  client's session now fails with
+  `%Arbor.MCP.Error.TransportError{reason: {:session_expired, {:http_error, 404, body}}}`
+  instead of `reason: {:http_error, 404, body}`, and the client starts a new
+  session (see Fixed). A request still in flight when that happens fails
+  with the same error, and one in flight when the session's reopened GET
+  stream gets 404 fails with `{:session_expired, {:sse_error, {:http_error, 404}}}`
+  instead of a `:connection_error` (`"Transport closed: ..."`). Code that
+  matched `{:http_error, 404, _}` to restart the client can match
+  `{:session_expired, _}`, or drop the workaround. `delivery_outcome/1`
+  still reports `:unknown`: the server answered, and a proxy's 404 looks the
+  same. Modern (2026-07-28) 404s keep their protocol-error handling (see
+  Fixed), and other 404s keep `{:http_error, 404, body}`.
+- A legacy `initialize` that carries a configured `:session_id` and gets 404
+  for it no longer fails the connection. The server has ended that session,
+  so the client sends one more `initialize`, without the id, and starts a new
+  session, as the 2025-03-26 to 2025-11-25 revisions require. That second
+  `initialize` has its own `:handshake_timeout`, but never more than the
+  connection's deadline (`:establish_timeout`) has left, and its failure is
+  reported as before. No later `initialize` in the same connection attempt
+  offers the ended session again, including the one `:prefer_legacy` retries
+  with a revision the modern probe named, so this happens at most once per
+  attempt. `start_link/1` now succeeds where it used to fail with a 404. A reconnect
+  after some other loss whose configured session the server has since ended,
+  which used to fail on every attempt, now connects. Once the configured
+  session has been replaced, later reconnects don't offer it again.
 - **BREAKING:** the default callbacks of `use Arbor.MCP.Server.Handler` now
   answer a method the handler doesn't serve with JSON-RPC `-32601` (Method
   not found), as the MCP schema asks for a method behind a capability the
@@ -596,13 +622,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asynchronous requests that the gateway settles in its own loop. Each
   request's later steps still wait for its own answers, so results, batch
   arrays and errors keep their order.
+- A legacy Streamable HTTP client kept its `Mcp-Session-Id` after the server
+  ended the session, by restarting for example (#181). Every request then got
+  `404 Session not found` and the client stayed `:ready`, even with
+  `reconnect: true`; with the GET stream on, it recovered only once that
+  stream's reopened GET got the 404 too. The 2025-03-26 to 2025-11-25
+  revisions say a client that gets 404 for a request carrying its session id
+  MUST start a new session with an `initialize` that carries none. The
+  request that got the 404, a POST, a notification or the reopened GET, now
+  fails with `{:session_expired, detail}` (see Changed) and is not sent
+  again, since a tool call may not be safe to repeat, and every request still
+  in flight on the session fails with it too. The client then closes the
+  transport as for a lost connection, its `reliability:` components
+  included, and reconnects under `:reconnect_backoff` with an `initialize`
+  that carries no session id, not even a configured `:session_id`. With
+  `reconnect: false` it goes `:disconnected`. Modern (2026-07-28)
+  connections have no session and are unchanged. Reported by Harper04.
 - Over modern (2026-07-28) Streamable HTTP, the client reported a `404`
   that carries a JSON-RPC error for the request, which is how the transport
   says a server doesn't implement a method, as
   `{:error, %Arbor.MCP.Error.TransportError{reason: {:http_error, 404, body}}}`.
   It now returns that JSON-RPC error, as it would from a `200`, on both a
   plain POST and a request stream, and the connection stays `:ready`. Any
-  other `404`, and every legacy one, is still an HTTP error.
+  other modern `404` is still an HTTP error. A legacy session's `404`
+  ends the session as described above, regardless of its body.
 - The deprecated HTTP+SSE GET stream (`legacy_http_sse: true`) sent
   `connection: keep-alive`. HTTP/2 forbids connection-specific header fields
   and its clients treat such a response as malformed (RFC 9113, section

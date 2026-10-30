@@ -75,6 +75,12 @@ defmodule Arbor.MCP.Transport.HTTP do
   Setting `use_sse: false` disables the legacy standalone GET stream. It does
   not disable a modern request-owned SSE response.
 
+  A server that has ended a session answers 404 to a request that carries it.
+  The client then starts a new session with an `initialize` that carries no
+  session id, as the legacy revisions require. When the 404 answers the
+  `initialize` that carried `:session_id`, the client sends that second
+  `initialize` at once. See "Streamable HTTP" in the transport guide.
+
   > #### Security Best Practices {: .warning}
   >
   > 1. **Always use HTTPS** in production
@@ -151,7 +157,11 @@ defmodule Arbor.MCP.Transport.HTTP do
     # The circuit breaker and health check a client's `reliability:` option
     # started, as a ReliabilityWrapper with no wrapped state, or nil (see
     # attach_reliability/2).
-    reliability: nil
+    reliability: nil,
+    # Whether the server answered 404 for the session id this connection was
+    # opened with (a configured `:session_id`): no initialize on this
+    # connection offers it again (see Arbor.MCP.Client.ConnectionManager).
+    configured_session_ended: false
   ]
 
   @type t :: %__MODULE__{
@@ -182,7 +192,8 @@ defmodule Arbor.MCP.Transport.HTTP do
           allowed_private_hosts: [String.t()],
           deadline: integer() | nil,
           granted_scopes: [String.t()],
-          reliability: ReliabilityWrapper.t() | nil
+          reliability: ReliabilityWrapper.t() | nil,
+          configured_session_ended: boolean()
         }
 
   @default_endpoint "/mcp/v1"
@@ -1332,7 +1343,7 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
-  defp handle_http_response({status_line, headers, body}, state, request_body) do
+  defp handle_http_response({status_line, headers, body}, sent_state, request_body) do
     # Convert charlist to binary if needed (httpc returns charlists by default)
     body_binary = if is_list(body), do: List.to_string(body), else: body
     {_, status_code, _} = status_line
@@ -1344,7 +1355,7 @@ defmodule Arbor.MCP.Transport.HTTP do
     )
 
     # Extract session ID from server response headers (per MCP spec)
-    state = maybe_update_session_id(headers, state)
+    state = maybe_update_session_id(headers, sent_state)
 
     case status_line do
       {_, 200, _} ->
@@ -1363,7 +1374,7 @@ defmodule Arbor.MCP.Transport.HTTP do
         {:error, {:unauthorized, 401, body_binary, www_auth}}
 
       {_, 404, _} ->
-        handle_not_found(body_binary, state, request_body)
+        handle_not_found(body_binary, sent_state, request_body)
 
       {_, status, _} ->
         {:error, {:http_error, status, body_binary}}
@@ -1373,7 +1384,7 @@ defmodule Arbor.MCP.Transport.HTTP do
   # A modern (2026-07-28) server answers a method it doesn't implement with
   # 404 and a JSON-RPC error for the request, which the body tells apart from
   # a server without the endpoint. That error is the request's answer, as in
-  # a 200. Any other 404, and every legacy one, stays an HTTP error.
+  # a 200. Other modern 404s stay HTTP errors.
   defp handle_not_found(body, %{protocol_era: :modern} = state, request_body) do
     with {:ok, %{"error" => %{"code" => code, "message" => message}} = response}
          when is_integer(code) and is_binary(message) <- Jason.decode(body),
@@ -1384,7 +1395,17 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
-  defp handle_not_found(body, _state, _request_body), do: {:error, {:http_error, 404, body}}
+  # A legacy server answers 404 to a request that carries a session it has
+  # ended, and the client must then start a new session (Session
+  # Management, 2025-03-26 and later). The sent request's headers determine
+  # whether the 404 ends a session, regardless of the response body.
+  defp handle_not_found(body, sent_state, request_body) do
+    reason = {:http_error, 404, body}
+
+    if RequestHeaders.session_request?(request_body, sent_state),
+      do: {:error, {:session_expired, reason}},
+      else: {:error, reason}
+  end
 
   defp answers_request?(%{"jsonrpc" => "2.0", "id" => id} = response, request_body)
        when not is_nil(id),
@@ -1508,7 +1529,7 @@ defmodule Arbor.MCP.Transport.HTTP do
 
       {:client_lifetime_event, epoch, {:sse_error, ^sse_pid, reason}} ->
         if Lifetime.event?(epoch),
-          do: {:error, {:sse_error, reason}},
+          do: {:error, stream_error(reason, state)},
           else: receive_message(state)
 
       # A server may close the session's GET stream at any time, and an
@@ -1516,7 +1537,7 @@ defmodule Arbor.MCP.Transport.HTTP do
       # the SSE client opens the stream again with Last-Event-ID, so the
       # receiver keeps waiting rather than reporting the connection closed,
       # which would drop the session and fail every pending request. Errors,
-      # such as a 404 for an expired session, still end the connection.
+      # such as a 404 for an ended session, still end the connection.
       {:client_lifetime_event, _epoch, {:sse_closed, ^sse_pid}} ->
         receive_message(state)
 
@@ -1524,7 +1545,7 @@ defmodule Arbor.MCP.Transport.HTTP do
         receive_sse_event(data, event, state)
 
       {:sse_error, ^sse_pid, reason} ->
-        {:error, {:sse_error, reason}}
+        {:error, stream_error(reason, state)}
 
       {:sse_closed, ^sse_pid} ->
         receive_message(state)
@@ -1599,6 +1620,14 @@ defmodule Arbor.MCP.Transport.HTTP do
       {:error, reason} -> {:error, {:json_decode_error, reason}}
     end
   end
+
+  # The session's GET stream carries its Mcp-Session-Id, so a 404 for it
+  # means the server ended the session, as one for a POST does.
+  defp stream_error({:http_error, 404} = reason, %__MODULE__{session_id: session})
+       when is_binary(session),
+       do: {:session_expired, {:sse_error, reason}}
+
+  defp stream_error(reason, _state), do: {:sse_error, reason}
 
   @doc """
   Terminates the server-side session by sending DELETE to the endpoint.

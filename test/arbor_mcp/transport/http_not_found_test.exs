@@ -3,8 +3,8 @@ defmodule Arbor.MCP.Transport.HTTPNotFoundTest do
   The 2026-07-28 Streamable HTTP transport answers a method the server
   doesn't implement with 404 and a JSON-RPC `-32601` error, whose body tells
   it apart from a server without the endpoint. The client takes that error
-  as the request's answer, as it would in a 200. Any other 404, and every
-  legacy one, stays an HTTP error.
+  as the request's answer, as it would in a 200. Other 404s stay HTTP errors,
+  with legacy session requests classified as session expiry.
   """
 
   use ExUnit.Case, async: true
@@ -67,5 +67,14 @@ defmodule Arbor.MCP.Transport.HTTPNotFoundTest do
 
     assert {:error, {:http_error, 404, ^body}, _state} =
              HTTP.send_authenticated(@request, transport(bypass, :legacy))
+  end
+
+  test "a legacy session 404 ends the session even with a matching JSON-RPC error" do
+    body = Jason.encode!(@not_found)
+    bypass = respond_404(body)
+    transport = %{transport(bypass, :legacy) | session_id: "ended-session"}
+
+    assert {:error, {:session_expired, {:http_error, 404, ^body}}, _state} =
+             HTTP.send_authenticated(@request, transport)
   end
 end
