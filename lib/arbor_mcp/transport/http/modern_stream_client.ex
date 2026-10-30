@@ -440,6 +440,20 @@ defmodule Arbor.MCP.Transport.HTTP.ModernStreamClient do
     end
   end
 
+  # A server answers a method it doesn't implement with 404 and a JSON-RPC
+  # error for the request (2026-07-28 Streamable HTTP): that error is the
+  # request's answer, as in a 200. Any other 404 is an HTTP error.
+  defp handle_complete_response(404, body, state) do
+    with {:ok, %{"error" => %{"code" => code, "message" => message}} = response}
+         when is_integer(code) and is_binary(message) <- Jason.decode(body),
+         :ok <- validate_message(response, state.request_id, state.stream_kind) do
+      deliver_message(response, state)
+      %{state | completed?: true}
+    else
+      _not_json_rpc -> notify_closed(state, {:http_error, 404})
+    end
+  end
+
   defp handle_complete_response(status, _body, state) do
     if status in [401, 403],
       do: notify_closed(state, {:auth_refused, auth_response_error(state)}),
