@@ -490,8 +490,11 @@ defmodule Arbor.MCP.Server.Handler do
   `tools/list` pages through. It leaves it out when the module defines it
   itself, or overrides `c:handle_list_tools/2`, even through `super`: the
   declared definitions might not be the ones that list advertises, so the
-  check walks it. `use Arbor.MCP.Server.Handler` defines no default, so a
-  handler without it keeps the walk.
+  check walks it. It can't see a `c:handle_list_tools/2` defined by a later
+  `@before_compile` hook, such as one from a library `use`d after the DSL; a
+  module whose list is changed that way must define this callback itself.
+  `use Arbor.MCP.Server.Handler` defines no default, so a handler without it
+  keeps the walk.
 
       @impl true
       def handle_get_tool(name, state) do

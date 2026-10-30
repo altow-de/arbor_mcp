@@ -134,6 +134,13 @@ header check walks the list the module serves. A module that defines
 `handle_get_tool/2` itself keeps its own, and it must return the definitions
 its `tools/list` advertises.
 
+The DSL sees an override written in the module body. It does not see a
+`handle_list_tools/2` that a later `@before_compile` hook defines, for
+example one from a library `use`d after the DSL, because that hook runs after
+the DSL's. A module whose list is changed that way must define
+`handle_get_tool/2` itself, returning the definitions the list advertises or
+`nil`.
+
 ### Param types
 
 | DSL type | JSON Schema |
