@@ -578,8 +578,14 @@ its caller exited is left alone.
 This is request cancellation, not the experimental Tasks extension
 (`Arbor.MCP.Client.cancel_task/3`).
 
-A long-running handler can check the current request between steps. The
-server MAY stop; ArborMCP does not automatically abort the JSON-RPC request.
+A long-running handler can check the current request between steps. When a
+Runtime cancels a callback, it sends that process
+`{:arbor_mcp_cancelled, token, reason}`. The token identifies the invocation;
+reasons are `:request_cancelled`, `:owner_down`, and `:handler_timeout`.
+The callback has `cancel_grace_ms` (default 100 ms) to finish cleanup before
+the Runtime kills its task. This applies to Runtime-backed servers on every
+transport. Neither polling nor receiving the message extends the grace period,
+and stopping a task cannot undo effects already performed outside the Runtime.
 
 ```elixir
 @impl true
@@ -593,3 +599,10 @@ def handle_call_tool("slow_import", _args, state) do
   end)
 end
 ```
+
+`Context.report_progress/3` returns `:ok` or an error. The common errors are
+`:progress_not_requested` (no token), `:request_not_streaming` (no delivery
+target), `:no_request_context`, `:stream_closed` (including a retired target),
+and `:stream_timeout`. Legacy session delivery can also report replay capacity,
+event size, retired-source, or session-service operation errors. Treat errors as
+a delivery result for that progress event, not as rollback of earlier events.

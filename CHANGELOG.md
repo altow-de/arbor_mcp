@@ -150,6 +150,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING:** Runtime constructors reject unknown option names instead of
+  silently discarding them. Configure `mrtr: true` and `request_state:` on the
+  Runtime for startup validation on every transport, including mounted HTTP.
+
 - **Pre-registered OAuth client secrets are issuer-bound by default.** There
   is no opt-out. This breaks HTTP auth and `DiscoveryFlow.execute/1` that
   still set only `client_id` / `client_secret` (the 1.x aliases) and omit
@@ -264,6 +268,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `__server_capabilities__/0`.
 
 ### Fixed
+
+- Mounted HTTP Runtimes validate explicitly enabled MRTR before starting their
+  handler and pass per-Runtime request-state key rings into dispatch. Named
+  HTTP mounts can initialize before runtime configuration loads. Runtime docs
+  now describe cancellation messages, the callback cleanup grace, progress
+  delivery errors, and request-state/output limits.
 
 - An HTTP `:auth_provider` whose `get_token/1` returns `{:error, reason}` now
   refuses the request before it is sent (#176). The transport ignored the
