@@ -154,7 +154,7 @@ after an operator-controlled endpoint upgrade. Strict `:modern_only` and
 `:legacy_only` modes never fall back.
 
 Over stdio, a `:modern_only` `start_link/1` that fails with
-`{:transport_connect_failed, "{:era_probe_failed, {:transport_error, :handshake_timeout}}"}`
+`{:transport_connect_failed, {:era_probe_failed, {:transport_error, :handshake_timeout}}}`
 means the spawned server did not answer the probe within its bound,
 `:handshake_timeout` (10 s) unless `:era_probe_timeout` is set. The wait
 includes the server's own start-up, so raise `:handshake_timeout` for a

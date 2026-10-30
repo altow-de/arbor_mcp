@@ -1922,6 +1922,20 @@ deadline, the caller's timeout or the transport's `:request_timeout`.
 
 ## Observability
 
+An initial client connection failure returns its structured reason inside
+`{:error, {:transport_connect_failed, reason}}`; callers can match a transport
+or nested probe failure directly, without parsing an inspected string. Existing
+dedicated handshake, initialization, and provider-failure envelopes remain.
+**BREAKING:** consumers that matched inspected connection-error strings must
+match terms when upgrading.
+
+Each such failure emits `[:arbor_mcp, :client, :connect, :failed]`, with
+measurements `%{count: 1}` and metadata `%{client: pid, reason: summary}`.
+The summary is redacted and contains no raw response bodies or credentials.
+The library's corresponding diagnostic is logged at debug level; the caller
+can own its application error logging or attach a telemetry handler. A host
+Supervisor may still report its own child-start failure using the public error.
+
 ### Operational telemetry and alerts
 
 The MCP 2026-07-28 migration emits bounded operational events for era

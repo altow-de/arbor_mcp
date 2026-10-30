@@ -150,6 +150,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING:** Client startup failures preserve structured connection reasons
+  inside `{:transport_connect_failed, reason}` instead of stringifying them.
+  Initial connection diagnostics use debug logging and the redacted
+  `[:arbor_mcp, :client, :connect, :failed]` telemetry event instead of an
+  unconditional error log. Explicit binary errors and established tagged
+  initialization/auth-provider failures retain their existing envelopes.
+
 - **Pre-registered OAuth client secrets are issuer-bound by default.** There
   is no opt-out. This breaks HTTP auth and `DiscoveryFlow.execute/1` that
   still set only `client_id` / `client_secret` (the 1.x aliases) and omit
