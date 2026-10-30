@@ -835,6 +835,23 @@ request's task or stream then sends it again with the new token. The
 `:auth_provider` answers it; without one, an ordinary request's challenge
 runs the OAuth flow there, and a request stream's fails its request.
 
+Each request carries the token the `:auth_provider`'s `get_token/1` gives
+for it. When that returns `{:error, reason}`, the request is refused before
+anything is sent, neither with the provider's earlier token nor without one,
+and fails with `{:auth_provider_token_failed, provider, reason}`, which
+`Arbor.MCP.Client.delivery_outcome/1` reports as `:not_sent`. `reason` is
+kept only when it is an atom. `{:ok, nil, state}` sends the request without
+an `Authorization` header. The provider owns that header: one set through
+`:headers` or `:security` is dropped when the transport connects, with a
+warning, and never sent alongside the provider. See
+`Arbor.MCP.Authorization.Provider` for the details.
+
+A request stream whose connection never opens (the connection is refused,
+or the address doesn't resolve or isn't permitted) fails at once, as not
+sent and with the reason an ordinary request reports, and isn't reissued
+under `:http_stream_retry`. A stream that breaks after it opened is
+reissued as before.
+
 ### TLS trust store
 
 Outbound HTTPS verifies peers against the operating system's trust store

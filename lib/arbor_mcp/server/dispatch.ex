@@ -25,7 +25,9 @@ defmodule Arbor.MCP.Server.Dispatch do
 
   Callbacks that `Arbor.MCP.Server.Handler` marks optional are probed with
   `function_exported?/3`; a handler that does not implement one answers
-  `-32601 Method not found`.
+  `-32601 Method not found`, as does the default `use Arbor.MCP.Server.Handler`
+  provides for it. Entries added with `Arbor.MCP.Server.add_tool/3` and its
+  siblings are still listed, read and fetched for such a handler.
   """
 
   require Logger
@@ -51,6 +53,8 @@ defmodule Arbor.MCP.Server.Dispatch do
   alias Arbor.MCP.Server.Runtime.{CallbackContext, Deadline}
   alias Arbor.MCP.Transport.HTTP.ToolHeaders
   alias Arbor.RPC.JSONRPC
+
+  @method_not_found ErrorCodes.method_not_found()
 
   @type handler_state :: term()
   @type result ::
@@ -392,7 +396,9 @@ defmodule Arbor.MCP.Server.Dispatch do
         callback_result(ctx, result, "Read resource error", state, on_ok)
 
       :error ->
-        call(ctx, :handle_read_resource, [uri, state], "Read resource error", state, on_ok: on_ok)
+        ctx
+        |> call(:handle_read_resource, [uri, state], "Read resource error", state, on_ok: on_ok)
+        |> unless_served(ctx)
     end
   end
 
@@ -430,7 +436,9 @@ defmodule Arbor.MCP.Server.Dispatch do
         callback_result(ctx, result, "Get prompt error", state, & &1)
 
       :error ->
-        call(ctx, :handle_get_prompt, [name, arguments, state], "Get prompt error", state)
+        ctx
+        |> call(:handle_get_prompt, [name, arguments, state], "Get prompt error", state)
+        |> unless_served(ctx)
     end
   end
 
@@ -440,12 +448,15 @@ defmodule Arbor.MCP.Server.Dispatch do
     ref = Map.get(ctx.params, "ref")
     argument = Map.get(ctx.params, "argument")
 
-    if exported?(ctx.module, :handle_complete, 4) do
-      context = Map.get(ctx.params, "context") || %{}
-      call(ctx, :handle_complete, [ref, argument, context, state], "Completion error", state)
-    else
-      call(ctx, :handle_complete, [ref, argument, state], "Completion error", state)
-    end
+    result =
+      if exported?(ctx.module, :handle_complete, 4) do
+        context = Map.get(ctx.params, "context") || %{}
+        call(ctx, :handle_complete, [ref, argument, context, state], "Completion error", state)
+      else
+        call(ctx, :handle_complete, [ref, argument, state], "Completion error", state)
+      end
+
+    unless_served(result, ctx)
   end
 
   defp do_dispatch("logging/setLevel", ctx, state) do
@@ -618,19 +629,40 @@ defmodule Arbor.MCP.Server.Dispatch do
     end
   end
 
-  # The Handler defaults for lists a handler doesn't serve.
-  @unimplemented_lists [
-    "Resources not implemented",
-    "Resource templates not implemented",
-    "Prompts not implemented"
-  ]
-
-  defp list_error(_ctx, _label, reason, state, unimplemented)
-       when is_function(unimplemented, 1) and reason in @unimplemented_lists,
+  # A list the handler doesn't serve: the Handler defaults answer -32601, and
+  # so may the handler itself.
+  defp list_error(
+         _ctx,
+         _label,
+         %Error.ProtocolError{code: @method_not_found},
+         state,
+         unimplemented
+       )
+       when is_function(unimplemented, 1),
        do: unimplemented.(state)
 
   defp list_error(ctx, label, reason, state, _unimplemented),
     do: {:response, error_response(ctx.id, label, reason), state}
+
+  # A method the handler doesn't serve, within a capability the server does
+  # serve: through the DSL, entries added at runtime or its own declaration.
+  # Like the TypeScript SDK, the server then answers an empty completion, or
+  # not-found for a name, rather than -32601 (see ResultNormalizer).
+  defp unless_served(
+         {:response, %{"error" => %{"code" => @method_not_found}}, state} = result,
+         ctx
+       ) do
+    case ResultNormalizer.served_capability_answer(ctx.method, ctx.params, served(ctx)) do
+      {:ok, answer} -> {:response, JSONRPC.response(ctx.id, answer), state}
+      {:error, error} -> {:response, JSONRPC.error(ctx.id, Error.to_json_rpc(error)), state}
+      nil -> result
+    end
+  end
+
+  defp unless_served(result, _ctx), do: result
+
+  # What the server advertises, as server/discover reports it.
+  defp served(ctx), do: ctx.module |> handler_capabilities() |> with_registered_capabilities()
 
   defp cursor(ctx), do: Map.get(ctx.params, "cursor")
 
@@ -928,7 +960,9 @@ defmodule Arbor.MCP.Server.Dispatch do
   defp registered_list(ctx, fun, args, key, label, state, kind) do
     case Registry.entries(Registry.current(), kind) do
       [] ->
-        paginated(ctx, fun, args, key, label, state)
+        # A list the handler doesn't serve, within a capability the server
+        # serves, is empty.
+        ctx |> paginated(fun, args, key, label, state) |> unless_served(ctx)
 
       entries ->
         # A handler that doesn't serve this list lists only the registered

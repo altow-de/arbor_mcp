@@ -383,6 +383,10 @@ defmodule Arbor.MCP.Client do
     request stream with a new JSON-RPC id. `:safe_only` reissues only built-in
     read operations or operations explicitly marked `retry_safe: true`, and
     otherwise returns a transport error whose reason is `:outcome_unknown`.
+    A stream whose connection never opened sent nothing, so it isn't
+    reissued: it fails at once, as not sent (see `delivery_outcome/1`). A
+    reissue that isn't sent leaves the outcome unknown, since the first
+    attempt may have been delivered.
   - `:http_stream_retry_delay` - Delay before the one reissue (default: 200ms),
     bounded by the operation's original deadline.
   - `:retry_safe` - Caller-owned safety attestation. Tool annotations such as
@@ -1408,7 +1412,9 @@ defmodule Arbor.MCP.Client do
       passed or the caller exited before it went out, or the transport
       refused it before writing anything (the connection could not be opened,
       the address could not be resolved or was not permitted, the request was
-      too large, a security policy blocked it).
+      too large, a security policy blocked it, the auth provider gave no
+      token for it, or gave one the server had already rejected). This holds
+      for a request with its own response stream too.
     * `:unknown` - the request was, or may have been, delivered, and whether
       the server acted on it is not known. This covers the caller's own
       timeout, a connection that failed after sending, a broken response
@@ -1467,7 +1473,11 @@ defmodule Arbor.MCP.Client do
   defp send_outcome({:validation_error, _reason}), do: :not_sent
   defp send_outcome({:transport_error, {:send_failed, _reason}}), do: :not_sent
   defp send_outcome({:transport_error, reason}), do: send_outcome(reason)
-  defp send_outcome(_reason), do: :unknown
+
+  # The HTTP transport refused it before writing anything: its auth provider
+  # gave no token, or gave one the server had already rejected.
+  defp send_outcome(reason),
+    do: if(HTTP.presend_refusal?(reason), do: :not_sent, else: :unknown)
 
   # GenServer callbacks
 
@@ -1610,6 +1620,13 @@ defmodule Arbor.MCP.Client do
   defp normalize_connection_error({:auth_provider_init_failed, _provider, _reason} = reason),
     do: {:transport_connect_failed, reason}
 
+  # So is this one: the opening request was refused before it was sent,
+  # because the auth provider gave no token for it. However establishment
+  # reported that, it says nothing about the server or its era.
+  defp normalize_connection_error({tag, _details} = reason)
+       when tag in [:auth_refused, :era_probe_failed, :pinned_modern_era_probe_failed],
+       do: {:transport_connect_failed, token_failure(reason) || extract_inner_reason(reason)}
+
   defp normalize_connection_error(:connection_refused) do
     {:transport_connect_failed, :connection_refused}
   end
@@ -1643,6 +1660,14 @@ defmodule Arbor.MCP.Client do
     normalized = extract_inner_reason(reason)
     {:transport_connect_failed, normalized}
   end
+
+  defp token_failure({:auth_refused, {:auth_provider_token_failed, _, _} = failure}), do: failure
+  defp token_failure({:era_probe_failed, {:transport_error, refusal}}), do: token_failure(refusal)
+
+  defp token_failure({:pinned_modern_era_probe_failed, %{probe: {:transport_error, refusal}}}),
+    do: token_failure(refusal)
+
+  defp token_failure(_reason), do: nil
 
   # Extract inner reason from nested structures
   defp extract_inner_reason(%{"code" => _, "message" => _} = err_map), do: err_map
@@ -2639,6 +2664,13 @@ defmodule Arbor.MCP.Client do
     end
   end
 
+  # The receiver read a 404 for the session's GET stream.
+  def handle_info(
+        {:transport_closed, {:session_expired, _detail} = reason},
+        %{connection_status: :ready} = state
+      ),
+      do: {:noreply, expire_session(reason, state)}
+
   def handle_info({:transport_closed, reason}, state) do
     Logger.error("Transport closed", reason: LogSummary.describe(reason))
 
@@ -2660,6 +2692,11 @@ defmodule Arbor.MCP.Client do
         {:noreply, state}
     end
   end
+
+  # A synchronous send got a 404 for the session (see
+  # RequestHandler.send_message/2).
+  def handle_info({:http_session_expired, reason}, state),
+    do: {:noreply, expire_session(reason, state)}
 
   def handle_info(:attempt_reconnect, %{connection_status: :reconnecting} = state) do
     {:noreply, attempt_reconnect(%{state | reconnect_timer: nil})}
@@ -2802,6 +2839,20 @@ defmodule Arbor.MCP.Client do
   defp handle_async_post_result({:ok, _new_ts}, _meta, state) do
     # POST returned but no inline data — result will come via SSE stream
     {:noreply, state}
+  end
+
+  # The server has ended the session this POST carried. The request fails
+  # with that reason, and the session ends for the rest of the client too.
+  defp handle_async_post_result({:error, {:session_expired, _detail} = reason}, meta, state) do
+    state =
+      fail_async_post_request(
+        state,
+        Map.get(meta, :request_id),
+        reason,
+        Map.get(meta, :deadline)
+      )
+
+    {:noreply, expire_session(reason, state)}
   end
 
   # The caller receives the failure, as from a synchronous send, so it is not
@@ -3284,6 +3335,31 @@ defmodule Arbor.MCP.Client do
 
   # Transport teardown and reconnection
 
+  # A legacy Streamable HTTP server answers 404 to a request carrying the
+  # session's Mcp-Session-Id once it has ended the session, and the client
+  # must then start a new session with an initialize that carries no session
+  # id (Session Management, 2025-03-26 and later). The request that found the
+  # session gone has already failed with the reason. It isn't sent again,
+  # since a tool call may not be safe to repeat, and every other request still
+  # in flight on the session fails with the same reason. The client closes the
+  # transport as for a lost connection, and reconnects, which initializes a new
+  # session, or stays disconnected under `reconnect: false`. A configured
+  # `:session_id` may name the ended session, so a new connection doesn't use
+  # it. Modern (2026-07-28) connections carry no session and never get here.
+  defp expire_session(reason, %{connection_status: :ready} = state) do
+    Logger.warning("The server ended the MCP session (HTTP 404)",
+      reason: LogSummary.describe(reason)
+    )
+
+    state = %{state | transport_opts: ConnectionManager.forget_session_id(state.transport_opts)}
+    state = abandon_transport(state, :bounded)
+    handle_transport_down(reason, state)
+  end
+
+  # The session ended with an earlier report, or the client is no longer
+  # connected.
+  defp expire_session(_reason, state), do: state
+
   # Already reconnecting with an attempt scheduled — nothing left to tear down.
   defp handle_transport_down(
          _reason,
@@ -3399,7 +3475,7 @@ defmodule Arbor.MCP.Client do
 
   # Reply to all pending requests with connection error or cancelled error
   defp reply_pending_with_close_error(reason, state) do
-    connection_error = Error.connection_error("Transport closed: #{inspect(reason)}")
+    connection_error = close_error(reason, state)
 
     Enum.each(state.pending_requests, fn
       {id, {from, :single, _method}} ->
@@ -3432,6 +3508,14 @@ defmodule Arbor.MCP.Client do
         :ok
     end)
   end
+
+  # Requests in flight on a session the server ended fail as the request that
+  # found it gone did.
+  defp close_error({:session_expired, _detail} = reason, state),
+    do: RequestHandler.send_error(reason, state)
+
+  defp close_error(reason, _state),
+    do: Error.connection_error("Transport closed: #{inspect(reason)}")
 
   defp close_error_for(id, state, connection_error) do
     if MapSet.member?(state.cancelled_requests, id) do

@@ -554,6 +554,13 @@ defmodule Arbor.MCP.Client.Internal.Request do
               {:error, %Error.TransportError{reason: :response_stream_broken} = second_error} ->
                 outcome_unknown(method, stream_retry_mode, 2, second_error)
 
+              # The first attempt may have been delivered, so a retry that
+              # was never sent leaves the request's outcome unknown.
+              {:error, reason} = retry_error ->
+                if Arbor.MCP.Client.delivery_outcome(reason) == :not_sent,
+                  do: outcome_unknown(method, stream_retry_mode, 2, error),
+                  else: retry_error
+
               result ->
                 result
             end
