@@ -47,7 +47,9 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
     end
 
     @impl true
-    def handle_call_tool("ask", _arguments, state) do
+    def handle_call_tool("ask", arguments, state) do
+      send(state.test_pid, {:app_arguments, arguments})
+
       case Context.input_responses() do
         nil ->
           {:input_required, name_request(), %{"step" => 1}, state}
@@ -381,6 +383,34 @@ defmodule Arbor.MCP.Client.ManualMRTRTest do
       # included apart from its progress token, and to the capabilities it
       # declared. Every round is a new request, and a client may give each
       # one its own progress token, as the TypeScript SDK does.
+      test "caller argument metadata is preserved and bound across rounds", %{
+        transport: transport
+      } do
+        client = connect(transport)
+        caller_meta = %{"progressToken" => "application-value"}
+        arguments = %{"_meta" => caller_meta}
+        opts = [mrtr: :manual, client_capabilities: @form, format: :map]
+
+        assert {:input_required, %{request_state: state}} =
+                 Client.call_tool(client, "ask", arguments, opts ++ [progress_token: "round-1"])
+
+        assert_received {:app_arguments, %{"_meta" => ^caller_meta}}
+
+        changed = put_in(arguments, ["_meta", "progressToken"], "changed-application-value")
+        retry = opts ++ [input_responses: @tom, request_state: state, progress_token: "round-2"]
+
+        assert {:error,
+                %{"code" => -32_602, "data" => %{"reason" => "request_state_binding_mismatch"}}} =
+                 Client.call_tool(client, "ask", changed, retry)
+
+        refute_received {:app_arguments, _}
+
+        assert {:ok, %{"content" => [%{"text" => "Welcome, Tom"}]}} =
+                 Client.call_tool(client, "ask", arguments, retry)
+
+        assert_received {:app_arguments, %{"_meta" => ^caller_meta}}
+      end
+
       test "every round repeats the arguments, capabilities and _meta, not the progress token",
            %{transport: transport} do
         client = connect(transport)

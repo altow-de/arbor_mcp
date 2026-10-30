@@ -835,6 +835,23 @@ request's task or stream then sends it again with the new token. The
 `:auth_provider` answers it; without one, an ordinary request's challenge
 runs the OAuth flow there, and a request stream's fails its request.
 
+Each request carries the token the `:auth_provider`'s `get_token/1` gives
+for it. When that returns `{:error, reason}`, the request is refused before
+anything is sent, neither with the provider's earlier token nor without one,
+and fails with `{:auth_provider_token_failed, provider, reason}`, which
+`Arbor.MCP.Client.delivery_outcome/1` reports as `:not_sent`. `reason` is
+kept only when it is an atom. `{:ok, nil, state}` sends the request without
+an `Authorization` header. The provider owns that header: one set through
+`:headers` or `:security` is dropped when the transport connects, with a
+warning, and never sent alongside the provider. See
+`Arbor.MCP.Authorization.Provider` for the details.
+
+A request stream whose connection never opens (the connection is refused,
+or the address doesn't resolve or isn't permitted) fails at once, as not
+sent and with the reason an ordinary request reports, and isn't reissued
+under `:http_stream_retry`. A stream that breaks after it opened is
+reissued as before.
+
 ### TLS trust store
 
 Outbound HTTPS verifies peers against the operating system's trust store
@@ -1725,6 +1742,44 @@ end
 
 Result normalization repeats this validation as a defensive boundary, but it
 cannot correct a handler-owned cursor calculated from invalid definitions.
+
+To check a `tools/call`, the server needs the called tool's definition, even
+when the request has no `Mcp-Param-*` header, because a missing header is
+rejected too. Tools added with `Arbor.MCP.Server.add_tool/3` carry their own.
+For the others it calls the handler's `handle_get_tool/2` when the handler
+defines it. Otherwise it calls `handle_list_tools/2` from the first page and
+follows the cursors until the tool turns up, on every call and within the
+request's deadline. A list that is dynamic or costly to build, as in a
+gateway that asks upstream servers, should define the lookup:
+
+```elixir
+@impl true
+def handle_get_tool(name, state) do
+  # The definition as handle_list_tools/2 lists it, or nil if unknown here.
+  {:ok, MyApp.Gateway.tool_definition(name), state}
+end
+```
+
+The server trusts that definition and doesn't compare it with the list, so
+it must be the one `tools/list` advertises for that name, with the same
+`inputSchema` and every `x-mcp-header` annotation. A definition that leaves an
+annotation out lets a request through without that header, or with a wrong
+value, which the walk would reject. Only the handler can introduce that
+mismatch, not a client, and returning `nil` is always safe. The DSL defines
+`handle_get_tool/2` for its declared tools, from the same definitions its
+`tools/list` pages through, and leaves it out for a module that overrides
+`handle_list_tools/2`, so the check walks the list that module serves.
+
+`nil` means the callback doesn't know the tool, and the server then walks the
+list as before, so the check is never skipped. An `{:error, reason, state}`,
+an invalid reply, or a definition with another `name` fails the request with
+`-32020` "Tool schema unavailable", as a failed list page does; a raise or a
+timeout ends the request as it would during the walk. During the walk,
+`handle_list_tools/2` runs in the `tools/call` request's context, so
+`Arbor.MCP.Server.Context.current().method` is `"tools/call"` there and
+`"tools/list"` when a client lists. A list that leaves the tool out for
+`"tools/call"` makes the server skip the check; define `handle_get_tool/2`
+instead.
 
 The server validates standard and annotated headers against the body before
 tool dispatch. Custom raw `Mcp-Method`, `Mcp-Name`, `Mcp-Session-Id`,

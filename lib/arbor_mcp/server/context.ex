@@ -18,6 +18,22 @@ defmodule Arbor.MCP.Server.Context do
   @key {__MODULE__, :current}
   @log_levels ~w(debug info notice warning error critical alert emergency)
 
+  @doc """
+  Returns the validated context of the request the callback is serving, or
+  `nil` outside a callback.
+
+  Its `method` is the JSON-RPC method of that request, which is not always
+  the one the callback stands for. Before a modern `tools/call` over
+  Streamable HTTP, the server may call `handle_list_tools/2` to find the
+  tool's `x-mcp-header` annotations, and on a Runtime it does so in the
+  `tools/call` context: `method` is `"tools/call"` there and `"tools/list"`
+  when a client lists. `c:Arbor.MCP.Server.Handler.handle_get_tool/2` saves
+  that walk.
+
+  Like the other functions here, the value is not inherited by a spawned
+  process. The `Arbor.MCP.MessageProcessor` handler-process path calls
+  `handle_list_tools/2` without a context, so `current/0` is `nil` there.
+  """
   @spec current() :: RequestContext.t() | nil
   def current, do: Process.get(@key)
 

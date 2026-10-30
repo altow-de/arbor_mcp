@@ -1032,6 +1032,12 @@ defmodule Arbor.MCP.Client.RequestHandler do
 
   def close_request_stream(_request_id, state, _outcome), do: state
 
+  # The stream's connection never opened, so nothing was sent: reported as a
+  # POST whose connection failed is, which Arbor.MCP.Client.delivery_outcome/1
+  # reads as :not_sent, and never retried as a broken stream.
+  defp request_stream_error({:connect_failed, reason}),
+    do: send_error(reason, %{transport_mod: HTTP})
+
   defp request_stream_error({:auth_refused, _reason} = refusal),
     do: send_error(refusal, %{transport_mod: HTTP})
 
@@ -2006,9 +2012,20 @@ defmodule Arbor.MCP.Client.RequestHandler do
           transport_state
         )
         |> transport_result(state)
+        |> report_session_expiry()
       end
     end
   end
+
+  # A synchronous send (legacy HTTP without a stream) that finds the server
+  # has ended its session tells the client, which ends the session once this
+  # send's caller has its answer (see Arbor.MCP.Client).
+  defp report_session_expiry({:error, {:session_expired, _detail} = reason, _state} = result) do
+    Lifetime.deliver(self(), {:http_session_expired, reason})
+    result
+  end
+
+  defp report_session_expiry(result), do: result
 
   defp transport_result({:ok, transport, response}, state),
     do: {:ok, %{state | transport_state: transport}, response}

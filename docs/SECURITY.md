@@ -276,7 +276,8 @@ tenant. The digest covers the request params without `inputResponses`,
 `requestState`, the argument `_request_id` and `_meta.progressToken`, which
 change from round to round, and without the copy of `_meta` the handler server
 puts into a call's arguments. An argument named `_meta` from the caller stays
-in the digest. It contains only bounded JSON application
+in the digest and is preserved on every transport; the server inserts its
+copy only when that string argument key is absent. It contains only bounded JSON application
 state—never bearer tokens or runtime secrets.
 
 Load the 32-byte key ring at runtime and retain decrypt-only old keys for at

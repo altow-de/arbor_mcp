@@ -107,6 +107,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A dead target misses the updates without failing the request.
 
   See "Progress to another process" in `docs/PROTOCOL_GUIDE.md`.
+- An optional `Arbor.MCP.Server.Handler` callback,
+  `handle_get_tool(name, state)`, which returns `{:ok, tool | nil, state}`
+  (#184). Before a modern `tools/call` over Streamable HTTP, the server
+  checks the `Mcp-Param-*` headers against the tool's `x-mcp-header`
+  annotations. To find them it called `handle_list_tools/2` from the first
+  page until the tool turned up, on every call. A handler that defines the
+  callback now supplies that one definition, which saves a gateway, or any
+  handler whose list is costly or dynamic, a listing per call. The check is
+  never skipped:
+  - `nil` means the callback doesn't know the tool, and the server walks the
+    list as before.
+  - An `{:error, reason, state}`, an invalid reply, or a definition with
+    another `name` fails the request with "Tool schema unavailable", as a
+    failed list page does (`-32020` on a Runtime).
+  - A raise or a timeout is handled as in the walk. The lookup shares the
+    walk's deadline: the request's `:request_timeout_ms` on a Runtime, or one
+    `:handler_call_timeout` for the lookup and any walk after it through
+    `Arbor.MCP.MessageProcessor`.
+
+  The server trusts the definition the callback returns: it must be the one
+  `tools/list` advertises for that name, with the same `inputSchema` and
+  every `x-mcp-header` annotation. One that leaves an annotation out lets
+  through requests the walk would reject. Only the handler can introduce
+  that mismatch, and `nil` is always safe.
+
+  Handlers without the callback walk the list as before.
+  `use Arbor.MCP.Server.DSL` defines the callback for the tools a module
+  declares, unless the module defines it. It reads the same definitions as
+  the module's `tools/list` and returns `nil` for tools added with
+  `Arbor.MCP.Server.add_tool/3`, which are checked against their own
+  definitions. A DSL server with `page_size:` no longer pages for the check.
+  A DSL module's `handle_list_tools/2` is now overridable, so an override
+  can call `super` for the declared list. A module that overrides
+  it gets no generated `handle_get_tool/2`, so the check walks the list it
+  serves; one that also defines `handle_get_tool/2` keeps its own.
+
+  `Arbor.MCP.Server.Context.current/0` is now documented: on a Runtime, its
+  `method` is `"tools/call"` while `handle_list_tools/2` runs for the check.
+  See the `handle_get_tool/2` docs and "Modern Streamable HTTP headers" in
+  `docs/CONFIGURATION.md`.
 
 ### Changed
 
@@ -164,9 +204,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JWE, derives shared secrets or exports password-encrypted keys, and MRTR
   request state is sealed with `:crypto` directly and checks the tag length.
   The floor keeps applications' dependency graphs off the affected releases.
+- **BREAKING:** a legacy Streamable HTTP request that gets 404 for the
+  client's session now fails with
+  `%Arbor.MCP.Error.TransportError{reason: {:session_expired, {:http_error, 404, body}}}`
+  instead of `reason: {:http_error, 404, body}`, and the client starts a new
+  session (see Fixed). A request still in flight when that happens fails
+  with the same error, and one in flight when the session's reopened GET
+  stream gets 404 fails with `{:session_expired, {:sse_error, {:http_error, 404}}}`
+  instead of a `:connection_error` (`"Transport closed: ..."`). Code that
+  matched `{:http_error, 404, _}` to restart the client can match
+  `{:session_expired, _}`, or drop the workaround. `delivery_outcome/1`
+  still reports `:unknown`: the server answered, and a proxy's 404 looks the
+  same. Modern (2026-07-28) 404s keep their protocol-error handling (see
+  Fixed), and other 404s keep `{:http_error, 404, body}`.
+- A legacy `initialize` that carries a configured `:session_id` and gets 404
+  for it no longer fails the connection. The server has ended that session,
+  so the client sends one more `initialize`, without the id, and starts a new
+  session, as the 2025-03-26 to 2025-11-25 revisions require. That second
+  `initialize` has its own `:handshake_timeout`, but never more than the
+  connection's deadline (`:establish_timeout`) has left, and its failure is
+  reported as before. No later `initialize` in the same connection attempt
+  offers the ended session again, including the one `:prefer_legacy` retries
+  with a revision the modern probe named, so this happens at most once per
+  attempt. `start_link/1` now succeeds where it used to fail with a 404. A reconnect
+  after some other loss whose configured session the server has since ended,
+  which used to fail on every attempt, now connects. Once the configured
+  session has been replaced, later reconnects don't offer it again.
+- **BREAKING:** the default callbacks of `use Arbor.MCP.Server.Handler` now
+  answer a method the handler doesn't serve with JSON-RPC `-32601` (Method
+  not found), as the MCP schema asks for a method behind a capability the
+  server did not advertise (#180). They returned plain strings such as
+  `"Resources not implemented"`, which went out as `-32000` and HTTP 200, so
+  clients and gateways could not tell an unsupported method from a server
+  failure, and the `Dispatch` promise of `-32601` never held. This covers
+  `resources/list`, `resources/templates/list`, `resources/read`,
+  `resources/subscribe`, `resources/unsubscribe`, `prompts/list`,
+  `prompts/get`, `completion/complete`, `roots/list` and the `tasks/*`
+  methods without `tasks: :store` (and legacy-era task requests with it), as
+  well as the `handle_create_message/2` default. Over modern (2026-07-28)
+  Streamable HTTP the error goes out with HTTP `404`, as the transport
+  specification requires and as for an unknown method, also when the
+  request's progress token selected an event stream that nothing had been
+  written to yet; legacy HTTP keeps `200`. A callback that calls `super` now
+  gets an `Arbor.MCP.Error.ProtocolError` with code `-32601` instead of a
+  string. A method whose capability the server doesn't advertise is still
+  dispatched, so a handler that serves one without advertising it keeps
+  working.
+- A server that serves a capability now answers the parts of it a handler
+  leaves out as the TypeScript SDK does, instead of with an error: an empty
+  `resources/list`, `resources/templates/list` or `prompts/list` (plus any
+  entries added with `Arbor.MCP.Server.add_resource/3` and its siblings), a
+  `completion/complete` with no values, and "Resource not found" or "Prompt
+  not found" (`-32602`) from `resources/read` or `prompts/get` for an
+  unknown name. So a DSL module with resources but no templates lists no
+  templates, one with only templates lists no resources, and a DSL prompt
+  argument without `complete:` completes to nothing; before, each answered
+  `-32000`. The server serves a capability when `server/discover`
+  advertises it: through the DSL, added entries, or the handler's own
+  `__server_capabilities__/0`.
 
 ### Fixed
 
+- An HTTP `:auth_provider` whose `get_token/1` returns `{:error, reason}` now
+  refuses the request before it is sent (#176). The transport ignored the
+  error, so the request went out with the token the provider gave before, or
+  with none, and the caller got the server's answer. This held for modern
+  POSTs, request streams (`progress_token:`), subscriptions, legacy POSTs,
+  notifications and the requests that open a connection. The request now
+  fails with `{:auth_provider_token_failed, provider, reason}`, which
+  `Arbor.MCP.Client.delivery_outcome/1` reports as `:not_sent`;
+  `Arbor.MCP.Client.listen/2` returns it as
+  `{:error, {:stream_error, {:auth_refused, {:auth_provider_token_failed, provider, reason}}}}`,
+  and `Arbor.MCP.Client.start_link/1` as
+  `{:error, {:transport_connect_failed, {:auth_provider_token_failed, provider, reason}}}`
+  in every `protocol_mode`, without falling back to the other era. `reason`
+  is redacted as an init failure's is (#161): an atom is kept, any other
+  error is `:redacted`, an exception `{:raised, exception_module}`, a throw
+  or exit `:throw` or `:exit`, and a return the callback doesn't allow
+  (including a token that isn't a string) `:invalid_token_result`.
+  `{:ok, nil, state}` now sends the request without an `Authorization`
+  header; it used to keep the earlier token. Dropping a token doesn't
+  forget it: a token the server rejected is still refused, as not sent, if
+  the provider returns it again with its state unchanged. With an
+  `:auth_provider`, an `Authorization` header set through `:headers` or
+  `:security` is now dropped at connect, with a warning: the provider owns
+  that header, so a request carries its token or none. The configured
+  header used to go out until the provider's first token replaced it, and
+  again whenever the provider had none, the OAuth provider's first,
+  pre-auth request included. Requests that went out with a stale token
+  before now fail, so a provider that would rather let the server decide
+  should return a token, as the built-in OAuth provider does when a refresh
+  fails. A request refused this way, or for carrying a
+  credential the server already rejected, never counts as a `reliability:`
+  circuit-breaker failure, and the rejected-credential refusal is now
+  reported as `:not_sent` too.
+- A modern request stream (`progress_token:`) whose connection never opened
+  was reported as possibly delivered (#177): a refused connection, an
+  address that didn't resolve or wasn't permitted, or an unavailable trust
+  store failed as `%Arbor.MCP.Error.TransportError{reason: :outcome_unknown}`
+  after the default `http_stream_retry: :at_least_once` had reissued it
+  once. It now fails at once, without a reissue, with the reason an
+  ordinary POST reports (for example `%Mint.TransportError{reason: :econnrefused}`
+  or `:dns_failed`), which `Arbor.MCP.Client.delivery_outcome/1` reports as
+  `:not_sent`. A stream that breaks after it opened is reissued as before,
+  and a reissue that is never sent now reports `:outcome_unknown`, since the
+  first attempt may have been delivered.
 - A pre-registered client secret configured through the legacy
   `client_id` / `client_secret` aliases was not bound to an issuer under the
   default legacy protocol (`2025-11-25`). Attacker-controlled authorization
@@ -252,8 +394,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   held only the token like a missing one. On stdio, BEAM and the test
   transport, the handler server's copy of `_meta` in a call's arguments
   stays out of the binding as a whole, since `_meta` binds it. An argument
-  named `_meta` from the caller, as over HTTP, is part of the tool's input
-  and stays bound, a `progressToken` in it included. The arguments, the
+  named `_meta` from the caller is preserved on every transport and stays
+  bound, a `progressToken` in it included. The server injects its metadata
+  only when that argument is absent. The arguments, the
   rest of `_meta` and the capabilities stay bound.
 - `Accept: application/json, text/event-stream;q` — a `q` parameter with no
   value — and `q =1` / `q= 1`, whose whitespace around the equals sign
@@ -577,6 +720,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asynchronous requests that the gateway settles in its own loop. Each
   request's later steps still wait for its own answers, so results, batch
   arrays and errors keep their order.
+- A legacy Streamable HTTP client kept its `Mcp-Session-Id` after the server
+  ended the session, by restarting for example (#181). Every request then got
+  `404 Session not found` and the client stayed `:ready`, even with
+  `reconnect: true`; with the GET stream on, it recovered only once that
+  stream's reopened GET got the 404 too. The 2025-03-26 to 2025-11-25
+  revisions say a client that gets 404 for a request carrying its session id
+  MUST start a new session with an `initialize` that carries none. The
+  request that got the 404, a POST, a notification or the reopened GET, now
+  fails with `{:session_expired, detail}` (see Changed) and is not sent
+  again, since a tool call may not be safe to repeat, and every request still
+  in flight on the session fails with it too. The client then closes the
+  transport as for a lost connection, its `reliability:` components
+  included, and reconnects under `:reconnect_backoff` with an `initialize`
+  that carries no session id, not even a configured `:session_id`. With
+  `reconnect: false` it goes `:disconnected`. Modern (2026-07-28)
+  connections have no session and are unchanged. Reported by Harper04.
+- Over modern (2026-07-28) Streamable HTTP, the client reported a `404`
+  that carries a JSON-RPC error for the request, which is how the transport
+  says a server doesn't implement a method, as
+  `{:error, %Arbor.MCP.Error.TransportError{reason: {:http_error, 404, body}}}`.
+  It now returns that JSON-RPC error, as it would from a `200`, on both a
+  plain POST and a request stream, and the connection stays `:ready`. Any
+  other modern `404` is still an HTTP error. A legacy session's `404`
+  ends the session as described above, regardless of its body.
+- The deprecated HTTP+SSE GET stream (`legacy_http_sse: true`) sent
+  `connection: keep-alive`. HTTP/2 forbids connection-specific header fields
+  and its clients treat such a response as malformed (RFC 9113, section
+  8.2.2), so curl and other nghttp2 clients over h2c or TLS got no `endpoint`
+  event from Bandit (#182). Neither legacy GET stream sends the header now;
+  over HTTP/1.1 it was redundant, since connections persist by default.
+- When a client closed a request's SSE stream, the next progress or log
+  notification, or the final response, raised
+  `Arbor.MCP.HttpPlug.RuntimeWriter.AdmissionError` ("MCP HTTP response
+  capacity unavailable"), which Bandit logged as an error with a stack trace
+  (#179). Closing the stream is how a modern client cancels, so the response
+  now ends quietly, as it does after a failed keepalive. The sender still
+  gets `{:error, :stream_closed}`, a modern request is still cancelled, and a
+  legacy one still runs to its end. Output refused before it is written, and
+  a write that raises, still raise.
 
 ## [2.0.0-rc.6] — 2026-10-26
 

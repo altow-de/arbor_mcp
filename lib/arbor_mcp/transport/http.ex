@@ -75,6 +75,12 @@ defmodule Arbor.MCP.Transport.HTTP do
   Setting `use_sse: false` disables the legacy standalone GET stream. It does
   not disable a modern request-owned SSE response.
 
+  A server that has ended a session answers 404 to a request that carries it.
+  The client then starts a new session with an `initialize` that carries no
+  session id, as the legacy revisions require. When the 404 answers the
+  `initialize` that carried `:session_id`, the client sends that second
+  `initialize` at once. See "Streamable HTTP" in the transport guide.
+
   > #### Security Best Practices {: .warning}
   >
   > 1. **Always use HTTPS** in production
@@ -151,7 +157,11 @@ defmodule Arbor.MCP.Transport.HTTP do
     # The circuit breaker and health check a client's `reliability:` option
     # started, as a ReliabilityWrapper with no wrapped state, or nil (see
     # attach_reliability/2).
-    reliability: nil
+    reliability: nil,
+    # Whether the server answered 404 for the session id this connection was
+    # opened with (a configured `:session_id`): no initialize on this
+    # connection offers it again (see Arbor.MCP.Client.ConnectionManager).
+    configured_session_ended: false
   ]
 
   @type t :: %__MODULE__{
@@ -182,7 +192,8 @@ defmodule Arbor.MCP.Transport.HTTP do
           allowed_private_hosts: [String.t()],
           deadline: integer() | nil,
           granted_scopes: [String.t()],
-          reliability: ReliabilityWrapper.t() | nil
+          reliability: ReliabilityWrapper.t() | nil,
+          configured_session_ended: boolean()
         }
 
   @default_endpoint "/mcp/v1"
@@ -314,7 +325,12 @@ defmodule Arbor.MCP.Transport.HTTP do
     # SSE is deferred until after the first successful POST (which provides
     # the session ID needed for the GET SSE stream).
     with {:ok, {auth_provider, auth_provider_state}} <- provider,
-         state = %{state | auth_provider: auth_provider, auth_provider_state: auth_provider_state},
+         state =
+           provider_owns_authorization(%{
+             state
+             | auth_provider: auth_provider,
+               auth_provider_state: auth_provider_state
+           }),
          :ok <- validate_security(state),
          :ok <- TargetPolicy.validate_options(network_policy_options(state)) do
       if use_sse do
@@ -369,7 +385,7 @@ defmodule Arbor.MCP.Transport.HTTP do
       case ReliabilityWrapper.admit(reliability) do
         :ok ->
           result = send_message_with_state(message, %{state | reliability: nil})
-          ReliabilityWrapper.report(reliability, reported_result(result))
+          report_admitted(reliability, result)
           reattach(result, reliability)
 
         {:error, reason} ->
@@ -414,9 +430,18 @@ defmodule Arbor.MCP.Transport.HTTP do
     send_authenticated(message, state)
   end
 
-  # The breaker records what the caller of send_message/2 sees.
-  defp reported_result({:error, reason, _state}), do: {:error, reason}
-  defp reported_result(result), do: result
+  # The breaker records what the caller of send_message/2 sees, unless the
+  # request was refused before it was sent (see presend_refusal?/1): no call
+  # reached the server, so there is nothing to record. A POST task's refusal
+  # comes before it is admitted at all.
+  defp report_admitted(reliability, {:error, reason, _state}) do
+    unless presend_refusal?(reason),
+      do: ReliabilityWrapper.report(reliability, {:error, reason})
+
+    :ok
+  end
+
+  defp report_admitted(reliability, result), do: ReliabilityWrapper.report(reliability, result)
 
   defp async_send?(%__MODULE__{use_sse: true, sse_pid: sse_pid}) when is_pid(sse_pid), do: true
   defp async_send?(%__MODULE__{}), do: false
@@ -464,6 +489,8 @@ defmodule Arbor.MCP.Transport.HTTP do
   def send_async(message, %__MODULE__{} = state) when is_binary(message),
     do: state |> maybe_start_deferred_sse(message) |> then(&async_post(message, &1))
 
+  # A request the auth provider refuses (see apply_provider_token/1) fails
+  # here, before a task starts or the breaker admits it.
   defp async_post(message, state) do
     case apply_provider_token(state) do
       {:ok, request_state} -> start_async_post(message, state, request_state)
@@ -541,8 +568,9 @@ defmodule Arbor.MCP.Transport.HTTP do
 
   # The breaker (see attach_reliability/2) admits the POST before it is sent
   # (hold_post/2) and settles the admission with how it ended, a re-send
-  # after authenticating included: a definitive refusal ({:auth_refused, _})
-  # counts as a failure, as any other failed request does.
+  # after authenticating included: a definitive refusal once the server has
+  # answered ({:auth_refused, _}) counts as a failure, as any other failed
+  # request does.
   defp hold_post(%{reliability: nil}, _task), do: :ok
 
   defp hold_post(%{reliability: reliability}, task),
@@ -592,7 +620,7 @@ defmodule Arbor.MCP.Transport.HTTP do
           Lifetime.deliver(
             parent,
             {:http_credential_rejected, :post, self(), extract_request_id(message),
-             state.credential_generation}
+             presented_generation(state)}
           )
         end
 
@@ -657,7 +685,7 @@ defmodule Arbor.MCP.Transport.HTTP do
       www_authenticate: www_auth,
       scopes: extract_scope_from_www_auth(www_auth),
       token: state.access_token,
-      credential_generation: state.credential_generation,
+      credential_generation: presented_generation(state),
       deadline: state.deadline
     }
 
@@ -811,13 +839,25 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
+  # Each request carries the token the provider gives for it. A provider that
+  # gives none (an error, or a return the callback doesn't allow) refuses the
+  # request before anything is written: it goes out neither with the token
+  # the provider gave before nor without one, and the transport drops that
+  # token. The refusal is definitive, as a rejected credential's is, and its
+  # reason is redacted as an init failure's is (see provider_call/1).
+  # `{:ok, nil, state}`, "no token yet", sends the request without an
+  # Authorization header, so the server's challenge can start the
+  # provider's flow. A token counts as newly acquired only when the
+  # provider's state changed, or when it is the first: otherwise it keeps
+  # the generation of the provider's last token, even one dropped since, and
+  # is refused before it is sent if the server rejected that one.
   defp apply_provider_token(%{auth_provider: provider, auth_provider_state: ps} = state)
        when not is_nil(provider) do
-    case provider.get_token(ps) do
-      {:ok, nil, new_ps} ->
-        {:ok, %{state | auth_provider_state: new_ps}}
+    case provider_call(fn -> provider.get_token(ps) end) do
+      {:ok, {:ok, nil, new_ps}} ->
+        {:ok, %{drop_provider_token(state) | auth_provider_state: new_ps}}
 
-      {:ok, token, new_ps} ->
+      {:ok, {:ok, token, new_ps}} when is_binary(token) ->
         generation =
           if new_ps != ps or state.credential_generation == 0,
             do: System.unique_integer([:positive, :monotonic]),
@@ -831,12 +871,62 @@ defmodule Arbor.MCP.Transport.HTTP do
           {:ok, apply_token_to_state(state, token, generation)}
         end
 
-      {:error, _} ->
-        {:ok, state}
+      {:ok, {:error, reason}} ->
+        refuse_without_token(state, provider, redact_provider_reason(reason))
+
+      {:ok, _invalid} ->
+        refuse_without_token(state, provider, :invalid_token_result)
+
+      {:failed, reason} ->
+        refuse_without_token(state, provider, reason)
     end
   end
 
   defp apply_provider_token(state), do: {:ok, state}
+
+  defp refuse_without_token(state, provider, reason) do
+    {:error, {:auth_refused, {:auth_provider_token_failed, provider, reason}},
+     drop_provider_token(state)}
+  end
+
+  # Drops the provider's token: requests go out without an Authorization
+  # header, whatever the transport held. Its credential generation stays, so
+  # a token the provider returns later with its state unchanged is still
+  # known for the one it was, and refused if the server rejected it; a
+  # request sent meanwhile presents no generation (see presented_generation/1).
+  defp drop_provider_token(state),
+    do: %{state | access_token: nil, headers: Headers.delete(state.headers, "authorization")}
+
+  # The provider owns the Authorization header, as it owns every other auth
+  # concern (see Arbor.MCP.Authorization.Provider): each request carries
+  # what get_token/1 gives, or no Authorization header, and never one
+  # configured through :headers or :security. So no request is credited to a
+  # credential the provider never gave, and a 401 to one retires none of its.
+  defp provider_owns_authorization(%{auth_provider: nil} = state), do: state
+
+  defp provider_owns_authorization(state) do
+    if Headers.get(state.headers, "authorization") do
+      Logger.warning(
+        "HTTP auth provider #{inspect(state.auth_provider)} supplies the Authorization " <>
+          "header; the one configured through :headers or :security is not sent"
+      )
+
+      %{state | headers: Headers.delete(state.headers, "authorization"), credential_generation: 0}
+    else
+      state
+    end
+  end
+
+  @doc false
+  # Whether `reason` is a refusal apply_provider_token/1 made before anything
+  # was written: the auth provider gave no token, or gave one the server had
+  # already rejected. Arbor.MCP.Client reports these without the
+  # {:auth_refused, _} marker, once its retry decisions are made.
+  @spec presend_refusal?(term()) :: boolean()
+  def presend_refusal?({:auth_refused, reason}), do: presend_refusal?(reason)
+  def presend_refusal?({:auth_provider_token_failed, _provider, _reason}), do: true
+  def presend_refusal?({:authentication_failed, :rejected_credential}), do: true
+  def presend_refusal?(_reason), do: false
 
   defp apply_token_to_state(state, token, generation \\ nil) do
     generation = generation || System.unique_integer([:positive, :monotonic])
@@ -867,20 +957,29 @@ defmodule Arbor.MCP.Transport.HTTP do
 
   # A configured provider that can't start fails the connection: without it,
   # every request would go out without the credentials the application set up.
-  # Only an atom reason is kept, because a provider's other reasons, and its
-  # exceptions, may carry its config, secrets included.
   defp start_auth_provider(mod, provider_config) do
-    case mod.init(provider_config) do
-      {:ok, provider_state} -> {:ok, {mod, provider_state}}
-      {:error, reason} when is_atom(reason) -> auth_provider_failed(mod, reason)
-      {:error, _reason} -> auth_provider_failed(mod, :redacted)
-      _invalid -> auth_provider_failed(mod, :invalid_init_result)
+    case provider_call(fn -> mod.init(provider_config) end) do
+      {:ok, {:ok, provider_state}} -> {:ok, {mod, provider_state}}
+      {:ok, {:error, reason}} -> auth_provider_failed(mod, redact_provider_reason(reason))
+      {:ok, _invalid} -> auth_provider_failed(mod, :invalid_init_result)
+      {:failed, reason} -> auth_provider_failed(mod, reason)
     end
-  rescue
-    exception -> auth_provider_failed(mod, {:raised, exception.__struct__})
-  catch
-    kind, _reason -> auth_provider_failed(mod, kind)
   end
+
+  # Runs an auth provider callback. A provider's exceptions, throws and
+  # exits may carry its config, secrets included, so a failure is reported
+  # only as `{:raised, exception_module}`, `:throw` or `:exit`.
+  defp provider_call(callback) do
+    {:ok, callback.()}
+  rescue
+    exception -> {:failed, {:raised, exception.__struct__}}
+  catch
+    kind, _reason -> {:failed, kind}
+  end
+
+  # Only an atom reason is kept, for the same reason.
+  defp redact_provider_reason(reason) when is_atom(reason), do: reason
+  defp redact_provider_reason(_reason), do: :redacted
 
   defp auth_provider_failed(mod, reason) do
     Logger.error(
@@ -1043,8 +1142,26 @@ defmodule Arbor.MCP.Transport.HTTP do
 
   defp retire_response_credential(state, response) do
     if match?({:unauthorized, _}, extract_auth_status(response)),
-      do: retire_credential(state, state.credential_generation),
+      do: retire_credential(state, presented_generation(state)),
       else: state
+  end
+
+  # The generation of the credential a request sent with `state` presents,
+  # which a 401 to it retires: none (0) when it carries no credential. Under
+  # an auth provider that means none of the provider's tokens (see
+  # provider_owns_authorization/1): a request sent after the provider's
+  # token was dropped presents nothing, so its 401 says nothing about that
+  # token, and the transport still knows which generation the token had
+  # (see apply_provider_token/1). Without one, it is the credential the
+  # Authorization header carries, configured or from the OAuth flow.
+  defp presented_generation(%{auth_provider: provider, access_token: nil})
+       when not is_nil(provider),
+       do: 0
+
+  defp presented_generation(state) do
+    if Headers.get(state.headers, "authorization"),
+      do: state.credential_generation,
+      else: 0
   end
 
   @doc false
@@ -1332,7 +1449,7 @@ defmodule Arbor.MCP.Transport.HTTP do
     end
   end
 
-  defp handle_http_response({status_line, headers, body}, state, request_body) do
+  defp handle_http_response({status_line, headers, body}, sent_state, request_body) do
     # Convert charlist to binary if needed (httpc returns charlists by default)
     body_binary = if is_list(body), do: List.to_string(body), else: body
     {_, status_code, _} = status_line
@@ -1344,7 +1461,7 @@ defmodule Arbor.MCP.Transport.HTTP do
     )
 
     # Extract session ID from server response headers (per MCP spec)
-    state = maybe_update_session_id(headers, state)
+    state = maybe_update_session_id(headers, sent_state)
 
     case status_line do
       {_, 200, _} ->
@@ -1362,10 +1479,45 @@ defmodule Arbor.MCP.Transport.HTTP do
         www_auth = Headers.get(headers, "www-authenticate")
         {:error, {:unauthorized, 401, body_binary, www_auth}}
 
+      {_, 404, _} ->
+        handle_not_found(body_binary, sent_state, request_body)
+
       {_, status, _} ->
         {:error, {:http_error, status, body_binary}}
     end
   end
+
+  # A modern (2026-07-28) server answers a method it doesn't implement with
+  # 404 and a JSON-RPC error for the request, which the body tells apart from
+  # a server without the endpoint. That error is the request's answer, as in
+  # a 200. Other modern 404s stay HTTP errors.
+  defp handle_not_found(body, %{protocol_era: :modern} = state, request_body) do
+    with {:ok, %{"error" => %{"code" => code, "message" => message}} = response}
+         when is_integer(code) and is_binary(message) <- Jason.decode(body),
+         true <- answers_request?(response, request_body) do
+      {:ok, %{state | last_response: response}, Jason.encode!(response)}
+    else
+      _not_json_rpc -> {:error, {:http_error, 404, body}}
+    end
+  end
+
+  # A legacy server answers 404 to a request that carries a session it has
+  # ended, and the client must then start a new session (Session
+  # Management, 2025-03-26 and later). The sent request's headers determine
+  # whether the 404 ends a session, regardless of the response body.
+  defp handle_not_found(body, sent_state, request_body) do
+    reason = {:http_error, 404, body}
+
+    if RequestHeaders.session_request?(request_body, sent_state),
+      do: {:error, {:session_expired, reason}},
+      else: {:error, reason}
+  end
+
+  defp answers_request?(%{"jsonrpc" => "2.0", "id" => id} = response, request_body)
+       when not is_nil(id),
+       do: not Map.has_key?(response, "result") and extract_request_id(request_body) == id
+
+  defp answers_request?(_response, _request_body), do: false
 
   defp handle_non_sse_response(body, headers, state, request_body) do
     content_type = Headers.get(headers, "content-type") || ""
@@ -1483,7 +1635,7 @@ defmodule Arbor.MCP.Transport.HTTP do
 
       {:client_lifetime_event, epoch, {:sse_error, ^sse_pid, reason}} ->
         if Lifetime.event?(epoch),
-          do: {:error, {:sse_error, reason}},
+          do: {:error, stream_error(reason, state)},
           else: receive_message(state)
 
       # A server may close the session's GET stream at any time, and an
@@ -1491,7 +1643,7 @@ defmodule Arbor.MCP.Transport.HTTP do
       # the SSE client opens the stream again with Last-Event-ID, so the
       # receiver keeps waiting rather than reporting the connection closed,
       # which would drop the session and fail every pending request. Errors,
-      # such as a 404 for an expired session, still end the connection.
+      # such as a 404 for an ended session, still end the connection.
       {:client_lifetime_event, _epoch, {:sse_closed, ^sse_pid}} ->
         receive_message(state)
 
@@ -1499,7 +1651,7 @@ defmodule Arbor.MCP.Transport.HTTP do
         receive_sse_event(data, event, state)
 
       {:sse_error, ^sse_pid, reason} ->
-        {:error, {:sse_error, reason}}
+        {:error, stream_error(reason, state)}
 
       {:sse_closed, ^sse_pid} ->
         receive_message(state)
@@ -1574,6 +1726,14 @@ defmodule Arbor.MCP.Transport.HTTP do
       {:error, reason} -> {:error, {:json_decode_error, reason}}
     end
   end
+
+  # The session's GET stream carries its Mcp-Session-Id, so a 404 for it
+  # means the server ended the session, as one for a POST does.
+  defp stream_error({:http_error, 404} = reason, %__MODULE__{session_id: session})
+       when is_binary(session),
+       do: {:session_expired, {:sse_error, reason}}
+
+  defp stream_error(reason, _state), do: {:sse_error, reason}
 
   @doc """
   Terminates the server-side session by sending DELETE to the endpoint.
@@ -1764,7 +1924,7 @@ defmodule Arbor.MCP.Transport.HTTP do
                parent: parent,
                request_id: request_id,
                deadline: state.deadline,
-               credential_generation: state.credential_generation,
+               credential_generation: presented_generation(state),
                url: url,
                headers: headers,
                body: message,

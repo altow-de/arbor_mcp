@@ -134,7 +134,7 @@ defmodule Arbor.MCP.Server.RequestState do
   # tool's input and stays bound, a `progressToken` in it included.
   defp injected_arguments(opts) do
     if Keyword.get(opts, :injected_argument_meta, false),
-      do: ["_request_id", :_request_id, "_meta", :_meta],
+      do: ["_request_id", :_request_id, "_meta"],
       else: ["_request_id", :_request_id]
   end
 

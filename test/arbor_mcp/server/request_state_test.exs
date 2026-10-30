@@ -88,6 +88,14 @@ defmodule Arbor.MCP.Server.RequestStateTest do
     refute binding_of(other_argument, injected) == binding_of(token_1, injected)
   end
 
+  test "the injection marker keeps atom-form caller argument metadata bound" do
+    original = put_in(params(), ["arguments", :_meta], %{progressToken: "caller-1"})
+    changed = put_in(original, ["arguments", :_meta, :progressToken], "caller-2")
+    injected = [injected_argument_meta: true]
+
+    refute binding_of(original, injected) == binding_of(changed, injected)
+  end
+
   test "supports decrypt-only rotation keys and expiry" do
     old_opts = options(now: 1_000)
     assert {:ok, binding} = RequestState.binding(context(), params(), [], 1, old_opts)

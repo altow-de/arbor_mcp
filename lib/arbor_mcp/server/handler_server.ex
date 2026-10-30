@@ -1751,12 +1751,13 @@ defmodule Arbor.MCP.Server.HandlerServer do
   defp do_process_mcp_request(%{"method" => "tools/call"} = request, state) do
     id = Map.get(request, "id")
     params = Map.get(request, "params", %{})
+    arguments = Map.get(params, "arguments", %{})
+    meta = Map.get(params, "_meta")
 
     enhanced_arguments =
-      params
-      |> Map.get("arguments", %{})
+      arguments
       |> Map.put("_request_id", id)
-      |> put_meta(Map.get(params, "_meta"))
+      |> put_meta(meta)
 
     enhanced_params = Map.put(params, "arguments", enhanced_arguments)
     enhanced_request = Map.put(request, "params", enhanced_params)
@@ -1764,7 +1765,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
     # The copy of _meta is not caller data, so the requestState binding leaves
     # it out; the request's own _meta stays bound.
     dispatch(enhanced_request, state,
-      injected_argument_meta: not is_nil(Map.get(params, "_meta"))
+      injected_argument_meta: not is_nil(meta) and not Map.has_key?(arguments, "_meta")
     )
   end
 
@@ -1929,7 +1930,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
   defp effective_protocol_mode(state), do: state.protocol_mode
 
   defp put_meta(arguments, nil), do: arguments
-  defp put_meta(arguments, meta), do: Map.put(arguments, "_meta", meta)
+  defp put_meta(arguments, meta), do: Map.put_new(arguments, "_meta", meta)
 
   defp emit_initialize_telemetry(result) do
     server_name =
