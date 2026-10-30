@@ -90,11 +90,14 @@ defmodule Arbor.MCP.Client.HTTPInlineReauthStreamTest do
     retired = :sys.get_state(client).transport_state
     assert retired.access_token == nil
 
-    assert {:error, %{reason: {:authentication_failed, :rejected_credential}}} =
+    assert {:error, %{reason: {:authentication_failed, :rejected_credential}} = refusal} =
              Client.call_tool(client, "protected", %{},
                format: :map,
                retry_policy: [max_attempts: 3, initial_delay: 0, should_retry?: fn _ -> true end]
              )
+
+    # Refused before it was sent.
+    assert Client.delivery_outcome(refusal) == :not_sent
 
     assert {:error,
             {:stream_error, {:auth_refused, {:authentication_failed, :rejected_credential}}}} =

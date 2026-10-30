@@ -383,6 +383,10 @@ defmodule Arbor.MCP.Client do
     request stream with a new JSON-RPC id. `:safe_only` reissues only built-in
     read operations or operations explicitly marked `retry_safe: true`, and
     otherwise returns a transport error whose reason is `:outcome_unknown`.
+    A stream whose connection never opened sent nothing, so it isn't
+    reissued: it fails at once, as not sent (see `delivery_outcome/1`). A
+    reissue that isn't sent leaves the outcome unknown, since the first
+    attempt may have been delivered.
   - `:http_stream_retry_delay` - Delay before the one reissue (default: 200ms),
     bounded by the operation's original deadline.
   - `:retry_safe` - Caller-owned safety attestation. Tool annotations such as
@@ -1408,7 +1412,9 @@ defmodule Arbor.MCP.Client do
       passed or the caller exited before it went out, or the transport
       refused it before writing anything (the connection could not be opened,
       the address could not be resolved or was not permitted, the request was
-      too large, a security policy blocked it).
+      too large, a security policy blocked it, the auth provider gave no
+      token for it, or gave one the server had already rejected). This holds
+      for a request with its own response stream too.
     * `:unknown` - the request was, or may have been, delivered, and whether
       the server acted on it is not known. This covers the caller's own
       timeout, a connection that failed after sending, a broken response
@@ -1467,7 +1473,11 @@ defmodule Arbor.MCP.Client do
   defp send_outcome({:validation_error, _reason}), do: :not_sent
   defp send_outcome({:transport_error, {:send_failed, _reason}}), do: :not_sent
   defp send_outcome({:transport_error, reason}), do: send_outcome(reason)
-  defp send_outcome(_reason), do: :unknown
+
+  # The HTTP transport refused it before writing anything: its auth provider
+  # gave no token, or gave one the server had already rejected.
+  defp send_outcome(reason),
+    do: if(HTTP.presend_refusal?(reason), do: :not_sent, else: :unknown)
 
   # GenServer callbacks
 
@@ -1610,6 +1620,13 @@ defmodule Arbor.MCP.Client do
   defp normalize_connection_error({:auth_provider_init_failed, _provider, _reason} = reason),
     do: {:transport_connect_failed, reason}
 
+  # So is this one: the opening request was refused before it was sent,
+  # because the auth provider gave no token for it. However establishment
+  # reported that, it says nothing about the server or its era.
+  defp normalize_connection_error({tag, _details} = reason)
+       when tag in [:auth_refused, :era_probe_failed, :pinned_modern_era_probe_failed],
+       do: {:transport_connect_failed, token_failure(reason) || extract_inner_reason(reason)}
+
   defp normalize_connection_error(:connection_refused) do
     {:transport_connect_failed, :connection_refused}
   end
@@ -1643,6 +1660,14 @@ defmodule Arbor.MCP.Client do
     normalized = extract_inner_reason(reason)
     {:transport_connect_failed, normalized}
   end
+
+  defp token_failure({:auth_refused, {:auth_provider_token_failed, _, _} = failure}), do: failure
+  defp token_failure({:era_probe_failed, {:transport_error, refusal}}), do: token_failure(refusal)
+
+  defp token_failure({:pinned_modern_era_probe_failed, %{probe: {:transport_error, refusal}}}),
+    do: token_failure(refusal)
+
+  defp token_failure(_reason), do: nil
 
   # Extract inner reason from nested structures
   defp extract_inner_reason(%{"code" => _, "message" => _} = err_map), do: err_map

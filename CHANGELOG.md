@@ -225,6 +225,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An HTTP `:auth_provider` whose `get_token/1` returns `{:error, reason}` now
+  refuses the request before it is sent (#176). The transport ignored the
+  error, so the request went out with the token the provider gave before, or
+  with none, and the caller got the server's answer. This held for modern
+  POSTs, request streams (`progress_token:`), subscriptions, legacy POSTs,
+  notifications and the requests that open a connection. The request now
+  fails with `{:auth_provider_token_failed, provider, reason}`, which
+  `Arbor.MCP.Client.delivery_outcome/1` reports as `:not_sent`;
+  `Arbor.MCP.Client.listen/2` returns it as
+  `{:error, {:stream_error, {:auth_refused, {:auth_provider_token_failed, provider, reason}}}}`,
+  and `Arbor.MCP.Client.start_link/1` as
+  `{:error, {:transport_connect_failed, {:auth_provider_token_failed, provider, reason}}}`
+  in every `protocol_mode`, without falling back to the other era. `reason`
+  is redacted as an init failure's is (#161): an atom is kept, any other
+  error is `:redacted`, an exception `{:raised, exception_module}`, a throw
+  or exit `:throw` or `:exit`, and a return the callback doesn't allow
+  (including a token that isn't a string) `:invalid_token_result`.
+  `{:ok, nil, state}` now sends the request without an `Authorization`
+  header; it used to keep the earlier token. Dropping a token doesn't
+  forget it: a token the server rejected is still refused, as not sent, if
+  the provider returns it again with its state unchanged. With an
+  `:auth_provider`, an `Authorization` header set through `:headers` or
+  `:security` is now dropped at connect, with a warning: the provider owns
+  that header, so a request carries its token or none. The configured
+  header used to go out until the provider's first token replaced it, and
+  again whenever the provider had none, the OAuth provider's first,
+  pre-auth request included. Requests that went out with a stale token
+  before now fail, so a provider that would rather let the server decide
+  should return a token, as the built-in OAuth provider does when a refresh
+  fails. A request refused this way, or for carrying a
+  credential the server already rejected, never counts as a `reliability:`
+  circuit-breaker failure, and the rejected-credential refusal is now
+  reported as `:not_sent` too.
+- A modern request stream (`progress_token:`) whose connection never opened
+  was reported as possibly delivered (#177): a refused connection, an
+  address that didn't resolve or wasn't permitted, or an unavailable trust
+  store failed as `%Arbor.MCP.Error.TransportError{reason: :outcome_unknown}`
+  after the default `http_stream_retry: :at_least_once` had reissued it
+  once. It now fails at once, without a reissue, with the reason an
+  ordinary POST reports (for example `%Mint.TransportError{reason: :econnrefused}`
+  or `:dns_failed`), which `Arbor.MCP.Client.delivery_outcome/1` reports as
+  `:not_sent`. A stream that breaks after it opened is reissued as before,
+  and a reissue that is never sent now reports `:outcome_unknown`, since the
+  first attempt may have been delivered.
 - A pre-registered client secret configured through the legacy
   `client_id` / `client_secret` aliases was not bound to an issuer under the
   default legacy protocol (`2025-11-25`). Attacker-controlled authorization
