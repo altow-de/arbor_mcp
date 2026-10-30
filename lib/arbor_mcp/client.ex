@@ -710,10 +710,11 @@ defmodule Arbor.MCP.Client do
       end
 
   Repeat the arguments, `:client_capabilities`, `:meta` and
-  `:progress_token` on every round of one call: an arbor_mcp server binds
-  `requestState` to them and refuses a round that differs. For the same
-  reason `reset_timeout_on_progress: true` with `mrtr: :manual` needs an
-  explicit `:progress_token`. A round passes the checks automatic MRTR
+  `:progress_token` on every round of one call: a server may bind
+  `requestState` to them and refuse a round that differs. An arbor_mcp server
+  leaves the progress token out of that binding; another server may not. For
+  the same reason `reset_timeout_on_progress: true` with `mrtr: :manual`
+  needs an explicit `:progress_token`. A round passes the checks automatic MRTR
   makes, apart from `:max_mrtr_rounds`; the caller runs the rounds.
   `:input_responses`, `:request_state` and `:client_capabilities` without
   `mrtr: :manual`, malformed, or on a connection that settled on a legacy
