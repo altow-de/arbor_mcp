@@ -1289,7 +1289,16 @@ defmodule Arbor.MCP.Client.ProgressToTest do
   # the same Mix setup as this VM (see ModernStdioTest).
   defp mix_child_env do
     [{"MIX_ENV", "test"}] ++
-      for name <- ["MIX_HOME", "MIX_ARCHIVES", "MIX_DEPS_PATH", "MIX_BUILD_PATH"],
+      for name <- [
+            "MIX_HOME",
+            "MIX_ARCHIVES",
+            "MIX_DEPS_PATH",
+            "MIX_BUILD_PATH",
+            "ARBOR_RPC_PATH",
+            "ARBOR_V2_DEPS",
+            "ARBOR_V2_BUILD",
+            "ARBOR_V2_LOCK"
+          ],
           value = System.get_env(name),
           do: {name, value}
   end
