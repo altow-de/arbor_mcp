@@ -51,8 +51,8 @@ defmodule Arbor.MCP.Server.HTTPBanditCompatibilityTest do
     end
 
     for {bandit, island} <- [
-          {"1.12.5", "1.5.0"}, {"1.13.1", "1.6.0"},
-          {"1.14.1", "1.6.0"}, {"1.14.0", "1.5.0"}, {"1.14.0", "1.6.1"}
+          {"1.12.5", "1.5.0"}, {"1.14.0", "1.6.0"},
+          {"1.14.2", "1.6.0"}, {"1.14.1", "1.5.0"}, {"1.14.1", "1.6.1"}
         ] do
       for {app, version} <- [bandit: bandit, thousand_island: island] do
         :ok = Application.unload(app)

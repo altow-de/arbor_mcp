@@ -150,6 +150,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING:** Bandit `~> 1.14 and >= 1.14.1` is required, for
+  EEF-CVE-2026-116078: HTTP/2 request bodies made of 1-byte DATA frames
+  amplify memory use in Bandit 1.14.0 and earlier. An owned Bandit listener
+  now qualifies exact Bandit `1.14.1` with Thousand Island `1.6.0`, so a host
+  that pinned `1.14.0` must update the pin. Bandit's `lib/bandit.ex`, from
+  which the owned listener's option handling is adapted, is the same in both
+  releases.
 - **BREAKING:** Client startup failures preserve structured connection reasons
   inside `{:transport_connect_failed, reason}` instead of stringifying them.
   Initial connection diagnostics use debug logging and the redacted
