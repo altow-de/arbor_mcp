@@ -109,6 +109,38 @@ tool "add", "Adds two numbers" do
 end
 ```
 
+A module with tools also gets `handle_get_tool/2`, which returns a declared
+tool's definition by name, read from the same list `tools/list` pages
+through, and `nil` for any other name, such as a tool added with
+`Arbor.MCP.Server.add_tool/3`. A modern `tools/call` over HTTP checks its
+`Mcp-Param-*` headers against that definition, so the server doesn't page
+through `tools/list` for it, even with `page_size:`. See
+`c:Arbor.MCP.Server.Handler.handle_get_tool/2`.
+
+A module may override `handle_list_tools/2`, for example to add tools or
+annotations, and may call `super` for the declared list:
+
+```elixir
+@impl true
+def handle_list_tools(cursor, state) do
+  {:ok, tools, next_cursor, state} = super(cursor, state)
+  {:ok, tools ++ MyApp.extra_tools(), next_cursor, state}
+end
+```
+
+The DSL then leaves out the generated `handle_get_tool/2`, since the
+declared definitions might not be the ones the list advertises, and the
+header check walks the list the module serves. A module that defines
+`handle_get_tool/2` itself keeps its own, and it must return the definitions
+its `tools/list` advertises.
+
+The DSL sees an override written in the module body. It does not see a
+`handle_list_tools/2` that a later `@before_compile` hook defines, for
+example one from a library `use`d after the DSL, because that hook runs after
+the DSL's. A module whose list is changed that way must define
+`handle_get_tool/2` itself, returning the definitions the list advertises or
+`nil`.
+
 ### Param types
 
 | DSL type | JSON Schema |

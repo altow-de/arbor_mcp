@@ -859,9 +859,10 @@ defmodule Arbor.MCP.Server.Dispatch do
 
   defp validate_http_initialize(_ctx, result, _state), do: result
 
-  # The tool's x-mcp-header annotations may be on any page of tools/list, so
-  # follow the cursors until it turns up. A list that runs past the bound
-  # fails closed rather than skipping the header check.
+  # Unless the handler's handle_get_tool/2 supplies it, the tool's
+  # x-mcp-header annotations may be on any page of tools/list, so follow the
+  # cursors until it turns up. A list that runs past the bound fails closed
+  # rather than skipping the header check.
   @max_tool_pages 100
 
   defp validate_tool_headers(
@@ -884,7 +885,7 @@ defmodule Arbor.MCP.Server.Dispatch do
          :error
        ) do
     if Keyword.has_key?(opts, :request_headers) do
-      case listed_tool(ctx, name, nil, state, @max_tool_pages) do
+      case handler_tool(ctx, name, state) do
         {:ok, tools, next_state} ->
           validate_tool_header_entries(tools, name, arguments, opts, next_state)
 
@@ -897,6 +898,36 @@ defmodule Arbor.MCP.Server.Dispatch do
   end
 
   defp validate_tool_headers(_ctx, _name, _arguments, state, _registered), do: {:ok, state}
+
+  # A handler that defines handle_get_tool/2 names the definition itself; nil
+  # means it doesn't know the tool, so the walk still runs and the check is
+  # never skipped. The lookup runs inside the request's work, like the walk,
+  # under the same deadline.
+  defp handler_tool(ctx, name, state) do
+    if exported?(ctx.module, :handle_get_tool, 2) do
+      looked_up =
+        Context.with_context(ctx.request_context, fn ->
+          ctx.module.handle_get_tool(name, state)
+        end)
+
+      # {:ok, result} keeps the state, as for other callbacks and over the
+      # MessageProcessor's handler bridge.
+      case looked_up do
+        {:ok, nil, next_state} -> listed_tool(ctx, name, nil, next_state, @max_tool_pages)
+        {:ok, nil} -> listed_tool(ctx, name, nil, state, @max_tool_pages)
+        {:ok, tool, next_state} when is_map(tool) -> named_tool(tool, name, next_state)
+        {:ok, tool} when is_map(tool) -> named_tool(tool, name, state)
+        _unavailable -> :unavailable
+      end
+    else
+      listed_tool(ctx, name, nil, state, @max_tool_pages)
+    end
+  end
+
+  # A definition for another tool would match no name and skip the check.
+  defp named_tool(tool, name, state) do
+    if listed?([tool], name), do: {:ok, [tool], state}, else: :unavailable
+  end
 
   defp listed_tool(_ctx, _name, _cursor, _state, 0), do: :unavailable
 
