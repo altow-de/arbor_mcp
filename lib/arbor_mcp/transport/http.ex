@@ -1362,10 +1362,35 @@ defmodule Arbor.MCP.Transport.HTTP do
         www_auth = Headers.get(headers, "www-authenticate")
         {:error, {:unauthorized, 401, body_binary, www_auth}}
 
+      {_, 404, _} ->
+        handle_not_found(body_binary, state, request_body)
+
       {_, status, _} ->
         {:error, {:http_error, status, body_binary}}
     end
   end
+
+  # A modern (2026-07-28) server answers a method it doesn't implement with
+  # 404 and a JSON-RPC error for the request, which the body tells apart from
+  # a server without the endpoint. That error is the request's answer, as in
+  # a 200. Any other 404, and every legacy one, stays an HTTP error.
+  defp handle_not_found(body, %{protocol_era: :modern} = state, request_body) do
+    with {:ok, %{"error" => %{"code" => code, "message" => message}} = response}
+         when is_integer(code) and is_binary(message) <- Jason.decode(body),
+         true <- answers_request?(response, request_body) do
+      {:ok, %{state | last_response: response}, Jason.encode!(response)}
+    else
+      _not_json_rpc -> {:error, {:http_error, 404, body}}
+    end
+  end
+
+  defp handle_not_found(body, _state, _request_body), do: {:error, {:http_error, 404, body}}
+
+  defp answers_request?(%{"jsonrpc" => "2.0", "id" => id} = response, request_body)
+       when not is_nil(id),
+       do: not Map.has_key?(response, "result") and extract_request_id(request_body) == id
+
+  defp answers_request?(_response, _request_body), do: false
 
   defp handle_non_sse_response(body, headers, state, request_body) do
     content_type = Headers.get(headers, "content-type") || ""
