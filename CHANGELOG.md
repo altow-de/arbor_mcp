@@ -150,10 +150,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING:** Client startup failures preserve structured connection reasons
+  inside `{:transport_connect_failed, reason}` instead of stringifying them.
+  Initial connection diagnostics use debug logging and the redacted
+  `[:arbor_mcp, :client, :connect, :failed]` telemetry event instead of an
+  unconditional error log. Explicit binary errors and established tagged
+  initialization/auth-provider failures retain their existing envelopes.
 - **BREAKING:** Runtime constructors reject unknown option names instead of
   silently discarding them. Configure `mrtr: true` and `request_state:` on the
   Runtime for startup validation on every transport, including mounted HTTP.
-
 - **Pre-registered OAuth client secrets are issuer-bound by default.** There
   is no opt-out. This breaks HTTP auth and `DiscoveryFlow.execute/1` that
   still set only `client_id` / `client_secret` (the 1.x aliases) and omit
@@ -274,7 +279,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP mounts can initialize before runtime configuration loads. Runtime docs
   now describe cancellation messages, the callback cleanup grace, progress
   delivery errors, and request-state/output limits.
-
 - An HTTP `:auth_provider` whose `get_token/1` returns `{:error, reason}` now
   refuses the request before it is sent (#176). The transport ignored the
   error, so the request went out with the token the provider gave before, or

@@ -202,6 +202,13 @@ defmodule Arbor.MCP.Client do
   @doc """
   Starts a client process with the given options.
 
+  Connection failures retain structured reasons inside
+  `{:error, {:transport_connect_failed, reason}}`; dedicated handshake and
+  initialization error envelopes remain unchanged. Initial failures emit
+  `[:arbor_mcp, :client, :connect, :failed]` with a redacted reason summary
+  and use debug-level diagnostics, leaving application error logging to the
+  caller. A host supervisor may still report its own child-start failure.
+
   ## Options
 
   - `:transport` - Transport type (`:stdio`, `:http`, `:sse`, `:beam`, etc.)
@@ -1597,7 +1604,15 @@ defmodule Arbor.MCP.Client do
 
   # Handle connection errors with proper normalization
   defp handle_connection_error(reason) do
-    Logger.error("Failed to initialize MCP client", reason: LogSummary.describe(reason))
+    summary = LogSummary.describe(reason)
+
+    :telemetry.execute(
+      [:arbor_mcp, :client, :connect, :failed],
+      %{count: 1},
+      %{client: self(), reason: summary}
+    )
+
+    Logger.debug("MCP client connection failed", reason: summary)
     {:stop, normalize_connection_error(reason)}
   end
 
@@ -1673,8 +1688,7 @@ defmodule Arbor.MCP.Client do
   # Extract inner reason from nested structures
   defp extract_inner_reason(%{"code" => _, "message" => _} = err_map), do: err_map
   defp extract_inner_reason({:error, inner_reason}), do: inner_reason
-  defp extract_inner_reason(atom) when is_atom(atom), do: to_string(atom)
-  defp extract_inner_reason(other), do: inspect(other)
+  defp extract_inner_reason(other), do: other
 
   @impl GenServer
   def handle_call({:request, method, params}, from, state) do
