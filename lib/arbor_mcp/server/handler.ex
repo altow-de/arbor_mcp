@@ -72,7 +72,8 @@ defmodule Arbor.MCP.Server.Handler do
   `x-mcp-header` annotation; one without an annotation lets through
   requests the walk would reject. Return `nil` when unsure: the server then
   walks the list. The DSL's generated callback reads the same definitions
-  as its `tools/list`.
+  as its `tools/list`, and the DSL leaves it out for a module that
+  overrides `c:handle_list_tools/2`.
 
   ## Basic Example
 
@@ -485,9 +486,12 @@ defmodule Arbor.MCP.Server.Handler do
 
   Tools added with `Arbor.MCP.Server.add_tool/3` are checked against their
   own definition, without this callback. `use Arbor.MCP.Server.DSL` defines
-  it for the tools the module declares, unless the module defines it
-  itself. `use Arbor.MCP.Server.Handler` defines no default, so a handler
-  without it keeps the walk.
+  it for the tools the module declares, from the definitions its
+  `tools/list` pages through. It leaves it out when the module defines it
+  itself, or overrides `c:handle_list_tools/2`, even through `super`: the
+  declared definitions might not be the ones that list advertises, so the
+  check walks it. `use Arbor.MCP.Server.Handler` defines no default, so a
+  handler without it keeps the walk.
 
       @impl true
       def handle_get_tool(name, state) do

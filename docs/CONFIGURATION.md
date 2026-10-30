@@ -1746,7 +1746,8 @@ annotation out lets a request through without that header, or with a wrong
 value, which the walk would reject. Only the handler can introduce that
 mismatch, not a client, and returning `nil` is always safe. The DSL defines
 `handle_get_tool/2` for its declared tools, from the same definitions its
-`tools/list` pages through.
+`tools/list` pages through, and leaves it out for a module that overrides
+`handle_list_tools/2`, so the check walks the list that module serves.
 
 `nil` means the callback doesn't know the tool, and the server then walks the
 list as before, so the check is never skipped. An `{:error, reason, state}`,

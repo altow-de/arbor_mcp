@@ -89,6 +89,14 @@ defmodule Arbor.MCP.Server.DSL do
 
       defoverridable child_spec: 1
 
+      # Overridable, so a module may replace the declared tools' list or
+      # extend it with super. The generated handle_get_tool/2 is then left
+      # out, and the Mcp-Param check walks the list the module serves.
+      @impl Arbor.MCP.Server.Handler
+      def handle_list_tools(cursor, state), do: __ex_mcp_dsl_list_tools__(cursor, state)
+
+      defoverridable handle_list_tools: 2
+
       @before_compile Arbor.MCP.Server.DSL
     end
   end
@@ -136,7 +144,11 @@ defmodule Arbor.MCP.Server.DSL do
     assert_unique_ids!(env, prompts, :prompt, & &1.name)
     assert_local_completers!(env, resource_templates, :resource_templates, locations)
     assert_local_completers!(env, prompts, :prompts, locations)
-    get_tool_defined? = Module.defines?(env.module, {:handle_get_tool, 2})
+    # Generated only while handle_list_tools/2 is the DSL's own: a lookup
+    # from the declared definitions would not match a list the module
+    # replaced or extended.
+    generate_get_tool? =
+      not Module.defines?(env.module, {:handle_get_tool, 2}) and own_list_tools?(env.module)
 
     quote do
       @doc false
@@ -147,7 +159,8 @@ defmodule Arbor.MCP.Server.DSL do
       )
 
       unquote_splicing(generate_tool_handlers(tools))
-      unquote(generate_tool_callbacks(tools, get_tool_defined?))
+      unquote(generate_tool_list(tools))
+      unquote(generate_tool_callbacks(tools, generate_get_tool?))
 
       unquote_splicing(generate_resource_handlers(resources, :resource))
       unquote_splicing(generate_resource_handlers(resource_templates, :resource_template))
@@ -898,11 +911,51 @@ defmodule Arbor.MCP.Server.DSL do
     end
   end
 
-  defp generate_tool_callbacks([], _get_tool_defined?), do: nil
+  # Whether handle_list_tools/2 is still the one `use` defined: a single
+  # clause that calls the generated list, not a replacement or a super call.
+  defp own_list_tools?(module) do
+    case Module.get_definition(module, {:handle_list_tools, 2}) do
+      {:v1, :def, _meta, [{_clause_meta, [_cursor, _state], [], body}]} ->
+        match?({:__ex_mcp_dsl_list_tools__, _call_meta, [_, _]}, body)
 
-  defp generate_tool_callbacks(tools, get_tool_defined?) do
+      _replaced ->
+        false
+    end
+  end
+
+  # What the DSL's handle_list_tools/2 returns, and what a module's override
+  # gets from super. Without tools it is the Handler default.
+  defp generate_tool_list([]) do
+    quote do
+      @doc false
+      def __ex_mcp_dsl_list_tools__(_cursor, state), do: {:ok, [], nil, state}
+    end
+  end
+
+  defp generate_tool_list(tools) do
     definitions = Enum.map(tools, fn {definition, _handler, _params} -> definition end)
 
+    quote do
+      # The one list of definitions that tools/list pages and the generated
+      # handle_get_tool/2 both read, so the definition the Mcp-Param check
+      # trusts is always the one listed.
+      defp __ex_mcp_dsl_tool_definitions__, do: unquote(Macro.escape(definitions))
+
+      @doc false
+      def __ex_mcp_dsl_list_tools__(cursor, state) do
+        Arbor.MCP.Server.DSL.Builder.list_page(
+          __ex_mcp_dsl_tool_definitions__(),
+          cursor,
+          @ex_mcp_dsl_page_size,
+          state
+        )
+      end
+    end
+  end
+
+  defp generate_tool_callbacks([], _generate_get_tool?), do: nil
+
+  defp generate_tool_callbacks(tools, generate_get_tool?) do
     mapping = tools |> Enum.with_index() |> Map.new(&tool_callback_entry/1)
 
     dispatch =
@@ -925,22 +978,7 @@ defmodule Arbor.MCP.Server.DSL do
       alias Arbor.MCP.Server.DSL.Builder
       alias Arbor.MCP.Server.Result
 
-      # The one list of definitions that tools/list pages and
-      # handle_get_tool/2 both read, so the definition the Mcp-Param check
-      # trusts is always the one listed.
-      defp __ex_mcp_dsl_tool_definitions__, do: unquote(Macro.escape(definitions))
-
-      @impl Arbor.MCP.Server.Handler
-      def handle_list_tools(cursor, state) do
-        Builder.list_page(
-          __ex_mcp_dsl_tool_definitions__(),
-          cursor,
-          @ex_mcp_dsl_page_size,
-          state
-        )
-      end
-
-      unquote(generate_get_tool_callback(get_tool_defined?))
+      unquote(generate_get_tool_callback(generate_get_tool?))
 
       @impl Arbor.MCP.Server.Handler
       def handle_call_tool(name, arguments, state) do
@@ -955,10 +993,10 @@ defmodule Arbor.MCP.Server.DSL do
 
   # A declared tool's definition by name, from the list tools/list pages, so
   # the Mcp-Param header check needs no walk; nil for any other name, such as
-  # a tool added with Server.add_tool/3. A module's own handle_get_tool/2 wins.
-  defp generate_get_tool_callback(true = _defined?), do: nil
+  # a tool added with Server.add_tool/3.
+  defp generate_get_tool_callback(false = _generate?), do: nil
 
-  defp generate_get_tool_callback(false = _defined?) do
+  defp generate_get_tool_callback(true = _generate?) do
     quote do
       @impl Arbor.MCP.Server.Handler
       def handle_get_tool(name, state) do

@@ -138,6 +138,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the module's `tools/list` and returns `nil` for tools added with
   `Arbor.MCP.Server.add_tool/3`, which are checked against their own
   definitions. A DSL server with `page_size:` no longer pages for the check.
+  A DSL module's `handle_list_tools/2` is now overridable, so an override
+  can call `super` for the declared list. A module that overrides
+  it gets no generated `handle_get_tool/2`, so the check walks the list it
+  serves; one that also defines `handle_get_tool/2` keeps its own.
 
   `Arbor.MCP.Server.Context.current/0` is now documented: on a Runtime, its
   `method` is `"tools/call"` while `handle_list_tools/2` runs for the check.

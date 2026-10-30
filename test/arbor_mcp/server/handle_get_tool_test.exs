@@ -192,6 +192,62 @@ defmodule Arbor.MCP.Server.HandleGetToolTest do
     end
   end
 
+  # Codex's case: the declared region has no annotation, and the module's
+  # own list advertises one.
+  defmodule DSLListOverride do
+    use Arbor.MCP.Server.Handler
+    use Arbor.MCP.Server.DSL, name: "get-tool-list-override", version: "1.0.0"
+
+    alias Arbor.MCP.Server.HandleGetToolTest, as: Fixture
+
+    tool "routed", "Declared without an annotation" do
+      input_schema(%{type: "object", properties: %{region: %{type: "string"}}})
+      run(fn _args, state -> {:ok, "routed", state} end)
+    end
+
+    @impl true
+    def handle_list_tools(_cursor, state), do: {:ok, [Fixture.routed()], nil, state}
+  end
+
+  # The same, with the annotation added to the declared list through super.
+  defmodule DSLSuperOverride do
+    use Arbor.MCP.Server.Handler
+    use Arbor.MCP.Server.DSL, name: "get-tool-super-override", version: "1.0.0"
+
+    alias Arbor.MCP.Server.HandleGetToolTest, as: Fixture
+
+    tool "routed", "Declared without an annotation" do
+      input_schema(%{type: "object", properties: %{region: %{type: "string"}}})
+      run(fn _args, state -> {:ok, "routed", state} end)
+    end
+
+    @impl true
+    def handle_list_tools(cursor, state) do
+      {:ok, tools, next, state} = super(cursor, state)
+      {:ok, Enum.map(tools, &Fixture.annotate_region/1), next, state}
+    end
+  end
+
+  # Both overridden, consistently.
+  defmodule DSLBothOverride do
+    use Arbor.MCP.Server.Handler
+    use Arbor.MCP.Server.DSL, name: "get-tool-both-override", version: "1.0.0"
+
+    alias Arbor.MCP.Server.HandleGetToolTest, as: Fixture
+
+    tool "routed", "Declared without an annotation" do
+      input_schema(%{type: "object", properties: %{region: %{type: "string"}}})
+      run(fn _args, state -> {:ok, "routed", state} end)
+    end
+
+    @impl true
+    def handle_list_tools(_cursor, state), do: {:ok, [Fixture.routed()], nil, state}
+
+    @impl true
+    def handle_get_tool(name, state),
+      do: {:ok, Map.get(%{"routed" => Fixture.routed()}, name), state}
+  end
+
   defmodule DSLWithoutTools do
     use Arbor.MCP.Server.Handler
     use Arbor.MCP.Server.DSL, name: "get-tool-dsl-empty", version: "1.0.0"
@@ -200,6 +256,15 @@ defmodule Arbor.MCP.Server.HandleGetToolTest do
       render(fn _args, state -> {:ok, %{messages: []}, state} end)
     end
   end
+
+  @doc false
+  def routed, do: @routed
+
+  @doc false
+  def annotate_region(%{name: "routed"} = tool),
+    do: put_in(tool, [:inputSchema, :properties, :region, :"x-mcp-header"], "Region")
+
+  def annotate_region(tool), do: tool
 
   @doc false
   def method do
@@ -617,6 +682,62 @@ defmodule Arbor.MCP.Server.HandleGetToolTest do
       assert %{status: 200} = call_tool(runtime, "routed", arguments, [{"mcp-param-zone", "eu"}])
     end
   end
+
+  describe "DSL servers whose tools/list is overridden" do
+    setup do
+      traced = [DSLListOverride, DSLSuperOverride, DSLBothOverride]
+
+      for module <- traced,
+          do: :erlang.trace_pattern({module, :handle_list_tools, 2}, true, [:call_count])
+
+      on_exit(fn ->
+        for module <- traced,
+            do: :erlang.trace_pattern({module, :handle_list_tools, 2}, false, [:call_count])
+      end)
+    end
+
+    test "a replaced list leaves out the generated lookup, so the walk checks it" do
+      refute function_exported?(DSLListOverride, :handle_get_tool, 2)
+      assert_region_checked(DSLListOverride)
+      assert {:call_count, count} = list_calls(DSLListOverride)
+      assert count > 0
+    end
+
+    test "a list extended with super leaves out the generated lookup too" do
+      refute function_exported?(DSLSuperOverride, :handle_get_tool, 2)
+
+      assert {:ok, [%{inputSchema: %{properties: %{region: %{"x-mcp-header": "Region"}}}}], nil,
+              :state} = DSLSuperOverride.handle_list_tools(nil, :state)
+
+      assert_region_checked(DSLSuperOverride)
+    end
+
+    test "a module that overrides both keeps its lookup and lists nothing for the check" do
+      assert {:ok, @routed, :state} = DSLBothOverride.handle_get_tool("routed", :state)
+      assert_region_checked(DSLBothOverride)
+      assert list_calls(DSLBothOverride) == {:call_count, 0}
+    end
+  end
+
+  # Over a Runtime and through a MessageProcessor handler process, a missing
+  # or mismatched Mcp-Param-Region is refused with -32020, and a matching one
+  # reaches the tool.
+  defp assert_region_checked(handler) do
+    for headers <- [[], [{"mcp-param-region", "us"}]] do
+      response = post(handler, [], headers)
+      assert {headers, response.status, response.body["error"]["code"]} == {headers, 400, -32020}
+
+      conn = process(handler, [], headers)
+
+      assert {headers, conn.assigns[:http_status], conn.response["error"]["code"]} ==
+               {headers, 400, -32020}
+    end
+
+    assert %{status: 200} = post(handler, [], [{"mcp-param-region", "eu"}])
+    assert process(handler, [], [{"mcp-param-region", "eu"}]).response["result"]
+  end
+
+  defp list_calls(module), do: :erlang.trace_info({module, :handle_list_tools, 2}, :call_count)
 
   # A modern tools/call for "routed" with region "eu", through a fresh
   # Runtime-mounted HttpPlug.
