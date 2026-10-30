@@ -405,7 +405,8 @@ def suggest_owners(value, _context),
   is the spec's limit.
 
 Arguments without `complete:` fall through to your `handle_complete/3`, so a
-hand-written callback can still cover the rest. Clients pass the context with
+hand-written callback can still cover the rest. Without one, they complete to
+no values, as in the TypeScript SDK, rather than to an error. Clients pass the context with
 `Arbor.MCP.Client.complete(client, ref, argument, context: %{"arguments" => ...})`.
 
 ## Adding tools at runtime

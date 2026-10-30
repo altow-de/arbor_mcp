@@ -285,6 +285,16 @@ The server returns one of these shapes:
   response; or
 - `202 Accepted` with no body for an accepted notification POST.
 
+A method the server doesn't implement, or one behind a capability it doesn't
+advertise, is answered with `404 Not Found` and a JSON-RPC `-32601` error,
+also for a request whose progress token would have opened an event stream,
+as long as nothing has been written to that stream yet. The client returns
+that error as it would one from a `200`, and keeps its connection. A `404`
+without a JSON-RPC error for the request stays an HTTP error.
+A server that advertises a capability but leaves out part of it, such as
+resource templates beside resources, or completion for one prompt argument,
+answers that part with an empty list or completion rather than `-32601`.
+
 A modern result always has `resultType: "complete"` or
 `resultType: "input_required"`. For `input_required`, the client satisfies the
 embedded elicitation, sampling, or roots requests and sends the original
@@ -299,8 +309,11 @@ Closing a modern request/subscription response stream is the cancellation
 signal; there is no session DELETE and no resumable `Last-Event-ID` cursor.
 For a modern SSE request response other than `subscriptions/listen`, which
 has its own keepalive, the server writes comment keepalives every
-`:request_keepalive_interval_ms` (15 seconds by default). A failed write
-cancels the running handler and releases its Runtime capacity. Over TCP the
+`:request_keepalive_interval_ms` (15 seconds by default). A failed write,
+of a keepalive or of a progress or log notification, cancels the running
+handler and releases its Runtime capacity. The client has closed the stream,
+which is how it cancels, so that write, like a failed write of the final
+response, ends the response without logging an error. Over TCP the
 first write after the client closes usually succeeds and the next one fails,
 so on Bandit the close is usually noticed within two intervals. Cowboy instead
 terminates the request process when it sees the connection close, which

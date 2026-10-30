@@ -19,7 +19,7 @@ defmodule Arbor.MCP.Client.LegacySessionExpiryTest do
   @moduletag :capture_log
 
   alias Arbor.MCP.Client
-  alias Arbor.MCP.Error.TransportError
+  alias Arbor.MCP.Error.{ProtocolError, TransportError}
   alias Arbor.MCP.Server.Runtime
   alias Arbor.MCP.Transport.ReliabilityWrapper
 
@@ -495,7 +495,7 @@ defmodule Arbor.MCP.Client.LegacySessionExpiryTest do
     on_exit(fn -> stop(client) end)
     assert_receive {:modern_post, "server/discover", nil}
 
-    assert {:error, %TransportError{reason: {:http_error, 404, _body}}} =
+    assert {:error, %ProtocolError{code: -32601, message: "Method not found"}} =
              Client.call_tool(client, "missing", %{}, timeout: 2_000)
 
     assert_receive {:modern_post, "tools/call", nil}
