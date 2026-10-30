@@ -1169,8 +1169,31 @@ config :arbor_mcp, :request_state,
   keys: %{"2026-08" => key},
   ttl_seconds: 300,
   max_ttl_seconds: 900,
-  clock_skew_seconds: 30
+  clock_skew_seconds: 30,
+  max_json_bytes: 32_768,
+  max_token_bytes: 65_536
 ```
+
+`max_json_bytes` bounds the entire encoded seal payload, including application
+state, the request binding, and envelope metadata. `max_token_bytes` bounds
+sealed tokens both when creating and receiving them. A gateway that nests an
+upstream token in its own application state may need to raise both limits:
+a permitted 64 KiB upstream token cannot fit in the default 32 KiB payload,
+and the binding, metadata, encoding and encryption add overhead. These
+limits do not change the Runtime's request/output byte budgets.
+
+Put `mrtr: true` on the Runtime child specification, for every transport,
+including `:mounted_http`. The Runtime validates the key ring before starting
+the handler. Set `request_state: [...]` there for a per-Runtime ring, or use
+the application configuration above; a per-Runtime ring reaches every MRTR
+dispatch. `HttpPlug.init/1` does not read the ring, so a named mount can be
+compiled before runtime configuration is loaded.
+
+**BREAKING:** Runtime constructors reject unknown option names with
+`{:error, {:unknown_runtime_options, keys}}` instead of silently dropping
+them. Correct misspelled or misplaced options when upgrading. HTTP listener
+settings still belong under `http:`; handler/stdio wrappers retain their own
+edge options while forwarding only Runtime options.
 
 For a rolling rotation, first distribute `%{"old" => old_key, "new" =>
 new_key}` to every node with `active_key_id: "old"`; then roll only
@@ -1224,15 +1247,15 @@ children = [
    handler: MyServer,
    handler_args: [],
    transport: :mounted_http,
+   mrtr: true,
    services: [replay_cache: []],
    require_replay_protection: true}
 ]
 Supervisor.start_link(children, strategy: :one_for_one)
 
-# In the router, validate the key ring and require the Runtime's replay service:
+# In the router, borrow the Runtime and require its replay service:
 forward "/mcp", Arbor.MCP.HttpPlug,
   runtime: MyApp.MCPRuntime,
-  mrtr: true,
   require_replay_protection: true
 ```
 
@@ -1361,10 +1384,14 @@ answers.
 Every round of one call carries the same request apart from
 `input_responses:` and `request_state:`: the same arguments,
 `client_capabilities:`, `:meta` and `:progress_token`. An arbor_mcp server
-binds its `requestState` to the request's params, `_meta` included, and to
-the capabilities the request declared, and rejects a round that differs with
-`-32602` and the reason `request_state_binding_mismatch`. A gateway that sets
-its own upstream progress token therefore keeps it for all rounds of the call.
+binds its `requestState` to the request's params, `_meta` included apart from
+its `progressToken`, and to the capabilities the request declared, and
+rejects a round that differs with `-32602` and the reason
+`request_state_binding_mismatch`. The progress token stays out because every
+round is a new request and a client may give each one its own token, as the
+TypeScript SDK does. Another server may bind all of `_meta`, so a gateway that
+sets its own upstream progress token still keeps it for all rounds of the
+call.
 `mrtr: :manual` with `reset_timeout_on_progress: true` or `progress_to:`
 needs a `:progress_token` (or `"progressToken"` in `:meta`), and returns a
 `ValidationError` without one: the token the client would add differs on

@@ -70,7 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `complete/4` take it on its own. All three need a 2026-07-28 connection.
   Otherwise they return `{:error, %Arbor.MCP.Error.ValidationError{}}`
   before anything is sent. Every round of one call repeats its arguments,
-  capabilities and progress token, because an arbor_mcp server binds
+  capabilities and progress token, because a server may bind
   `requestState` to them, so `mrtr: :manual` with
   `reset_timeout_on_progress: true` needs an explicit `:progress_token`.
   Each input response is validated against the 2026-07-28 schema's
@@ -156,7 +156,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[:arbor_mcp, :client, :connect, :failed]` telemetry event instead of an
   unconditional error log. Explicit binary errors and established tagged
   initialization/auth-provider failures retain their existing envelopes.
-
+- **BREAKING:** Runtime constructors reject unknown option names instead of
+  silently discarding them. Configure `mrtr: true` and `request_state:` on the
+  Runtime for startup validation on every transport, including mounted HTTP.
 - **Pre-registered OAuth client secrets are issuer-bound by default.** There
   is no opt-out. This breaks HTTP auth and `DiscoveryFlow.execute/1` that
   still set only `client_id` / `client_secret` (the 1.x aliases) and omit
@@ -272,6 +274,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Mounted HTTP Runtimes validate explicitly enabled MRTR before starting their
+  handler and pass per-Runtime request-state key rings into dispatch. Named
+  HTTP mounts can initialize before runtime configuration loads. Runtime docs
+  now describe cancellation messages, the callback cleanup grace, progress
+  delivery errors, and request-state/output limits.
 - An HTTP `:auth_provider` whose `get_token/1` returns `{:error, reason}` now
   refuses the request before it is sent (#176). The transport ignored the
   error, so the request went out with the token the provider gave before, or
@@ -391,6 +398,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result's own fields win over a hint, so a server could not keep a discovery
   result that differs by caller, its instructions for example, out of shared
   caches. The hint now sets both; without one, discovery keeps its defaults.
+- An MRTR retry with a new `_meta.progressToken` failed with `-32602` and
+  `request_state_binding_mismatch`, because the `requestState` binding
+  covered all of `_meta`. Every round is a new request with its own JSON-RPC
+  id, and a client may give each one its own progress token: the TypeScript
+  SDK sends the request id as the token whenever a request has a progress
+  handler, so its retries were refused. The binding now leaves
+  `progressToken` out of the request's `_meta` and binds an `_meta` that
+  held only the token like a missing one. On stdio, BEAM and the test
+  transport, the handler server's copy of `_meta` in a call's arguments
+  stays out of the binding as a whole, since `_meta` binds it. An argument
+  named `_meta` from the caller is preserved on every transport and stays
+  bound, a `progressToken` in it included. The server injects its metadata
+  only when that argument is absent. The arguments, the
+  rest of `_meta` and the capabilities stay bound.
 - `Accept: application/json, text/event-stream;q` — a `q` parameter with no
   value — and `q =1` / `q= 1`, whose whitespace around the equals sign
   violates the weight grammar (RFC 9110 section 12.4.2: optional whitespace

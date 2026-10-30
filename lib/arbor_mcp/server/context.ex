@@ -67,6 +67,13 @@ defmodule Arbor.MCP.Server.Context do
   that invocation from committing state and the runtime stops unresponsive
   callback tasks after the configured grace period.
 
+  On cancellation, the Runtime sends the callback process
+  `{:arbor_mcp_cancelled, token, reason}`. The token is the opaque invocation
+  token; reasons are `:request_cancelled`, `:owner_down`, or `:handler_timeout`.
+  The callback has `:cancel_grace_ms` (default 100 ms) to finish cooperative
+  cleanup before the Runtime kills the task. Polling this function does not
+  extend that grace period, and cancellation cannot undo external effects.
+
   Handler-process callbacks dispatched by `Arbor.MCP.MessageProcessor` only
   observe a cancellation sent from the same HTTP session, or for a
   sessionless request from the same authenticated principal, tenant and
@@ -168,6 +175,17 @@ defmodule Arbor.MCP.Server.Context do
   receipt. A cancelled callback cannot append under a retired phase or lease.
   Legacy replay or operation pressure returns a fixed typed atom error without
   retrying a previously accepted event.
+
+  Returns `{:error, :progress_not_requested}` without a progress token,
+  `{:error, :request_not_streaming}` without a notification target, or
+  `{:error, :no_request_context}` outside a callback. A closed or retired
+  target returns `:stream_closed`; an unacknowledged delivery can return
+  `:stream_timeout`. Legacy session delivery also propagates atom errors from
+  its session service, including `:replay_capacity_exhausted`,
+  `:event_too_large_or_invalid`, `:callback_source_retired`, `:operation_timeout`,
+  and `:service_unavailable`. Custom session adapters may return other atom
+  errors, so the error type is intentionally open. A delivery error does not
+  imply that earlier progress or application effects were rolled back.
   """
   @spec report_progress(number(), number() | nil, String.t() | nil) :: :ok | {:error, atom()}
   def report_progress(progress, total \\ nil, message \\ nil) when is_number(progress) do

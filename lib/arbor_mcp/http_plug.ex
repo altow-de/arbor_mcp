@@ -253,7 +253,6 @@ defmodule Arbor.MCP.HttpPlug do
   @impl Plug
   def init(opts) do
     Configuration.validate!(opts)
-    validate_mrtr_configuration!(opts)
     protected_resource_metadata = protected_resource_metadata!(opts)
 
     legacy_http_sse = Keyword.get(opts, :legacy_http_sse, false)
@@ -367,20 +366,6 @@ defmodule Arbor.MCP.HttpPlug do
 
     if URI.parse(value).query do
       raise ArgumentError, ":authorization_servers entries must not contain query components"
-    end
-  end
-
-  defp validate_mrtr_configuration!(opts) do
-    if Keyword.get(opts, :mrtr, false) do
-      case Arbor.MCP.Server.RequestState.validate_configuration(
-             request_state: Keyword.get(opts, :request_state)
-           ) do
-        :ok ->
-          :ok
-
-        {:error, reason} ->
-          raise ArgumentError, "invalid MRTR requestState configuration: #{reason}"
-      end
     end
   end
 
@@ -1905,7 +1890,12 @@ defmodule Arbor.MCP.HttpPlug do
       :subscription_max_lifetime_ms
     ]
 
-    Enum.map(keys, &{&1, Map.get(opts, &1)}) ++
+    dispatch_opts =
+      keys
+      |> Enum.map(&{&1, Map.get(opts, &1)})
+      |> Enum.reject(fn {key, value} -> key == :request_state and is_nil(value) end)
+
+    dispatch_opts ++
       [
         application_context: opts.handler_opts,
         request_headers: conn.req_headers,
