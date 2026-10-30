@@ -59,6 +59,11 @@ defmodule Arbor.MCP.Server.HTTP.Config do
     :server
   ]
 
+  def option_keys do
+    @plug_keys ++
+      @retired ++ [:host, :port, :http_adapter, :http_listener_options, :ranch_ref]
+  end
+
   def new(opts, ownership \\ :owned) do
     with {:ok, opts} <- options(opts),
          :ok <- validate_retired(opts),

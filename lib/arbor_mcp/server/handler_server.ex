@@ -140,7 +140,7 @@ defmodule Arbor.MCP.Server.HandlerServer do
     case validate_mrtr_configuration(opts) do
       :ok ->
         Runtime.start_link(
-          Keyword.merge(opts,
+          Keyword.merge(Keyword.take(opts, Arbor.MCP.Server.Runtime.Config.option_keys()),
             cancellation_tracker:
               Keyword.get(opts, :cancellation_tracker, CancellationTracker.Default),
             edge: {__MODULE__, Keyword.delete(opts, :name)}

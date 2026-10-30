@@ -201,13 +201,13 @@ defmodule Arbor.MCP.Server.RequestStateTest do
                request_state: [active_key_id: "bad", keys: %{"bad" => "too short"}]
              )
 
-    assert_raise ArgumentError, ~r/invalid MRTR requestState configuration/, fn ->
-      Arbor.MCP.HttpPlug.init(
-        runtime: __MODULE__.UnstartedRuntime,
-        mrtr: true,
-        request_state: [active_key_id: "bad", keys: %{"bad" => "too short"}]
-      )
-    end
+    assert {:error, {:mrtr_configuration_error, :invalid_request_state_configuration}} =
+             Arbor.MCP.Server.Runtime.start_link(
+               handler: __MODULE__,
+               transport: :mounted_http,
+               mrtr: true,
+               request_state: [active_key_id: "bad", keys: %{"bad" => "too short"}]
+             )
   end
 
   defp binding_of(params, opts \\ []) do
